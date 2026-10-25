@@ -694,9 +694,40 @@ module Nokogiri
 
       def append_node(node)
         return if node.nil?
-        return if @root.document? && node.text? && node.blank? && @stack.empty?
 
-        @stack.last ? @stack.last.add_child_node(node) : @root.add_child_node(node)
+        state = node.instance_variable_get(:@pure)
+        parent = @stack.last || @root
+        return parent.add_child_node(node) unless state
+
+        text_node = XML::Node::TEXT_NODE
+        return if @root.document? && state.type == text_node && node.blank? && @stack.empty?
+
+        # Parser nodes are new. Skip the cycle check and the unlink.
+        # HTML does not adopt XML namespaces. XML elements still do.
+        if state.parent || !state.children.empty?
+          parent.add_child_node(node)
+          return
+        end
+
+        parent_state = parent.instance_variable_get(:@pure)
+        if state.type == text_node
+          last = parent_state.children.last
+          if last
+            last_state = last.instance_variable_get(:@pure)
+            if last_state&.type == text_node
+              last_state.content = last_state.content.to_s + state.content.to_s
+              return
+            end
+          end
+        end
+
+        state.parent = parent
+        state.document = parent_state.document
+        parent_state.children << node
+        node.decorate! if node.respond_to?(:decorate!)
+        return if html_document? || state.type != XML::Node::ELEMENT_NODE
+
+        parent.send(:adopt_namespaces, node)
       end
 
       def append_text(text)
