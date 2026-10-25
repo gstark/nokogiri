@@ -11,15 +11,21 @@ module Nokogiri
         "quot" => "\"",
         "apos" => "'",
       }.freeze
+      TEXT_ESCAPE = { "&" => "&amp;", "<" => "&lt;", ">" => "&gt;" }.freeze
+      ATTR_ESCAPE = TEXT_ESCAPE.merge('"' => "&quot;").freeze
+      HTML_ATTR_ESCAPE = TEXT_ESCAPE.merge('"' => "%22").freeze
+      TEXT_PATTERN = /[&<>]/
+      ATTR_PATTERN = /[&<>"]/
 
       module_function
 
       def escape_text(string)
-        string.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+        string.to_s.gsub(TEXT_PATTERN, TEXT_ESCAPE)
       end
 
-      def escape_attr(string)
-        escape_text(string).gsub('"', "&quot;")
+      def escape_attr(string, percent_quotes: false)
+        map = percent_quotes ? HTML_ATTR_ESCAPE : ATTR_ESCAPE
+        string.to_s.gsub(ATTR_PATTERN, map)
       end
 
       # Decode predefined entities and character references.

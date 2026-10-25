@@ -146,7 +146,11 @@ module Nokogiri
       #
       # See Searchable#css for more information.
       def at_css(*args)
-        css(*args).first
+        if Nokogiri.uses_libxml?
+          css(*args).first
+        else
+          Nokogiri::Pure::XPath.node_limit(1) { css(*args).first }
+        end
       end
 
       ###
@@ -196,7 +200,11 @@ module Nokogiri
       #
       # See Searchable#xpath for more information.
       def at_xpath(*args)
-        xpath(*args).first
+        if Nokogiri.uses_libxml?
+          xpath(*args).first
+        else
+          Nokogiri::Pure::XPath.node_limit(1) { xpath(*args).first }
+        end
       end
 
       # :call-seq:

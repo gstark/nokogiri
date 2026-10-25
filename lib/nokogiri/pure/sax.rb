@@ -180,28 +180,34 @@ module Nokogiri
       end
 
       def markup_complete?
-        rest = @scanner.rest
-        if rest.start_with?("<!--")
-          rest.include?("-->")
-        elsif rest.start_with?("<![CDATA[")
-          rest.include?("]]>")
-        elsif rest.start_with?("<?")
-          rest.include?("?>")
-        elsif rest.start_with?("<!")
-          rest.include?(">")
+        source = @scanner.string
+        pos = @scanner.charpos
+        head = source[pos, 9].to_s
+        if head.start_with?("<!--")
+          !source.index("-->", pos).nil?
+        elsif head.start_with?("<![CDATA[")
+          !source.index("]]>", pos).nil?
+        elsif head.start_with?("<?")
+          !source.index("?>", pos).nil?
+        elsif head.start_with?("<!")
+          !source.index(">", pos).nil?
         else
           quote = nil
-          rest.each_char.any? do |char|
+          while pos < source.length
+            found = source.index(/["'>]/, pos)
+            return false unless found
+
+            char = source[found]
             if quote
               quote = nil if char == quote
-              false
             elsif char == "'" || char == '"'
               quote = char
-              false
             else
-              char == ">"
+              return true
             end
+            pos = found + 1
           end
+          false
         end
       end
 
@@ -743,7 +749,7 @@ module Nokogiri
 
       # Read up to +marker+ and leave the marker for the caller to consume.
       def read_before(marker)
-        chunk = @scanner.scan_until(/#{Regexp.escape(marker)}/)
+        chunk = @scanner.scan_until(marker_pattern(marker))
         unless chunk
           rest = @scanner.rest
           @scanner.terminate
@@ -774,15 +780,27 @@ module Nokogiri
       end
 
       def skip_space
-        while (char = @scanner.check(/[ \t\r\n]/))
-          take_char
-          break unless char
-        end
+        spaces = @scanner.scan(/[ \t\r\n]+/)
+        account(spaces) if spaces
       end
 
       def consume(token)
-        token.each_char { take_char }
+        remaining = @scanner.string.bytesize - @scanner.pos
+        if token.bytesize > remaining
+          rest = @scanner.rest
+          @scanner.terminate
+          account(rest) unless rest.empty?
+          return true
+        end
+
+        @scanner.pos += token.bytesize
+        account(token)
         true
+      end
+
+      def marker_pattern(marker)
+        @marker_patterns ||= {}
+        @marker_patterns[marker] ||= Regexp.new(Regexp.escape(marker))
       end
 
       def take_char
