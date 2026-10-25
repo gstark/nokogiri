@@ -48,6 +48,22 @@ module Nokogiri
         state
       end
 
+      # Parser hot path. Assign the fields directly. Public constructors keep #attach.
+      def self.fast_attach(owner, type, name, document, content = nil, line = nil)
+        state = new
+        state.fast_fill(type, name, document, content, line)
+        owner.instance_variable_set(:@pure, state)
+        state
+      end
+
+      def fast_fill(type, name, document, content, line)
+        @type = type
+        @name = name
+        @document = document
+        @content = content unless content.nil?
+        @line = line unless line.nil?
+      end
+
       def duplicate(level, document)
         copy = self.class.new
         copy.name = name
