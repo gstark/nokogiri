@@ -20,6 +20,11 @@ module Nokogiri
       def self.evaluate(context_node, path, namespaces, variables = nil, handler = nil)
         limit = Thread.current[:nokogiri_pure_node_limit]
         Thread.current[:nokogiri_pure_node_limit] = nil if limit
+        if handler.nil? && (variables.nil? || variables.empty?)
+          nodes = fast_nodes(context_node, path.to_s, namespaces || {}, limit)
+          return XML::NodeSet.new(context_node.document, nodes) unless nodes.nil?
+        end
+
         value = Engine.new(path.to_s, namespaces || {}, variables || {}, handler, node_limit: limit).evaluate(context_node)
         document = context_node.document
         case value.type
@@ -34,6 +39,201 @@ module Nokogiri
         end
       ensure
         Thread.current[:nokogiri_pure_node_limit] = limit if limit
+      end
+
+      # Direct walks for the location paths CSS and the common calls emit.
+      # Any other expression returns nil and uses the full evaluator.
+      FAST_NAME = /[A-Za-z_][\w.\-]*/
+      FAST_ATTR_CHILD = /\A\/\/(#{FAST_NAME})\[@(#{FAST_NAME})=(?:"([^"]*)"|'([^']*)')\]\/(#{FAST_NAME})\z/
+      FAST_CLASS = /\A(\.\/\/|\/\/)(#{FAST_NAME})\[contains\(concat\(' ',normalize-space\(@class\),' '\),' ([^']*)'\)\]\z/
+      FAST_CHILD = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/(#{FAST_NAME})\z/
+      FAST_UNION = /\A\.\/\/(#{FAST_NAME}) \| self::\1\z/
+      FAST_QNAME = /\A\/\/(#{FAST_NAME}):(#{FAST_NAME})\z/
+      FAST_ONE = /\A(\.\/\/|\/\/)(#{FAST_NAME})\z/
+
+      def self.fast_nodes(context, path, namespaces, limit)
+        return nil unless path.start_with?("//", ".//")
+
+        if (match = FAST_ATTR_CHILD.match(path))
+          expected = match[3] || match[4]
+          return named_attr_children(fast_origin(context, true), match[1], match[2], expected, match[5], limit)
+        end
+        if (match = FAST_CLASS.match(path))
+          inner = match[3]
+          return nil unless inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
+
+          needle = inner[1..-2]
+          return nil if needle.include?(" ")
+
+          return named_class(fast_origin(context, match[1] == "//"), match[2], needle, limit)
+        end
+        if (match = FAST_CHILD.match(path))
+          return named_children(fast_origin(context, match[1] == "//"), match[2], match[3], limit)
+        end
+        if (match = FAST_UNION.match(path))
+          return union_self(context, match[1], limit)
+        end
+        if (match = FAST_QNAME.match(path))
+          return nil unless namespaces.key?(match[1])
+
+          return named(fast_origin(context, true), match[2], namespaces[match[1]], limit)
+        end
+        if (match = FAST_ONE.match(path))
+          return named(fast_origin(context, match[1] == "//"), match[2], nil, limit)
+        end
+
+        nil
+      end
+
+      def self.fast_origin(context, absolute)
+        return context unless absolute
+        return context if context.is_a?(XML::Document)
+        return context.document if context.respond_to?(:document) && context.document
+
+        context
+      end
+
+      def self.named(root, local, href, limit)
+        out = []
+        each_element(root) do |node, state|
+          next unless state.name == local && href_match?(state, href)
+
+          out << node
+          return out if limit && out.length >= limit
+        end
+        out
+      end
+
+      def self.named_class(root, local, needle, limit)
+        out = []
+        each_element(root) do |node, state|
+          next unless state.name == local && state.namespace.nil?
+          next unless class_match?(state, needle)
+
+          out << node
+          return out if limit && out.length >= limit
+        end
+        out
+      end
+
+      def self.named_children(root, parent_name, child_name, limit)
+        out = []
+        each_element(root) do |_node, state|
+          next unless state.name == parent_name && state.namespace.nil?
+
+          append_children(state, child_name, out, limit)
+          return out if limit && out.length >= limit
+        end
+        out
+      end
+
+      def self.named_attr_children(root, parent_name, attr_name, expected, child_name, limit)
+        out = []
+        each_element(root) do |_node, state|
+          next unless state.name == parent_name && state.namespace.nil?
+          next unless attr_match?(state, attr_name, expected)
+
+          append_children(state, child_name, out, limit)
+          return out if limit && out.length >= limit
+        end
+        out
+      end
+
+      def self.union_self(context, local, limit)
+        out = []
+        state = context.instance_variable_get(:@pure)
+        if state&.type == XML::Node::ELEMENT_NODE && state.name == local && state.namespace.nil?
+          out << context
+          return out if limit && out.length >= limit
+        end
+        named(context, local, nil, limit.nil? ? nil : limit - out.length).each { |node| out << node }
+        out
+      end
+
+      def self.append_children(state, local, out, limit)
+        state.children.each do |child|
+          child_state = child.instance_variable_get(:@pure)
+          next unless child_state&.type == XML::Node::ELEMENT_NODE
+          next unless child_state.name == local && child_state.namespace.nil?
+
+          out << child
+          return if limit && out.length >= limit
+        end
+      end
+
+      def self.href_match?(state, href)
+        if href.nil?
+          state.namespace.nil?
+        else
+          state.namespace&.href == href
+        end
+      end
+
+      def self.class_match?(state, needle)
+        return true if needle.empty?
+
+        state.attributes.each do |attr|
+          attr_state = attr.instance_variable_get(:@pure)
+          next unless attr_state&.name == "class" && attr_state.namespace.nil?
+
+          return word_class?(attr_state.content.to_s, needle)
+        end
+        false
+      end
+
+      def self.attr_match?(state, name, expected)
+        state.attributes.each do |attr|
+          attr_state = attr.instance_variable_get(:@pure)
+          next unless attr_state&.name == name && attr_state.namespace.nil?
+
+          return attr_state.content.to_s == expected
+        end
+        expected == ""
+      end
+
+      def self.each_element(root)
+        state = root.instance_variable_get(:@pure)
+        return unless state
+
+        children = state.children
+        return if children.empty?
+
+        stack = []
+        index = children.length
+        while index > 0
+          index -= 1
+          stack << children[index]
+        end
+        element = XML::Node::ELEMENT_NODE
+        while (node = stack.pop)
+          child_state = node.instance_variable_get(:@pure)
+          next unless child_state
+
+          yield node, child_state if child_state.type == element
+          kids = child_state.children
+          cursor = kids.length
+          while cursor > 0
+            cursor -= 1
+            stack << kids[cursor]
+          end
+        end
+      end
+
+      # Word-boundary class match. Blank is space, tab, LF, and CR.
+      def self.word_class?(hay, needle)
+        return true if needle.empty?
+
+        blank = " \t\n\r"
+        index = 0
+        while index < hay.length
+          if hay[index, needle.length] == needle
+            next_char = hay[index + needle.length]
+            return true if next_char.nil? || blank.include?(next_char)
+          end
+          index += 1 while index < hay.length && !blank.include?(hay[index])
+          index += 1 while index < hay.length && blank.include?(hay[index])
+        end
+        false
       end
 
       # One XPath value: a node set, a string, a number, or a boolean.
@@ -945,21 +1145,8 @@ module Nokogiri
           end
         end
 
-        # Word-boundary class match. Blank is space, tab, LF, and CR.
         def css_class?(hay, needle)
-          return true if needle.empty?
-
-          blank = " \t\n\r"
-          index = 0
-          while index < hay.length
-            if hay[index, needle.length] == needle
-              next_char = hay[index + needle.length]
-              return true if next_char.nil? || blank.include?(next_char)
-            end
-            index += 1 while index < hay.length && !blank.include?(hay[index])
-            index += 1 while index < hay.length && blank.include?(hay[index])
-          end
-          false
+          XPath.word_class?(hay, needle)
         end
 
         def handler_value(name, args)

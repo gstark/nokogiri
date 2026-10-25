@@ -8,8 +8,6 @@ module Nokogiri
     class Parser
       RECOVER = 1
       NAME = /[\p{L}_:][\p{L}\p{N}_:.\-]*/.freeze
-      HTML_MARKUP = %r{</?[A-Za-z]|<!--|<!\[CDATA\[|<\?|<!DOCTYPE|<!}
-      MARKUP_CHAR = /</
       UNQUOTED = /[^\s>\/]*/
       QUOTED_DQ = /[^"&]+/
       QUOTED_SQ = /[^'&]+/
@@ -90,8 +88,10 @@ module Nokogiri
       private
 
       def parse_loop
-        until @scanner.eos?
-          if @scanner.check(/</)
+        scanner = @scanner
+        until scanner.eos?
+          # "<" is one ASCII byte, including inside a UTF-8 document.
+          if scanner.string.getbyte(scanner.pos) == 60
             if html_document? && !html_markup?
               append_text(take_char.to_s)
             else
@@ -104,23 +104,42 @@ module Nokogiri
       end
 
       def html_markup?
-        @scanner.check(HTML_MARKUP)
+        string = @scanner.string
+        pos = @scanner.pos
+        byte = string.getbyte(pos + 1)
+        return false unless byte
+        return true if byte == 33 || byte == 63
+
+        if byte == 47
+          next_byte = string.getbyte(pos + 2)
+          return false unless next_byte
+
+          return (next_byte >= 65 && next_byte <= 90) || (next_byte >= 97 && next_byte <= 122)
+        end
+
+        (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
       end
 
       def parse_markup
-        if @scanner.check(/<!--/)
-          append_node(read_comment)
-        elsif @scanner.check(/<!\[CDATA\[/)
-          append_node(read_cdata)
-        elsif @scanner.check(/<\?/)
+        string = @scanner.string
+        pos = @scanner.pos
+        byte = string.getbyte(pos + 1)
+        if byte == 33
+          second = string.getbyte(pos + 2)
+          if second == 45 && string.getbyte(pos + 3) == 45
+            append_node(read_comment)
+          elsif second == 91 && string.byteslice(pos, 9) == "<![CDATA["
+            append_node(read_cdata)
+          elsif second == 68 && string.byteslice(pos, 9) == "<!DOCTYPE"
+            append_node(read_doctype)
+          else
+            error("Unsupported markup declaration")
+            skip_through(">")
+          end
+        elsif byte == 63
           append_node(read_pi)
-        elsif @scanner.check(/<!DOCTYPE/)
-          append_node(read_doctype)
-        elsif @scanner.check(/<\//)
+        elsif byte == 47
           read_end_tag
-        elsif @scanner.check(/<!/)
-          error("Unsupported markup declaration")
-          skip_through(">")
         else
           read_start_tag
         end
@@ -139,7 +158,7 @@ module Nokogiri
         advance("<")
         line = @line
         qname = read_name
-        qname = qname.downcase if html_document?
+        qname.downcase! if html_document? && !qname.empty?
         if qname.empty?
           error("StartTag: invalid element name")
           return
@@ -147,15 +166,16 @@ module Nokogiri
         attributes = read_attributes
         skip_space
         self_closing = false
-        if @scanner.check(/\/>/)
+        string = @scanner.string
+        mark = @scanner.pos
+        if string.getbyte(mark) == 47 && string.getbyte(mark + 1) == 62
           advance("/>")
           self_closing = true
         else
           expect(">")
         end
 
-        element = XML::Element.new(qname, @document)
-        element.pure.line = line
+        element = make_node(XML::Element, XML::Node::ELEMENT_NODE, qname, nil, line)
         apply_namespaces(element, qname, attributes)
         append_node(element)
         unless self_closing || void_html?(element.name)
@@ -170,10 +190,10 @@ module Nokogiri
         skip_space
         expect(">")
         name = local_name(qname)
-        name = name.downcase if html_document?
+        name.downcase! if html_document? && !name.empty?
         if html_document? && @stack.none? { |node| node.name == name }
           if name == "p" || name == "br"
-            append_node(XML::Element.new(name, @document))
+            append_node(make_node(XML::Element, XML::Node::ELEMENT_NODE, name))
           else
             open = @stack.last
             if open
@@ -652,16 +672,19 @@ module Nokogiri
           next if !html_document? && (attr_name == "xmlns" || attr_name.start_with?("xmlns:"))
 
           if html_document?
-            attr = XML::Attr.new(@document, attr_name.downcase)
-            attr.value = value
+            attr = make_node(XML::Attr, XML::Node::ATTRIBUTE_NODE, attr_name.downcase, value&.to_s)
             attr.pure.parent = element
             element.pure.attributes << attr
             next
           end
 
           attr_prefix, attr_local = split_name(attr_name)
-          attr = XML::Attr.new(@document, attr_prefix ? attr_local : attr_name)
-          attr.value = value
+          attr = make_node(
+            XML::Attr,
+            XML::Node::ATTRIBUTE_NODE,
+            attr_prefix ? attr_local : attr_name,
+            value&.to_s,
+          )
           attr.pure.parent = element
           if attr_prefix
             ns = find_namespace(attr_prefix, element)
@@ -703,7 +726,6 @@ module Nokogiri
         return if @root.document? && state.type == text_node && node.blank? && @stack.empty?
 
         # Parser nodes are new. Skip the cycle check and the unlink.
-        # HTML does not adopt XML namespaces. XML elements still do.
         if state.parent || !state.children.empty?
           parent.add_child_node(node)
           return
@@ -715,7 +737,13 @@ module Nokogiri
           if last
             last_state = last.instance_variable_get(:@pure)
             if last_state&.type == text_node
-              last_state.content = last_state.content.to_s + state.content.to_s
+              extra = state.content.to_s
+              current = last_state.content
+              if current.is_a?(String) && !current.frozen?
+                current << extra
+              else
+                last_state.content = current.to_s + extra
+              end
               return
             end
           end
@@ -724,10 +752,15 @@ module Nokogiri
         state.parent = parent
         state.document = parent_state.document
         parent_state.children << node
-        node.decorate! if node.respond_to?(:decorate!)
-        return if html_document? || state.type != XML::Node::ELEMENT_NODE
+        node.decorate!
+        # apply_namespaces already bound this element's namespaces. A second
+        # adopt_namespaces walk repeats that search for every element.
+      end
 
-        parent.send(:adopt_namespaces, node)
+      def make_node(klass, type, name, content = nil, line = nil)
+        node = klass.allocate
+        Pure::State.fast_attach(node, type, name, @document, content, line)
+        node
       end
 
       def append_text(text)
@@ -737,9 +770,13 @@ module Nokogiri
           return
         end
 
+        unless text.include?("&")
+          append_node(make_node(XML::Text, XML::Node::TEXT_NODE, "text", text, @line))
+          return
+        end
+
         split_text_and_entities(text).each do |piece|
-          node = piece.is_a?(XML::Node) ? piece : XML::Text.new(piece, @document)
-          node.pure.line = @line
+          node = piece.is_a?(XML::Node) ? piece : make_node(XML::Text, XML::Node::TEXT_NODE, "text", piece, @line)
           append_node(node)
         end
       end
@@ -774,16 +811,20 @@ module Nokogiri
       end
 
       def read_until_markup
-        chunk = @scanner.scan_until(MARKUP_CHAR)
-        unless chunk
-          rest = @scanner.rest
+        string = @scanner.string
+        pos = @scanner.pos
+        found = string.byteindex("<", pos)
+        unless found
+          rest = string.byteslice(pos..) || +""
           @scanner.terminate
           account_text(rest)
           return rest
         end
 
-        @scanner.pos -= 1
-        text = chunk.chop
+        @scanner.pos = found
+        return "" if found == pos
+
+        text = string.byteslice(pos, found - pos)
         account_text(text)
         text
       end
@@ -792,13 +833,14 @@ module Nokogiri
         attributes = {}
         loop do
           skip_space
-          break if @scanner.eos? || @scanner.check(/[>\/]/)
+          byte = @scanner.string.getbyte(@scanner.pos)
+          break if @scanner.eos? || byte == 62 || byte == 47
 
           name = read_name
           break if name.empty?
 
           skip_space
-          if html_document? && !@scanner.check(/=/)
+          if html_document? && @scanner.string.getbyte(@scanner.pos) != 61
             attributes[name] = ""
             next
           end
