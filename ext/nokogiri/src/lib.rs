@@ -1,5 +1,6 @@
 //! Ruby extension entry point. The shared library still initializes as `Init_nokogiri`.
 
+mod oxide;
 mod parse;
 mod serialize;
 mod store;
@@ -466,7 +467,13 @@ fn node_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
     let owner = store.borrow().nodes[doc_id as usize].owner;
     let id = store.borrow_mut().alloc(ELEMENT, owner);
     store.borrow_mut().nodes[id as usize].name = Some(name);
-    let class_override = if classes().element.equal(class).unwrap_or(false) { None } else { Some(class) };
+    // Node.new and Element.new both build an element. A subclass keeps its class.
+    let class_name: String = class.funcall("name", ()).unwrap_or_default();
+    let class_override = if class_name == "Nokogiri::XML::Node" || class_name == "Nokogiri::XML::Element" {
+        None
+    } else {
+        Some(class)
+    };
     let value = wrap_node(ruby, &store, id, class_override);
     value.funcall::<_, _, Value>("initialize", args)?;
     if ruby.block_given() {
@@ -974,6 +981,9 @@ fn add_child_node(ruby: &Ruby, rb_self: Value, child: Value) -> Result<Value, Er
     if !allowed_child(parent_kind, child_kind) {
         return Err(Error::new(ruby.exception_arg_error(), "cannot reparent node there"));
     }
+    if store.borrow().creates_cycle(parent, child_id) && Rc::ptr_eq(&store, &child_store) {
+        return Err(Error::new(ruby.exception_runtime_error(), "cycle detected"));
+    }
     let owner = store.borrow().nodes[parent as usize].owner;
     let child_id = adopt(&child_store, child_id, &store, owner);
     let parent_kind = store.borrow().nodes[parent as usize].kind;
@@ -1010,6 +1020,13 @@ fn relink_node(ruby: &Ruby, store: &Rc<RefCell<Store>>, id: u32) {
 fn add_sibling(ruby: &Ruby, rb_self: Value, node: Value, after: bool) -> Result<Value, Error> {
     let (store, sibling) = handle_from(rb_self)?;
     let (node_store, node_id) = handle_from(node)?;
+    if Rc::ptr_eq(&store, &node_store) {
+        if let Some(parent) = store.borrow().nodes[sibling as usize].parent {
+            if store.borrow().creates_cycle(parent, node_id) {
+                return Err(Error::new(ruby.exception_runtime_error(), "cycle detected"));
+            }
+        }
+    }
     let owner = store.borrow().nodes[sibling as usize].owner;
     let node_id = adopt(&node_store, node_id, &store, owner);
     if after {
@@ -1026,6 +1043,13 @@ fn add_sibling(ruby: &Ruby, rb_self: Value, node: Value, after: bool) -> Result<
 fn replace_node(ruby: &Ruby, rb_self: Value, node: Value) -> Result<Value, Error> {
     let (store, old) = handle_from(rb_self)?;
     let (node_store, node_id) = handle_from(node)?;
+    if Rc::ptr_eq(&store, &node_store) {
+        if let Some(parent) = store.borrow().nodes[old as usize].parent {
+            if store.borrow().creates_cycle(parent, node_id) {
+                return Err(Error::new(ruby.exception_runtime_error(), "cycle detected"));
+            }
+        }
+    }
     let owner = store.borrow().nodes[old as usize].owner;
     let node_id = adopt(&node_store, node_id, &store, owner);
     store.borrow_mut().replace_with(old, node_id);

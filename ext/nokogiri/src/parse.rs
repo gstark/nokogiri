@@ -361,24 +361,65 @@ fn parse_document(
     key: u64,
     html: bool,
 ) -> Parsed {
-    let mut builder = Builder::new(html, options, key);
-    if let Some(url) = url {
-        builder.store.borrow_mut().nodes[0].url = Some(url);
+    let mut parsed = crate::oxide::import(input, url, encoding, options, key, html);
+    enrich_dtd(&mut parsed, options, html);
+    parsed
+}
+
+/// Fill DTD declaration nodes from the subset text xmloxide kept on the doctype.
+fn enrich_dtd(parsed: &mut Parsed, options: i32, html: bool) {
+    let dtd_id = parsed.store.borrow().nodes[0].internal_subset;
+    let Some(dtd_id) = dtd_id else {
+        return;
+    };
+    let (subset, external_id, system_id, name) = {
+        let store = parsed.store.borrow();
+        let node = &store.nodes[dtd_id as usize];
+        (
+            node.content.clone(),
+            node.external_id.clone(),
+            node.system_id.clone(),
+            node.name.clone().unwrap_or_default(),
+        )
+    };
+    parsed.store.borrow_mut().nodes[dtd_id as usize].content.clear();
+
+    let mut builder = Builder {
+        store: Rc::clone(&parsed.store),
+        errors: std::mem::take(&mut parsed.errors),
+        entities: Vec::new(),
+        entity_base: None,
+        html,
+        options,
+    };
+    if !subset.is_empty() {
+        parse_dtd_decls(&mut builder, &subset, dtd_id, true);
     }
-    if let Some(encoding) = encoding {
-        if !encoding.is_empty() {
-            builder.store.borrow_mut().nodes[0].encoding = Some(encoding);
+    if !html && options & (DTDLOAD | DTDVALID) != 0 {
+        if let Some(system) = system_id.clone() {
+            let base = builder.store.borrow().nodes[0].url.clone();
+            if let Some((text, path)) = read_external_subset(&base, &system) {
+                if let Some(dir) = path.parent() {
+                    builder.entity_base = Some(dir.to_string_lossy().into_owned());
+                }
+                parse_dtd_decls(&mut builder, &text, dtd_id, false);
+            }
         }
     }
-    if html {
-        parse_html_tree(&mut builder, input);
-    } else {
-        parse_xml_tree(&mut builder, input);
-        if options & DTDVALID != 0 {
-            validate_document(&mut builder);
+    if !html && options & DTDLOAD != 0 && (external_id.is_some() || system_id.is_some()) {
+        let ext = builder.add(DTD, 0);
+        builder.set_name(ext, name);
+        {
+            let mut store = builder.store.borrow_mut();
+            store.nodes[ext as usize].external_id = external_id;
+            store.nodes[ext as usize].system_id = system_id;
+            store.nodes[0].external_subset = Some(ext);
         }
     }
-    Parsed { store: builder.store, errors: builder.errors }
+    if !html && options & DTDVALID != 0 {
+        validate_document(&mut builder);
+    }
+    parsed.errors = builder.errors;
 }
 
 fn parse_xml_tree(builder: &mut Builder, input: &str) {

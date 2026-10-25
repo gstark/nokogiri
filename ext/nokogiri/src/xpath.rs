@@ -267,8 +267,8 @@ impl<'a> Parser<'a> {
         if rest.is_empty() || rest.starts_with(|c: char| ")]|".contains(c)) {
             return false;
         }
-        !rest.starts_with("or") && !rest.starts_with("and") && !rest.starts_with('=') && !rest.starts_with('!')
-            && !rest.starts_with('<') && !rest.starts_with('>') && !rest.starts_with('+')
+        // After `/`, `or` and `and` are name tests (`//orange`), not operators.
+        !matches!(rest.chars().next(), Some('=' | '!' | '<' | '>' | '+'))
     }
 
     fn looks_like_step(&mut self) -> bool {
@@ -587,7 +587,7 @@ pub fn evaluate<'a>(
     functions: Option<&'a mut XPathFunction<'a>>,
 ) -> Result<XValue, String> {
     check_prefixes(expr, namespaces)?;
-    let ast = Parser::new(expr).parse()?;
+    let ast = Parser::new(expr).parse().map_err(|message| format!("{message} ({expr})"))?;
     let mut ctx = Eval { store, node: context, position: 1, size: 1, namespaces, variables, functions };
     let value = ctx.eval(&ast)?;
     let store = ctx.store.borrow();

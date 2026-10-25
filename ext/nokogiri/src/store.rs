@@ -338,6 +338,10 @@ impl Store {
         chain
     }
 
+    pub fn creates_cycle(&self, parent: u32, child: u32) -> bool {
+        parent == child || self.ancestor_of(child, parent)
+    }
+
     fn ancestor_of(&self, ancestor: u32, mut node: u32) -> bool {
         while let Some(parent) = self.nodes[node as usize].parent {
             if parent == ancestor {
