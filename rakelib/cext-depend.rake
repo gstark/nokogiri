@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 namespace "cext" do
-  desc "Regenerate C extension dependencies in #{File.dirname(NOKOGIRI_SPEC.extensions.first)}/depend"
+  if NOKOGIRI_SPEC.extensions.any?
+    desc "Regenerate C extension dependencies in #{File.dirname(NOKOGIRI_SPEC.extensions.first)}/depend"
+  end
   task :depend do
     # this task requires the `makedepend` utility
     NOKOGIRI_SPEC.extensions.each do |extconf|

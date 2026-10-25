@@ -1620,7 +1620,8 @@ module Nokogiri
           save_options = options[:save_with] || options[1]
           indent_times = options[:indent] || 0
         else
-          save_options = options[:save_with] || options[1] || SaveOptions::FORMAT
+          default_save = document&.html? ? SaveOptions::DEFAULT_HTML : SaveOptions::FORMAT
+          save_options = options[:save_with] || options[1] || default_save
           indent_times = options[:indent] || 2
         end
         indent_text = options[:indent_text] || " "
@@ -1731,7 +1732,9 @@ module Nokogiri
         {}.tap do |values|
           requested_keys.each do |key|
             method = DECONSTRUCT_METHODS[key] || key
-            values[key] = send(method)
+            value = send(method)
+            value = value.to_a if key == :attributes && value.respond_to?(:to_a)
+            values[key] = value
           end
         end
       end
