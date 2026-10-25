@@ -777,8 +777,13 @@ impl<'a> XmlParser<'a> {
             }
         }
 
-        // Resolve the element's namespace URI from its prefix.
-        let elem_ns = self.ns.resolve(prefix).map(String::from);
+        // Copy the URI only for a prefixed name. An unprefixed element keeps
+        // `None` here; the store import binds the in-scope default namespace.
+        let elem_ns = if prefix.is_some() {
+            self.ns.resolve(prefix).map(String::from)
+        } else {
+            None
+        };
 
         // Check for unbound element prefix.
         if let Some(pfx) = prefix {

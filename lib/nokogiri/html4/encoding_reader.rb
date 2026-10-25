@@ -12,6 +12,10 @@ module Nokogiri
 
     # :nodoc: all
     class EncodingReader
+      # One pass: skip comments and raw text, and keep meta start tags.
+      META_OR_SKIP = /<!--.*?-->|<script\b[^>]*>.*?<\/script>|<style\b[^>]*>.*?<\/style>|<meta\b(?:[^>"']+|"[^"]*"|'[^']*')*>/im
+      META_ATTR = /([^\s=\/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+)))?/
+
       class EncodingFound < StandardError
         attr_reader :found_encoding
 
@@ -68,14 +72,41 @@ module Nokogiri
             nil
           end
         else
-          handler = SAXHandler.new
-          parser = Nokogiri::HTML4::SAX::PushParser.new(handler)
-          begin
-            parser << chunk
-          rescue
-            Nokogiri::SyntaxError
+          # The SAX push parser builds a full document before the first callback.
+          # A scan finds the same meta charset without that parse.
+          scan_meta_charset(chunk)
+        end
+      end
+
+      class << self
+        private
+
+        # Last meta charset in the chunk wins, matching SAXHandler#start_element.
+        # Comments, script, and style are skipped.
+        def scan_meta_charset(chunk)
+          found = nil
+          chunk.b.scan(META_OR_SKIP) do |token|
+            next unless token.byteslice(1, 4)&.downcase == "meta"
+
+            found = charset_from_meta(token) || found
           end
-          handler.encoding
+          return unless found
+
+          found.ascii_only? ? found.force_encoding(Encoding::US_ASCII) : found
+        end
+
+        def charset_from_meta(tag)
+          attrs = {}
+          tag.scan(META_ATTR) do |name, double_quoted, single_quoted, bare|
+            attrs[name.downcase] = double_quoted || single_quoted || bare || ""
+          end
+          encoding = attrs["charset"] if attrs.key?("charset") && !attrs["charset"].empty?
+          http_equiv = attrs["http-equiv"]
+          if http_equiv&.match?(/\AContent-Type\z/i) && (content = attrs["content"]) &&
+              (match = content.match(/;\s*charset\s*=\s*([\w-]+)/))
+            encoding = match[1]
+          end
+          encoding
         end
       end
 

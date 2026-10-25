@@ -610,7 +610,13 @@ module Nokogiri
       # See also: #native_content=
       #
       def content=(string)
-        self.native_content = encode_special_chars(string.to_s)
+        string = string.to_s
+        # Plain text has no markup and no entity. Skip the encoder and the parser.
+        if string.include?("<") || string.include?("&")
+          self.native_content = encode_special_chars(string)
+        else
+          self.native_content = string
+        end
       end
 
       ###
@@ -1814,7 +1820,12 @@ module Nokogiri
 
       def add_child_node_and_reparent_attrs(node)
         add_child_node(node)
-        node.attribute_nodes.find_all { |a| a.name.include?(":") }.each do |attr_node|
+        attrs = node.attribute_nodes
+        return if attrs.empty?
+
+        attrs.each do |attr_node|
+          next unless attr_node.name.include?(":")
+
           attr_node.remove
           node[attr_node.name] = attr_node.value
         end

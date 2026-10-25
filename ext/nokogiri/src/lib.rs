@@ -56,6 +56,7 @@ thread_local! {
 }
 
 struct Classes {
+    node: RClass,
     element: RClass,
     text: RClass,
     cdata: RClass,
@@ -79,6 +80,7 @@ struct Classes {
 fn classes() -> Classes {
     CLASSES.with(|slot| {
         slot.borrow().as_ref().map(|classes| Classes {
+            node: classes.node,
             element: classes.element,
             text: classes.text,
             cdata: classes.cdata,
@@ -360,6 +362,14 @@ fn node_list(ruby: &Ruby, store: &Rc<RefCell<Store>>, ids: &[u32]) -> Result<Val
     make_nodeset(ruby, document, nodes)
 }
 
+fn node_array(ruby: &Ruby, store: &Rc<RefCell<Store>>, ids: &[u32]) -> Result<Value, Error> {
+    let array = ruby.ary_new();
+    for id in ids {
+        array.push(wrap_node(ruby, store, *id, None))?;
+    }
+    Ok(array.as_value())
+}
+
 fn bytes_of(value: Value) -> Result<Vec<u8>, Error> {
     if value.is_nil() {
         return Ok(Vec::new());
@@ -496,12 +506,16 @@ fn node_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
     if !matches!(kind, DOCUMENT | HTML_DOCUMENT) {
         ruby.warning("Passing a Node as the second parameter to Node.new is deprecated. Please pass a Document instead, or prefer an alternative constructor like Node#add_child. This will become an error in Nokogiri v1.17.0.");
     }
-    let owner = store.borrow().nodes[doc_id as usize].owner;
-    let id = store.borrow_mut().alloc(ELEMENT, owner);
-    store.borrow_mut().nodes[id as usize].name = Some(name);
+    let id = {
+        let mut store_ref = store.borrow_mut();
+        let owner = store_ref.nodes[doc_id as usize].owner;
+        let id = store_ref.alloc(ELEMENT, owner);
+        store_ref.nodes[id as usize].name = Some(name);
+        id
+    };
     // Node.new and Element.new both build an element. A subclass keeps its class.
-    let class_name: String = class.funcall("name", ()).unwrap_or_default();
-    let class_override = if class_name == "Nokogiri::XML::Node" || class_name == "Nokogiri::XML::Element" {
+    let stock = classes();
+    let class_override = if class.equal(stock.node).unwrap_or(false) || class.equal(stock.element).unwrap_or(false) {
         None
     } else {
         Some(class)
@@ -704,10 +718,17 @@ fn attribute_nodes(ruby: &Ruby, handle: &NodeHandle) -> Result<Value, Error> {
         } else {
             Vec::new()
         };
-        return node_list(ruby, &store, &ids);
+        return node_array(ruby, &store, &ids);
     }
-    let ids = store.borrow().nodes[id as usize].attrs.clone();
-    node_list(ruby, &store, &ids)
+    let ids = {
+        let store_ref = store.borrow();
+        let attrs = &store_ref.nodes[id as usize].attrs;
+        if attrs.is_empty() {
+            return Ok(ruby.ary_new().as_value());
+        }
+        attrs.clone()
+    };
+    node_array(ruby, &store, &ids)
 }
 
 fn child(ruby: &Ruby, handle: &NodeHandle) -> Option<Value> {
@@ -1027,21 +1048,29 @@ fn add_child_node(ruby: &Ruby, rb_self: Value, child: Value) -> Result<Value, Er
             }
         }
     }
-    store.borrow_mut().append_child(parent, child_id);
-    relink_node(ruby, &store, child_id);
+    {
+        let mut store_ref = store.borrow_mut();
+        let child_kind = store_ref.nodes[child_id as usize].kind;
+        store_ref.append_child(parent, child_id);
+        if child_kind == TEXT {
+            store_ref.merge_appended_text(parent, child_id);
+        } else {
+            let inheritance = store_ref.namespace_inheritance;
+            store_ref.relink_namespace(child_id, inheritance);
+        }
+    }
     let value = wrap_node(ruby, &store, child_id, None);
     decorate_node(value);
     Ok(value)
 }
 
-fn namespace_inheritance_enabled(ruby: &Ruby, store: &Rc<RefCell<Store>>) -> bool {
-    let document = store.borrow().wrappers.first().copied().flatten();
-    let Some(document) = document else {
-        return false;
-    };
-    get_ivar(document, "@namespace_inheritance")
-        .ok()
-        .is_some_and(|value| !value.is_nil() && value.is_kind_of(ruby.class_true_class()))
+fn namespace_inheritance_enabled(_ruby: &Ruby, store: &Rc<RefCell<Store>>) -> bool {
+    store.borrow().namespace_inheritance
+}
+
+fn set_namespace_inheritance(handle: &NodeHandle, enabled: bool) -> bool {
+    handle.store().borrow_mut().namespace_inheritance = enabled;
+    enabled
 }
 
 fn relink_node(ruby: &Ruby, store: &Rc<RefCell<Store>>, id: u32) {
@@ -1084,20 +1113,33 @@ fn replace_node(ruby: &Ruby, rb_self: Value, node: Value) -> Result<Value, Error
     }
     let owner = store.borrow().nodes[old as usize].owner;
     let node_id = adopt(&node_store, node_id, &store, owner);
-    store.borrow_mut().replace_with(old, node_id);
-    relink_node(ruby, &store, node_id);
+    {
+        let mut store_ref = store.borrow_mut();
+        let child_kind = store_ref.nodes[node_id as usize].kind;
+        store_ref.replace_with(old, node_id);
+        if child_kind == TEXT {
+            store_ref.merge_replaced_text(node_id);
+        } else {
+            let inheritance = store_ref.namespace_inheritance;
+            store_ref.relink_namespace(node_id, inheritance);
+        }
+    }
     let value = wrap_node(ruby, &store, node_id, None);
     decorate_node(value);
     Ok(value)
 }
 
-fn native_content_set(ruby: &Ruby, handle: &NodeHandle, content: String) -> Result<String, Error> {
+fn native_content_set(ruby: &Ruby, handle: &NodeHandle, content: String) -> Result<(), Error> {
     let store = handle.store();
     let id = handle.id();
     let kind = store.borrow().nodes[id as usize].kind;
     if matches!(kind, TEXT | CDATA | COMMENT | PI | ATTRIBUTE | ENTITY_REF) {
-        store.borrow_mut().nodes[id as usize].content = content.clone();
-        return Ok(content);
+        store.borrow_mut().nodes[id as usize].content = content;
+        return Ok(());
+    }
+    if !content.bytes().any(|byte| byte == b'<' || byte == b'&') {
+        store.borrow_mut().set_plain_content(id, content);
+        return Ok(());
     }
     let children = store.borrow().nodes[id as usize].children.clone();
     for child in children {
@@ -1110,7 +1152,7 @@ fn native_content_set(ruby: &Ruby, handle: &NodeHandle, content: String) -> Resu
         store.borrow_mut().append_child(id, child);
     }
     let _ = ruby;
-    Ok(content)
+    Ok(())
 }
 
 fn in_context(ruby: &Ruby, handle: &NodeHandle, input: String, options: i32) -> Result<Value, Error> {
@@ -1281,6 +1323,7 @@ fn initialize_copy_document(rb_self: Value, other: Value, level: i32) -> Result<
         let mut destination = dest.borrow_mut();
         let from = source.nodes[0].clone();
         destination.html = source.html;
+        destination.namespace_inheritance = source.namespace_inheritance;
         {
             let node = &mut destination.nodes[0];
             node.name = from.name.clone();
@@ -2807,6 +2850,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     CLASSES.with(|slot| {
         *slot.borrow_mut() = Some(Classes {
+            node,
             element,
             text,
             cdata,
@@ -2836,6 +2880,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     document.define_method("root=", method!(set_root, 1))?;
     document.define_method("encoding", method!(document_encoding, 0))?;
     document.define_method("encoding=", method!(set_encoding, 1))?;
+    document.define_method("native_namespace_inheritance=", method!(set_namespace_inheritance, 1))?;
     document.define_method("version", method!(version, 0))?;
     document.define_method("canonicalize", method!(canonicalize, -1))?;
     document.define_method("url", method!(url, 0))?;

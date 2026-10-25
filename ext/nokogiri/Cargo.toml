@@ -14,5 +14,5 @@ magnus = { version = "0.9.3", features = ["rb-sys"] }
 xmloxide = { path = "vendor/xmloxide", default-features = false }
 
 [profile.release]
-lto = false
-codegen-units = 16
+lto = "thin"
+codegen-units = 1

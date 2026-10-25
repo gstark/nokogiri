@@ -363,11 +363,10 @@ module Nokogiri
       end
 
       def css_class(hay, needle)
-        if @builtins == BuiltinsConfig::ALWAYS || (@builtins == BuiltinsConfig::OPTIMAL && Nokogiri.uses_libxml?)
-          # use the builtin implementation
+        # The JRuby builtin is slower than the vanilla expression. The CRuby builtin is faster.
+        if @builtins == BuiltinsConfig::ALWAYS || (@builtins == BuiltinsConfig::OPTIMAL && !Nokogiri.jruby?)
           "nokogiri-builtin:css-class(#{hay},'#{needle}')"
         else
-          # use only ordinary xpath functions
           "contains(concat(' ',normalize-space(#{hay}),' '),' #{needle} ')"
         end
       end

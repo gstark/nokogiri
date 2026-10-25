@@ -53,7 +53,7 @@ pub fn import(
 }
 
 fn document_to_store(
-    doc: Document,
+    mut doc: Document,
     url: Option<String>,
     encoding: Option<String>,
     options: i32,
@@ -68,7 +68,9 @@ fn document_to_store(
     apply_document_fields(&store, &url, &encoding, html, doc.version.as_deref(), doc.encoding.as_deref());
     {
         let mut store_ref = store.borrow_mut();
-        import_children(&doc, &mut store_ref, doc.root(), 0, html, options);
+        store_ref.reserve_nodes(doc.node_count());
+        let root = doc.root();
+        import_children(&mut doc, &mut store_ref, root, 0, html, options);
     }
     Parsed { store, errors }
 }
@@ -108,80 +110,80 @@ fn apply_document_fields(
     }
 }
 
-fn import_children(doc: &Document, store: &mut Store, oxide_parent: NodeId, parent: u32, html: bool, options: i32) {
-    for child in doc.children(oxide_parent) {
-        import_node(doc, store, child, parent, html, options);
+fn import_children(doc: &mut Document, store: &mut Store, oxide_parent: NodeId, parent: u32, html: bool, options: i32) {
+    let mut child = doc.first_child(oxide_parent);
+    while let Some(id) = child {
+        let next = doc.next_sibling(id);
+        import_node(doc, store, id, parent, html, options);
+        child = next;
     }
 }
 
-fn import_node(doc: &Document, store: &mut Store, id: NodeId, parent: u32, html: bool, options: i32) {
-    let kind = doc.node(id).kind.clone();
+fn import_node(doc: &mut Document, store: &mut Store, id: NodeId, parent: u32, html: bool, options: i32) {
+    let line = source_line(doc, id);
+    let kind = doc.take_kind(id);
     match kind {
         NodeKind::Document => {
             import_children(doc, store, id, parent, html, options);
         }
         NodeKind::Element { name, prefix, namespace, attributes } => {
-            import_element(doc, store, id, parent, html, options, name, prefix, namespace, attributes);
+            import_element(doc, store, id, parent, html, options, name, prefix, namespace, attributes, line);
         }
         NodeKind::Text { content } => {
             if skip_text(&content, options) {
                 return;
             }
-            add_text_at(store, parent, content, source_line(doc, id));
+            add_text_at(store, parent, content, line);
         }
         NodeKind::CData { content } => {
             if options & NOCDATA != 0 {
                 if !skip_text(&content, options) {
-                    add_text_at(store, parent, content, source_line(doc, id));
+                    add_text_at(store, parent, content, line);
                 }
                 return;
             }
             let node = store.alloc(CDATA, 0);
             store.nodes[node as usize].content = content;
-            store.nodes[node as usize].line = source_line(doc, id);
+            store.nodes[node as usize].line = line;
             store.append_child(parent, node);
         }
         NodeKind::Comment { content } => {
             let node = store.alloc(COMMENT, 0);
-            store.nodes[node as usize].name = Some("comment".to_string());
             store.nodes[node as usize].content = content;
-            store.nodes[node as usize].line = source_line(doc, id);
+            store.nodes[node as usize].line = line;
             store.append_child(parent, node);
         }
         NodeKind::ProcessingInstruction { target, data } => {
             let node = store.alloc(PI, 0);
             store.nodes[node as usize].name = Some(target);
             store.nodes[node as usize].content = data.unwrap_or_default();
-            store.nodes[node as usize].line = source_line(doc, id);
+            store.nodes[node as usize].line = line;
             store.append_child(parent, node);
         }
         NodeKind::EntityRef { name, value } => {
             if options & NOENT != 0 {
-                let children: Vec<NodeId> = doc.children(id).collect();
-                if children.is_empty() {
+                if doc.first_child(id).is_none() {
                     if let Some(value) = value {
                         if !value.is_empty() {
-                            add_text_at(store, parent, value, source_line(doc, id));
+                            add_text_at(store, parent, value, line);
                         }
                     }
                     return;
                 }
-                for child in children {
-                    import_node(doc, store, child, parent, html, options);
-                }
+                import_children(doc, store, id, parent, html, options);
                 return;
             }
             let node = store.alloc(ENTITY_REF, 0);
             store.nodes[node as usize].name = Some(name);
             store.nodes[node as usize].content = value.unwrap_or_default();
-            store.nodes[node as usize].line = source_line(doc, id);
+            store.nodes[node as usize].line = line;
             store.append_child(parent, node);
         }
         NodeKind::DocumentType { name, system_id, public_id, internal_subset } => {
             let node = store.alloc(DTD, 0);
-            let dtd_name = if html { name.to_ascii_lowercase() } else { name };
+            let dtd_name = owned_html_name(html, name);
             store.nodes[node as usize].name = Some(if dtd_name.is_empty() { "html".to_string() } else { dtd_name });
-            store.nodes[node as usize].line = source_line(doc, id);
+            store.nodes[node as usize].line = line;
             store.nodes[node as usize].external_id = public_id;
             store.nodes[node as usize].system_id = system_id;
             if let Some(subset) = internal_subset {
@@ -196,7 +198,7 @@ fn import_node(doc: &Document, store: &mut Store, id: NodeId, parent: u32, html:
 }
 
 fn import_element(
-    doc: &Document,
+    doc: &mut Document,
     store: &mut Store,
     id: NodeId,
     parent: u32,
@@ -206,19 +208,11 @@ fn import_element(
     prefix: Option<String>,
     namespace: Option<String>,
     attributes: Vec<Attribute>,
+    line: i64,
 ) {
-    let local = if html { name.to_ascii_lowercase() } else { name };
-    let shown = if html {
-        match prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => format!("{}:{local}", prefix.to_ascii_lowercase()),
-            _ => local.clone(),
-        }
-    } else {
-        local.clone()
-    };
+    let local = owned_html_name(html, name);
     let node = store.alloc(ELEMENT, 0);
-    store.nodes[node as usize].name = Some(shown);
-    store.nodes[node as usize].line = source_line(doc, id);
+    store.nodes[node as usize].line = line;
     store.append_child(parent, node);
 
     if html {
@@ -245,27 +239,45 @@ fn import_element(
         }
         bind_ns(store, node, prefix.as_deref(), namespace.as_deref(), &local);
     }
+    if store.nodes[node as usize].name.is_none() {
+        store.nodes[node as usize].name = Some(shown_name(html, local, prefix.as_deref()));
+    }
     import_children(doc, store, id, node, html, options);
 }
 
 fn import_attribute(store: &mut Store, element: u32, html: bool, attr: Attribute) {
-    let local = if html { attr.name.to_ascii_lowercase() } else { attr.name };
-    let shown = if html {
-        match attr.prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => format!("{}:{local}", prefix.to_ascii_lowercase()),
-            _ => local.clone(),
-        }
-    } else {
-        local.clone()
-    };
+    let local = owned_html_name(html, attr.name);
+    let prefix = attr.prefix;
     let node = store.alloc(ATTRIBUTE, 0);
-    store.nodes[node as usize].name = Some(shown);
     store.nodes[node as usize].content = attr.value;
     store.append_child(element, node);
     // An unprefixed attribute is not in the default namespace.
-    if !html && attr.prefix.is_some() {
-        bind_ns(store, node, attr.prefix.as_deref(), attr.namespace.as_deref(), &local);
+    if !html && prefix.is_some() {
+        bind_ns(store, node, prefix.as_deref(), attr.namespace.as_deref(), &local);
     }
+    if store.nodes[node as usize].name.is_none() {
+        store.nodes[node as usize].name = Some(shown_name(html, local, prefix.as_deref()));
+    }
+}
+
+fn owned_html_name(html: bool, name: String) -> String {
+    if html && name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        name.to_ascii_lowercase()
+    } else {
+        name
+    }
+}
+
+fn shown_name(html: bool, local: String, prefix: Option<&str>) -> String {
+    if html {
+        if let Some(prefix) = prefix {
+            if !prefix.is_empty() {
+                let prefix = owned_html_name(true, prefix.to_string());
+                return format!("{prefix}:{local}");
+            }
+        }
+    }
+    local
 }
 
 fn is_xmlns(attr: &Attribute) -> bool {
@@ -340,13 +352,12 @@ fn add_text(store: &mut Store, parent: u32, content: String) {
         }
     }
     let node = store.alloc(TEXT, 0);
-    store.nodes[node as usize].name = Some("text".to_string());
     store.nodes[node as usize].content = content;
     store.append_child(parent, node);
 }
 
 fn skip_text(content: &str, options: i32) -> bool {
-    content.chars().all(char::is_whitespace) && options & NOBLANKS != 0
+    options & NOBLANKS != 0 && content.bytes().all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 fn errors_from_failure(error: &OxideParseError) -> Vec<ParseError> {

@@ -270,6 +270,34 @@ fn is_head_content_element(tag: &str) -> bool {
     )
 }
 
+/// Copies `len` bytes from `input` into `out`. A CR becomes LF. CRLF becomes one LF.
+fn append_html_slice(out: &mut String, input: &mut ParserInput<'_>, len: usize) {
+    let start = input.pos();
+    {
+        let chunk = input.slice(start, start + len);
+        if !chunk.contains(&b'\r') {
+            match std::str::from_utf8(chunk) {
+                Ok(text) => out.push_str(text),
+                Err(_) => out.push_str(&String::from_utf8_lossy(chunk)),
+            }
+        } else {
+            let lossy = String::from_utf8_lossy(chunk);
+            let mut chars = lossy.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\r' {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push('\n');
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    input.advance_counting_lines(len);
+}
+
 // --- The HTML Parser ---
 
 /// The core HTML parser state machine.
@@ -299,10 +327,11 @@ impl<'a> HtmlParser<'a> {
     fn new(input: &'a str, options: &HtmlParseOptions) -> Self {
         let mut pi = ParserInput::new(input);
         pi.set_recover(options.recover);
+        let estimated_nodes = (input.len() / 30).max(64);
 
         Self {
             input: pi,
-            doc: Document::new(),
+            doc: Document::with_capacity(estimated_nodes),
             options: options.clone(),
             open_elements: Vec::new(),
             fatal_error: None,
@@ -886,18 +915,25 @@ impl<'a> HtmlParser<'a> {
             self.input.advance(1); // consume opening quote
             let mut value = String::new();
             while !self.input.at_end() {
-                let ch = self.input.peek();
-                if ch == Some(quote) {
+                let safe_len = self.input.scan_attr_value(quote);
+                if safe_len > 0 {
+                    append_html_slice(&mut value, &mut self.input, safe_len);
+                    continue;
+                }
+                if self.input.peek() == Some(quote) {
                     self.input.advance(1);
                     break;
                 }
-                if ch == Some(b'&') {
+                if self.input.peek() == Some(b'&') {
                     let resolved = self.parse_html_reference();
                     value.push_str(&resolved);
-                } else {
-                    let c = self.next_char_html();
-                    value.push(c);
+                    continue;
                 }
+                let c = self.next_char_html();
+                if c == '\0' && self.input.at_end() {
+                    break;
+                }
+                value.push(c);
             }
             value
         } else {
@@ -946,6 +982,11 @@ impl<'a> HtmlParser<'a> {
         let mut text = String::new();
 
         while !self.input.at_end() {
+            let safe_len = self.input.scan_char_data();
+            if safe_len > 0 {
+                append_html_slice(&mut text, &mut self.input, safe_len);
+                continue;
+            }
             if self.input.peek() == Some(b'<') {
                 break;
             }
@@ -955,6 +996,9 @@ impl<'a> HtmlParser<'a> {
                 text.push_str(&resolved);
             } else {
                 let ch = self.next_char_html();
+                if ch == '\0' && self.input.at_end() {
+                    break;
+                }
                 text.push(ch);
             }
         }
@@ -989,7 +1033,15 @@ impl<'a> HtmlParser<'a> {
             if self.input.looking_at_ci(&end_tag_bytes) {
                 break;
             }
+            let safe_len = self.input.scan_until_byte(b'<');
+            if safe_len > 0 {
+                append_html_slice(&mut content, &mut self.input, safe_len);
+                continue;
+            }
             let ch = self.next_char_html();
+            if ch == '\0' && self.input.at_end() {
+                break;
+            }
             content.push(ch);
         }
 

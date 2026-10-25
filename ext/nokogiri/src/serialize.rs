@@ -640,7 +640,11 @@ fn name_is(name: &str, names: &[&str]) -> bool {
 }
 
 pub fn escape_text(text: &str) -> String {
-    let mut out = String::new();
+    let bytes = text.as_bytes();
+    if bytes.iter().all(|byte| !matches!(byte, b'&' | b'<' | b'>' | b'\r')) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
             '&' => out.push_str("&amp;"),

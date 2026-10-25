@@ -737,42 +737,42 @@ describe Nokogiri::CSS::XPathVisitor do
     #  If someone can explain to me why this is, and fix it, I will love you forever.
     #
     it ". class" do
-      if Nokogiri.uses_libxml?
+      if Nokogiri.jruby?
         assert_xpath(
-          "//*[nokogiri-builtin:css-class(@class,'awesome')]",
+          "//*[contains(concat(' ',normalize-space(@class),' '),' awesome ')]",
           ".awesome",
         )
       else
         assert_xpath(
-          "//*[contains(concat(' ',normalize-space(@class),' '),' awesome ')]",
+          "//*[nokogiri-builtin:css-class(@class,'awesome')]",
           ".awesome",
         )
       end
     end
 
     it "~=" do
-      if Nokogiri.uses_libxml?
+      if Nokogiri.jruby?
         assert_xpath(
-          "//a[nokogiri-builtin:css-class(@class,'bar')]",
+          "//a[contains(concat(' ',normalize-space(@class),' '),' bar ')]",
           "a[class~='bar']",
         )
       else
         assert_xpath(
-          "//a[contains(concat(' ',normalize-space(@class),' '),' bar ')]",
+          "//a[nokogiri-builtin:css-class(@class,'bar')]",
           "a[class~='bar']",
         )
       end
     end
 
     it "~= (extended-syntax)" do
-      if Nokogiri.uses_libxml?
+      if Nokogiri.jruby?
         assert_xpath(
-          "//a[nokogiri-builtin:css-class(@class,'bar')]",
+          "//a[contains(concat(' ',normalize-space(@class),' '),' bar ')]",
           "a[@class~='bar']",
         )
       else
         assert_xpath(
-          "//a[contains(concat(' ',normalize-space(@class),' '),' bar ')]",
+          "//a[nokogiri-builtin:css-class(@class,'bar')]",
           "a[@class~='bar']",
         )
       end

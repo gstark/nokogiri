@@ -640,6 +640,13 @@ impl<'a> ParserInput<'a> {
 
     // -- Bulk scanning --
 
+    /// Bytes from the current position until `marker`, or the rest of the input.
+    #[inline]
+    pub fn scan_until_byte(&self, marker: u8) -> usize {
+        let bytes = &self.input[self.pos..];
+        bytes.iter().position(|&byte| byte == marker).unwrap_or(bytes.len())
+    }
+
     /// Scans forward from the current position to find the next character data
     /// boundary (`<`, `&`, or `]]>`). Returns the number of safe bytes that
     /// can be consumed as plain text content.

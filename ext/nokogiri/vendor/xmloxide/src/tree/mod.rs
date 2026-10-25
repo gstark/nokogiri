@@ -387,6 +387,12 @@ impl Document {
         &self.nodes[id.as_index()]
     }
 
+    /// Removes the node payload and leaves an empty document node in its place.
+    /// Child links stay in place so the caller can still walk the tree.
+    pub fn take_kind(&mut self, id: NodeId) -> NodeKind {
+        std::mem::replace(&mut self.nodes[id.as_index()].kind, NodeKind::Document)
+    }
+
     /// Returns a mutable reference to the `NodeData` for the given node.
     #[inline]
     pub(crate) fn node_mut(&mut self, id: NodeId) -> &mut NodeData {

@@ -186,12 +186,17 @@ module Nokogiri
       #   #    </root>
       #
       # Since v1.12.4
-      attr_accessor :namespace_inheritance
+      attr_reader :namespace_inheritance
+
+      def namespace_inheritance=(value)
+        @namespace_inheritance = value
+        self.native_namespace_inheritance = value ? true : false
+      end
 
       def initialize(*args) # :nodoc: # rubocop:disable Lint/MissingSuper
         @errors     = []
         @decorators = nil
-        @namespace_inheritance = false
+        self.namespace_inheritance = false
       end
 
       #

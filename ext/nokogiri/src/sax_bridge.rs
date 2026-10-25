@@ -2,6 +2,7 @@
 //! implied html, head, and body tags are present. Push parsing reparses the
 //! buffer and emits only the new suffix of events.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use magnus::error::Error;
@@ -265,6 +266,16 @@ fn parse_context(ruby: &Ruby, context: Value, parser: Value, html_method: bool) 
         let _ = call(document, "error", (message.as_str(),));
         String::from_utf8_lossy(&bytes).into_owned()
     });
+    if html {
+        // One-shot HTML SAX walks the tree into Ruby callbacks. The push parser
+        // still materializes events so it can emit only the new suffix.
+        call(document, "start_document", ())?;
+        if let Ok(doc) = parse_html5(&text) {
+            emit_html_tree(ruby, document, &doc, doc.root())?;
+        }
+        call(document, "end_document", ())?;
+        return Ok(ruby.qnil().as_value());
+    }
     let parsed = collect(&text, html, recover, replace);
     let mut cursor = 0usize;
     emit(ruby, document, Some(context), &text, &mut cursor, &parsed.events)?;
@@ -402,6 +413,54 @@ fn walk_html(doc: &Document, id: NodeId, events: &mut Vec<Ev>) {
             NodeKind::Document => walk_html(doc, child, events),
             _ => {}
         }
+    }
+}
+
+fn emit_html_tree(ruby: &Ruby, document: Value, doc: &Document, id: NodeId) -> Result<(), Error> {
+    for child in doc.children(id) {
+        emit_html_node(ruby, document, doc, child)?;
+    }
+    Ok(())
+}
+
+fn emit_html_node(ruby: &Ruby, document: Value, doc: &Document, id: NodeId) -> Result<(), Error> {
+    match &doc.node(id).kind {
+        NodeKind::Element { name, attributes, .. } => {
+            let name = lower_ascii(name);
+            let list = ruby.ary_new();
+            for attr in attributes {
+                let pair = ruby.ary_new();
+                let attr_name = lower_ascii(&attr.name);
+                pair.push(attr_name.as_ref())?;
+                if attr.value.is_empty() {
+                    pair.push(ruby.qnil().as_value())?;
+                } else {
+                    pair.push(attr.value.as_str())?;
+                }
+                list.push(pair)?;
+            }
+            call(document, "start_element", (name.as_ref(), list))?;
+            emit_html_tree(ruby, document, doc, id)?;
+            call(document, "end_element", (name.as_ref(),))?;
+        }
+        NodeKind::Text { content } | NodeKind::CData { content } => {
+            call(document, "characters", (content.as_str(),))?;
+        }
+        NodeKind::Comment { content } => call(document, "comment", (content.as_str(),))?,
+        NodeKind::ProcessingInstruction { target, data } => {
+            call(document, "processing_instruction", (target.as_str(), opt(ruby, data)))?;
+        }
+        NodeKind::Document => emit_html_tree(ruby, document, doc, id)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn lower_ascii(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     }
 }
 

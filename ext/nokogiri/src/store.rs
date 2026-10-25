@@ -98,6 +98,7 @@ pub struct Store {
     pub notations: Vec<Notation>,
     pub key: u64,
     pub html: bool,
+    pub namespace_inheritance: bool,
 }
 
 impl NodeData {
@@ -114,7 +115,7 @@ impl NodeData {
             owner,
             line: 0,
             column: 0,
-            version: "1.0".to_string(),
+            version: String::new(),
             encoding: None,
             url: None,
             lang: None,
@@ -132,6 +133,7 @@ impl Store {
         let kind = if html { HTML_DOCUMENT } else { DOCUMENT };
         let mut doc = NodeData::blank(kind, 0);
         doc.name = Some("document".to_string());
+        doc.version = "1.0".to_string();
         doc.owner = 0;
         let store = Self {
             nodes: vec![doc],
@@ -143,8 +145,14 @@ impl Store {
             notations: Vec::new(),
             key,
             html,
+            namespace_inheritance: false,
         };
         Rc::new(RefCell::new(store))
+    }
+
+    pub fn reserve_nodes(&mut self, count: usize) {
+        self.nodes.reserve(count);
+        self.wrappers.reserve(count);
     }
 
     pub fn alloc(&mut self, kind: i32, owner: u32) -> u32 {
@@ -185,6 +193,105 @@ impl Store {
         } else {
             self.nodes[parent as usize].children.push(child);
         }
+    }
+
+    /// Replace element children with one text node. The caller already checked that
+    /// `content` has no markup and no entity references.
+    pub fn set_plain_content(&mut self, id: u32, content: String) {
+        if content.is_empty() {
+            let children = self.nodes[id as usize].children.clone();
+            for child in children {
+                self.unlink(child);
+            }
+            return;
+        }
+        if self.nodes[id as usize].children.len() == 1 {
+            let child = self.nodes[id as usize].children[0];
+            if self.nodes[child as usize].kind == TEXT && self.nodes[child as usize].children.is_empty() {
+                self.nodes[child as usize].content = content;
+                return;
+            }
+        }
+        let children = self.nodes[id as usize].children.clone();
+        for child in children {
+            self.unlink(child);
+        }
+        if content.is_empty() {
+            return;
+        }
+        let owner = self.nodes[id as usize].owner;
+        let text_id = self.alloc(TEXT, owner);
+        self.nodes[text_id as usize].content = content;
+        self.append_child(id, text_id);
+    }
+
+    /// libxml merges an appended text node into the previous text sibling.
+    pub fn merge_appended_text(&mut self, parent: u32, child: u32) {
+        if self.nodes[child as usize].kind != TEXT {
+            return;
+        }
+        let children = &self.nodes[parent as usize].children;
+        if children.len() < 2 || children.last().copied() != Some(child) {
+            return;
+        }
+        let prev = children[children.len() - 2];
+        if self.nodes[prev as usize].kind != TEXT {
+            return;
+        }
+        let extra = std::mem::take(&mut self.nodes[child as usize].content);
+        self.nodes[prev as usize].content.push_str(&extra);
+        self.unlink(child);
+    }
+
+    /// libxml `xmlReplaceNode` merges the new text node with both adjacent text siblings.
+    pub fn merge_replaced_text(&mut self, id: u32) {
+        let survivor = self.merge_text_prev(id);
+        self.merge_text_next(survivor);
+    }
+
+    fn merge_text_prev(&mut self, id: u32) -> u32 {
+        if self.nodes[id as usize].kind != TEXT {
+            return id;
+        }
+        let Some(parent) = self.nodes[id as usize].parent else {
+            return id;
+        };
+        let Some(index) = self.nodes[parent as usize].children.iter().position(|child| *child == id) else {
+            return id;
+        };
+        if index == 0 {
+            return id;
+        }
+        let prev = self.nodes[parent as usize].children[index - 1];
+        if self.nodes[prev as usize].kind != TEXT {
+            return id;
+        }
+        let extra = std::mem::take(&mut self.nodes[id as usize].content);
+        self.nodes[prev as usize].content.push_str(&extra);
+        self.unlink(id);
+        prev
+    }
+
+    fn merge_text_next(&mut self, id: u32) -> u32 {
+        if self.nodes[id as usize].kind != TEXT {
+            return id;
+        }
+        let Some(parent) = self.nodes[id as usize].parent else {
+            return id;
+        };
+        let Some(index) = self.nodes[parent as usize].children.iter().position(|child| *child == id) else {
+            return id;
+        };
+        let Some(next) = self.nodes[parent as usize].children.get(index + 1).copied() else {
+            return id;
+        };
+        if self.nodes[next as usize].kind != TEXT {
+            return id;
+        }
+        let extra = std::mem::take(&mut self.nodes[next as usize].content);
+        self.nodes[id as usize].content.push_str(&extra);
+        self.unlink(next);
+        id
     }
 
     pub fn insert_before(&mut self, sibling: u32, node: u32) {
@@ -241,6 +348,8 @@ impl Store {
         match self.nodes[id as usize].kind {
             CDATA => None,
             DOCUMENT_FRAG => Some("#document-fragment".to_string()),
+            TEXT => self.nodes[id as usize].name.clone().or_else(|| Some("text".to_string())),
+            COMMENT => self.nodes[id as usize].name.clone().or_else(|| Some("comment".to_string())),
             _ => self.nodes[id as usize].name.clone(),
         }
     }
@@ -463,14 +572,17 @@ impl Store {
             Some(ns) => self.nss[ns as usize].prefix.is_none(),
         };
         if prefix_missing {
-            let name = self.nodes[id as usize].name.clone().unwrap_or_default();
-            if let Some((prefix, local)) = split_qname_owned(&name) {
-                if kind == ATTRIBUTE && prefix == "xmlns" {
-                    return;
-                }
-                if let Some(ns) = self.lookup_ns(id, Some(&prefix)) {
-                    self.nodes[id as usize].name = Some(local);
-                    self.nodes[id as usize].ns = Some(ns);
+            let colon = self.nodes[id as usize].name.as_deref().is_some_and(|name| name.contains(':'));
+            if colon {
+                let name = self.nodes[id as usize].name.clone().unwrap_or_default();
+                if let Some((prefix, local)) = split_qname_owned(&name) {
+                    if kind == ATTRIBUTE && prefix == "xmlns" {
+                        return;
+                    }
+                    if let Some(ns) = self.lookup_ns(id, Some(&prefix)) {
+                        self.nodes[id as usize].name = Some(local);
+                        self.nodes[id as usize].ns = Some(ns);
+                    }
                 }
             } else if kind == ATTRIBUTE {
                 return;
@@ -490,32 +602,36 @@ impl Store {
             let parent_ns = self.nodes[parent as usize].ns;
             self.nodes[id as usize].ns = parent_ns;
         }
-        let defs = self.nodes[id as usize].ns_defs.clone();
-        let mut kept = Vec::with_capacity(defs.len());
-        for def in defs {
-            let prefix = self.nss[def as usize].prefix.clone();
-            let href = self.nss[def as usize].href.clone();
-            let redundant = self.lookup_ns_by_href(parent, &href).is_some_and(|ns| {
-                ns != def && self.nss[ns as usize].prefix == prefix
-            });
-            if !redundant {
-                kept.push(def);
+        if !self.nodes[id as usize].ns_defs.is_empty() {
+            let defs = self.nodes[id as usize].ns_defs.clone();
+            let mut kept = Vec::with_capacity(defs.len());
+            for def in defs {
+                let prefix = self.nss[def as usize].prefix.clone();
+                let href = self.nss[def as usize].href.clone();
+                let redundant = self.lookup_ns_by_href(parent, &href).is_some_and(|ns| {
+                    ns != def && self.nss[ns as usize].prefix == prefix
+                });
+                if !redundant {
+                    kept.push(def);
+                }
             }
+            self.nodes[id as usize].ns_defs = kept;
         }
-        self.nodes[id as usize].ns_defs = kept;
         if let Some(current) = self.nodes[id as usize].ns {
             let prefix = self.nss[current as usize].prefix.clone();
-            let href = self.nss[current as usize].href.clone();
             if let Some(ns) = self.lookup_ns(id, prefix.as_deref()) {
                 if ns != current
                     && self.nss[ns as usize].prefix == prefix
-                    && self.nss[ns as usize].href == href
+                    && self.nss[ns as usize].href == self.nss[current as usize].href
                 {
                     self.nodes[id as usize].ns = Some(ns);
                 }
             }
         }
         if self.nodes[id as usize].ns.is_none() {
+            return;
+        }
+        if self.nodes[id as usize].children.is_empty() && self.nodes[id as usize].attrs.is_empty() {
             return;
         }
         let children = self.nodes[id as usize].children.clone();

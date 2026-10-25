@@ -588,8 +588,20 @@ pub fn evaluate<'a>(
 ) -> Result<XValue, String> {
     check_prefixes(expr, namespaces)?;
     let ast = Parser::new(expr).parse().map_err(|message| format!("{message} ({expr})"))?;
-    let mut ctx = Eval { store, node: context, position: 1, size: 1, namespaces, variables, functions };
+    let mut ctx = Eval {
+        store,
+        node: context,
+        position: 1,
+        size: 1,
+        namespaces,
+        variables,
+        functions,
+        sorted: false,
+    };
     let value = ctx.eval(&ast)?;
+    if ctx.sorted {
+        return Ok(value);
+    }
     let store = ctx.store.borrow();
     Ok(sort_result(&store, value))
 }
@@ -602,6 +614,8 @@ struct Eval<'a> {
     namespaces: &'a HashMap<String, String>,
     variables: &'a HashMap<String, XValue>,
     functions: Option<&'a mut XPathFunction<'a>>,
+    /// The node-set from the latest step is already unique and in document order.
+    sorted: bool,
 }
 
 impl<'a> Eval<'a> {
@@ -643,8 +657,12 @@ impl<'a> Eval<'a> {
                 for item in items {
                     nodes.extend(self.nodes(item)?);
                 }
-                let store = self.store.borrow();
-                Ok(XValue::Nodes(unique_doc_order(&store, nodes)))
+                let nodes = {
+                    let store = self.store.borrow();
+                    unique_doc_order(&store, nodes)
+                };
+                self.sorted = true;
+                Ok(XValue::Nodes(nodes))
             }
             Expr::Path(absolute, steps) => self.eval_path(*absolute, steps),
             Expr::From(primary, steps) => {
@@ -671,14 +689,15 @@ impl<'a> Eval<'a> {
     }
 
     fn eval_from_nodes(&mut self, mut current: Vec<u32>, steps: &[Step]) -> Result<XValue, String> {
-        for step in steps {
-            if step.axis == Axis::Namespace {
+        let mut index = 0;
+        while index < steps.len() {
+            if steps[index].axis == Axis::Namespace {
                 let mut nss = Vec::new();
                 {
                     let store = self.store.borrow();
                     for node in &current {
                         for ns in namespace_axis(&store, *node) {
-                            if namespace_test(&store, ns, &step.test) {
+                            if namespace_test(&store, ns, &steps[index].test) {
                                 nss.push(ns);
                             }
                         }
@@ -686,19 +705,187 @@ impl<'a> Eval<'a> {
                 }
                 nss.sort_unstable();
                 nss.dedup();
+                self.sorted = true;
                 return Ok(XValue::Nss(nss));
             }
-            let mut next = Vec::new();
-            for node in current {
-                let mut matches = self.axis_nodes(node, step.axis);
-                matches.retain(|candidate| self.matches(*candidate, &step.test, step.axis));
-                matches = self.apply_preds(matches, &step.preds)?;
-                next.extend(matches);
+
+            // `//foo` is descendant-or-self::node()/child::foo. Test during one walk.
+            // A predicate stays with the child step, so `[1]` is the first match of each parent.
+            if index + 1 < steps.len() && can_fuse(&steps[index], &steps[index + 1]) {
+                let axis = steps[index + 1].axis;
+                let produced = self.fused_scan(&current, axis, &steps[index + 1].test, &steps[index + 1].preds)?;
+                current = produced;
+                index += 2;
+                continue;
             }
-            let store = self.store.borrow();
-            current = unique_doc_order(&store, next);
+
+            let axis = steps[index].axis;
+            if fast_axis(axis) {
+                current = self.collect_forward(&current, axis, &steps[index].test, &steps[index].preds)?;
+            } else {
+                let mut next = Vec::new();
+                let count = current.len();
+                for node_index in 0..count {
+                    let node = current[node_index];
+                    let mut matches = self.axis_nodes(node, axis);
+                    matches.retain(|candidate| self.matches(*candidate, &steps[index].test, axis));
+                    matches = self.apply_preds(matches, &steps[index].preds)?;
+                    next.extend(matches);
+                }
+                let store = self.store.borrow();
+                current = unique_doc_order(&store, next);
+            }
+            index += 1;
         }
+        self.sorted = true;
         Ok(XValue::Nodes(current))
+    }
+
+    /// Forward axes already emit document order. Predicates apply once for one
+    /// context node, and once per context node when several nodes are current.
+    fn collect_forward(&mut self, current: &[u32], axis: Axis, test: &NodeTest, preds: &[Expr]) -> Result<Vec<u32>, String> {
+        if preds.is_empty() {
+            return Ok(self.fast_collect(current, axis, test));
+        }
+        if current.len() == 1 {
+            let matches = self.fast_collect(current, axis, test);
+            return self.apply_preds(matches, preds);
+        }
+        let mut out = Vec::new();
+        let mut seen = if axis_overlaps(axis) {
+            Seen::on(self.store.borrow().nodes.len())
+        } else {
+            Seen::off()
+        };
+        for &node in current {
+            let matches = self.fast_collect(std::slice::from_ref(&node), axis, test);
+            let kept = self.apply_preds(matches, preds)?;
+            for id in kept {
+                if seen.mark(id) {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn fast_collect(&self, contexts: &[u32], axis: Axis, test: &NodeTest) -> Vec<u32> {
+        let store = self.store.borrow();
+        let mut out = Vec::new();
+        let mut seen = if contexts.len() > 1 && axis_overlaps(axis) {
+            Seen::on(store.nodes.len())
+        } else {
+            Seen::off()
+        };
+        if let NodeTest::Name { prefix: None, local: Some(local) } = test {
+            if axis != Axis::Attribute {
+                collect_elements(&store, contexts, axis, Some(local), &mut seen, &mut out);
+                return out;
+            }
+        }
+        for &ctx in contexts {
+            match axis {
+                Axis::Child => {
+                    for &child in &store.nodes[ctx as usize].children {
+                        push_match(&store, self.namespaces, child, axis, test, &mut seen, &mut out);
+                    }
+                }
+                Axis::Attribute => {
+                    for &attr in &store.nodes[ctx as usize].attrs {
+                        push_match(&store, self.namespaces, attr, axis, test, &mut seen, &mut out);
+                    }
+                }
+                Axis::Self_ => push_match(&store, self.namespaces, ctx, axis, test, &mut seen, &mut out),
+                Axis::Parent => {
+                    if let Some(parent) = store.nodes[ctx as usize].parent {
+                        push_match(&store, self.namespaces, parent, axis, test, &mut seen, &mut out);
+                    }
+                }
+                Axis::Descendant => walk_nodes(&store, self.namespaces, ctx, false, axis, test, &mut seen, &mut out),
+                Axis::DescendantOrSelf => walk_nodes(&store, self.namespaces, ctx, true, axis, test, &mut seen, &mut out),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn fused_scan(&mut self, contexts: &[u32], axis: Axis, test: &NodeTest, preds: &[Expr]) -> Result<Vec<u32>, String> {
+        if preds.is_empty() && axis == Axis::Child {
+            return Ok(self.fast_collect(contexts, Axis::Descendant, test));
+        }
+        let mut out = Vec::new();
+        let mut seen = if contexts.len() > 1 {
+            Seen::on(self.store.borrow().nodes.len())
+        } else {
+            Seen::off()
+        };
+        // Emit a matching child before that child's descendants, then the next sibling.
+        struct FuseFrame {
+            id: u32,
+            next: usize,
+            kept: Vec<u32>,
+            kept_i: usize,
+            prepared: bool,
+        }
+        let mut stack = Vec::new();
+        for &ctx in contexts.iter().rev() {
+            stack.push(FuseFrame { id: ctx, next: 0, kept: Vec::new(), kept_i: 0, prepared: false });
+        }
+        while !stack.is_empty() {
+            if !stack.last().unwrap().prepared {
+                let id = stack.last().unwrap().id;
+                let matching = {
+                    let store = self.store.borrow();
+                    let node = &store.nodes[id as usize];
+                    let ids: &[u32] = if axis == Axis::Attribute { &node.attrs } else { &node.children };
+                    let mut matching = Vec::new();
+                    for &candidate in ids {
+                        if node_test_matches(&store, self.namespaces, candidate, test, axis) {
+                            matching.push(candidate);
+                        }
+                    }
+                    matching
+                };
+                let kept = if matching.is_empty() || preds.is_empty() {
+                    matching
+                } else {
+                    self.apply_preds(matching, preds)?
+                };
+                let frame = stack.last_mut().unwrap();
+                frame.prepared = true;
+                if axis == Axis::Attribute {
+                    for matched in kept {
+                        if seen.mark(matched) {
+                            out.push(matched);
+                        }
+                    }
+                } else {
+                    frame.kept = kept;
+                }
+                continue;
+            }
+            let id = stack.last().unwrap().id;
+            let next = stack.last().unwrap().next;
+            let child = {
+                let store = self.store.borrow();
+                let children = &store.nodes[id as usize].children;
+                if next >= children.len() { None } else { Some(children[next]) }
+            };
+            let Some(child) = child else {
+                stack.pop();
+                continue;
+            };
+            let frame = stack.last_mut().unwrap();
+            frame.next = next + 1;
+            if frame.kept_i < frame.kept.len() && frame.kept[frame.kept_i] == child {
+                frame.kept_i += 1;
+                if seen.mark(child) {
+                    out.push(child);
+                }
+            }
+            stack.push(FuseFrame { id: child, next: 0, kept: Vec::new(), kept_i: 0, prepared: false });
+        }
+        Ok(out)
     }
 
     fn document(&self) -> u32 {
@@ -726,46 +913,11 @@ impl<'a> Eval<'a> {
 
     fn matches(&self, id: u32, test: &NodeTest, axis: Axis) -> bool {
         let store = self.store.borrow();
-        let kind = store.nodes[id as usize].kind;
-        match test {
-            NodeTest::Node => !matches!(axis, Axis::Attribute) || kind == ATTRIBUTE,
-            NodeTest::Text => matches!(kind, TEXT | CDATA),
-            NodeTest::Comment => kind == COMMENT,
-            NodeTest::Pi(target) => kind == PI && target.as_ref().map(|name| store.nodes[id as usize].name.as_deref() == Some(name)).unwrap_or(true),
-            NodeTest::Name { prefix, local } => self.match_name(&store, id, kind, axis, prefix, local),
-        }
-    }
-
-    fn match_name(&self, store: &Store, id: u32, kind: i32, axis: Axis, prefix: &Option<String>, local: &Option<String>) -> bool {
-        let principal = if matches!(axis, Axis::Attribute) { kind == ATTRIBUTE } else { kind == ELEMENT };
-        if !principal {
-            return false;
-        }
-        if let Some(local) = local {
-            if store.nodes[id as usize].name.as_deref() != Some(local) {
-                return false;
-            }
-        }
-        match prefix {
-            None if local.is_none() => true,
-            None => store.nodes[id as usize].ns.is_none(),
-            Some(prefix) => {
-                let href = if prefix.is_empty() {
-                    self.namespaces.get("").map(String::as_str)
-                } else if prefix == "xml" {
-                    Some(crate::store::XML_NS)
-                } else {
-                    self.namespaces.get(prefix).map(String::as_str)
-                };
-                let Some(href) = href else {
-                    return false;
-                };
-                store.nodes[id as usize].ns.is_some_and(|ns| store.nss[ns as usize].href == href)
-            }
-        }
+        node_test_matches(&store, self.namespaces, id, test, axis)
     }
 
     fn apply_preds(&mut self, nodes: Vec<u32>, preds: &[Expr]) -> Result<Vec<u32>, String> {
+        let saved_sorted = self.sorted;
         let mut nodes = nodes;
         for pred in preds {
             let size = nodes.len();
@@ -788,6 +940,7 @@ impl<'a> Eval<'a> {
             }
             nodes = kept;
         }
+        self.sorted = saved_sorted;
         Ok(nodes)
     }
 
@@ -1029,6 +1182,195 @@ fn css_class_match(hay: &str, needle: &str) -> bool {
 
 fn is_xpath_blank(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn can_fuse(head: &Step, tail: &Step) -> bool {
+    head.axis == Axis::DescendantOrSelf
+        && matches!(head.test, NodeTest::Node)
+        && head.preds.is_empty()
+        && matches!(tail.axis, Axis::Child | Axis::Attribute)
+}
+
+fn fast_axis(axis: Axis) -> bool {
+    matches!(
+        axis,
+        Axis::Child | Axis::Attribute | Axis::Self_ | Axis::Parent | Axis::Descendant | Axis::DescendantOrSelf
+    )
+}
+
+fn axis_overlaps(axis: Axis) -> bool {
+    matches!(axis, Axis::Parent | Axis::Descendant | Axis::DescendantOrSelf)
+}
+
+struct Seen {
+    marks: Vec<bool>,
+}
+
+impl Seen {
+    fn off() -> Self {
+        Self { marks: Vec::new() }
+    }
+
+    fn on(len: usize) -> Self {
+        Self { marks: vec![false; len] }
+    }
+
+    fn mark(&mut self, id: u32) -> bool {
+        if self.marks.is_empty() {
+            return true;
+        }
+        let cell = &mut self.marks[id as usize];
+        if *cell {
+            return false;
+        }
+        *cell = true;
+        true
+    }
+}
+
+fn collect_elements(store: &Store, contexts: &[u32], axis: Axis, local: Option<&str>, seen: &mut Seen, out: &mut Vec<u32>) {
+    for &ctx in contexts {
+        match axis {
+            Axis::Child => {
+                for &child in &store.nodes[ctx as usize].children {
+                    push_element(store, child, local, seen, out);
+                }
+            }
+            Axis::Self_ => push_element(store, ctx, local, seen, out),
+            Axis::Parent => {
+                if let Some(parent) = store.nodes[ctx as usize].parent {
+                    push_element(store, parent, local, seen, out);
+                }
+            }
+            Axis::Descendant => walk_elements(store, ctx, false, local, seen, out),
+            Axis::DescendantOrSelf => walk_elements(store, ctx, true, local, seen, out),
+            _ => {}
+        }
+    }
+}
+
+fn push_element(store: &Store, id: u32, local: Option<&str>, seen: &mut Seen, out: &mut Vec<u32>) {
+    let node = &store.nodes[id as usize];
+    if node.kind != ELEMENT || node.ns.is_some() {
+        return;
+    }
+    if let Some(local) = local {
+        if node.name.as_deref() != Some(local) {
+            return;
+        }
+    }
+    if seen.mark(id) {
+        out.push(id);
+    }
+}
+
+fn walk_elements(store: &Store, start: u32, include_self: bool, local: Option<&str>, seen: &mut Seen, out: &mut Vec<u32>) {
+    if include_self {
+        push_element(store, start, local, seen, out);
+    }
+    let mut frames = vec![(start, 0usize)];
+    while let Some((id, next)) = frames.last().copied() {
+        let children = &store.nodes[id as usize].children;
+        if next >= children.len() {
+            frames.pop();
+            continue;
+        }
+        let child = children[next];
+        frames.last_mut().unwrap().1 = next + 1;
+        push_element(store, child, local, seen, out);
+        frames.push((child, 0));
+    }
+}
+
+fn walk_nodes(
+    store: &Store,
+    namespaces: &HashMap<String, String>,
+    start: u32,
+    include_self: bool,
+    axis: Axis,
+    test: &NodeTest,
+    seen: &mut Seen,
+    out: &mut Vec<u32>,
+) {
+    if include_self {
+        push_match(store, namespaces, start, axis, test, seen, out);
+    }
+    let mut frames = vec![(start, 0usize)];
+    while let Some((id, next)) = frames.last().copied() {
+        let children = &store.nodes[id as usize].children;
+        if next >= children.len() {
+            frames.pop();
+            continue;
+        }
+        let child = children[next];
+        frames.last_mut().unwrap().1 = next + 1;
+        push_match(store, namespaces, child, axis, test, seen, out);
+        frames.push((child, 0));
+    }
+}
+
+fn push_match(
+    store: &Store,
+    namespaces: &HashMap<String, String>,
+    id: u32,
+    axis: Axis,
+    test: &NodeTest,
+    seen: &mut Seen,
+    out: &mut Vec<u32>,
+) {
+    if node_test_matches(store, namespaces, id, test, axis) && seen.mark(id) {
+        out.push(id);
+    }
+}
+
+fn node_test_matches(store: &Store, namespaces: &HashMap<String, String>, id: u32, test: &NodeTest, axis: Axis) -> bool {
+    let kind = store.nodes[id as usize].kind;
+    match test {
+        NodeTest::Node => !matches!(axis, Axis::Attribute) || kind == ATTRIBUTE,
+        NodeTest::Text => matches!(kind, TEXT | CDATA),
+        NodeTest::Comment => kind == COMMENT,
+        NodeTest::Pi(target) => {
+            kind == PI && target.as_ref().map(|name| store.nodes[id as usize].name.as_deref() == Some(name)).unwrap_or(true)
+        }
+        NodeTest::Name { prefix, local } => name_matches(store, namespaces, id, kind, axis, prefix, local),
+    }
+}
+
+fn name_matches(
+    store: &Store,
+    namespaces: &HashMap<String, String>,
+    id: u32,
+    kind: i32,
+    axis: Axis,
+    prefix: &Option<String>,
+    local: &Option<String>,
+) -> bool {
+    let principal = if matches!(axis, Axis::Attribute) { kind == ATTRIBUTE } else { kind == ELEMENT };
+    if !principal {
+        return false;
+    }
+    if let Some(local) = local {
+        if store.nodes[id as usize].name.as_deref() != Some(local) {
+            return false;
+        }
+    }
+    match prefix {
+        None if local.is_none() => true,
+        None => store.nodes[id as usize].ns.is_none(),
+        Some(prefix) => {
+            let href = if prefix.is_empty() {
+                namespaces.get("").map(String::as_str)
+            } else if prefix == "xml" {
+                Some(crate::store::XML_NS)
+            } else {
+                namespaces.get(prefix).map(String::as_str)
+            };
+            let Some(href) = href else {
+                return false;
+            };
+            store.nodes[id as usize].ns.is_some_and(|ns| store.nss[ns as usize].href == href)
+        }
+    }
 }
 
 fn descendants(store: &Store, id: u32, include_self: bool) -> Vec<u32> {
