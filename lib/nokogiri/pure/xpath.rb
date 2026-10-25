@@ -369,7 +369,7 @@ module Nokogiri
             end
           end
           predicates = []
-          predicates << @scanner.predicate while @scanner.peek == "["
+          predicates << compile_predicate(@scanner.predicate) while @scanner.peek == "["
           { axis: axis, test: test, predicates: predicates }
         end
 
@@ -495,7 +495,21 @@ module Nokogiri
           end
 
           matched = []
-          children.each { |child| matched << child if match_test?(child, test, :child) }
+          # An unprefixed name test is the CSS and XPath case that walks every element.
+          # Skip the general matcher. A literal local name of "*" keeps the old result.
+          if test[:kind] == :name && test[:prefix].nil? && test[:local] != "*"
+            local = test[:local]
+            element = XML::Node::ELEMENT_NODE
+            children.each do |child|
+              child_state = child.instance_variable_get(:@pure)
+              next unless child_state
+              next unless child_state.type == element && child_state.name == local && child_state.namespace.nil?
+
+              matched << child
+            end
+          else
+            children.each { |child| matched << child if match_test?(child, test, :child) }
+          end
           kept = apply_predicates(matched, step[:predicates])
           kept_ids = {}
           kept.each { |item| kept_ids[item.object_id] = true }
@@ -565,7 +579,38 @@ module Nokogiri
           current
         end
 
+        # Compile a predicate once per step. The walk used to match these patterns
+        # again for every parent node.
+        def compile_predicate(source)
+          if (match = CLASS_CONTAINS.match(source))
+            name = match[1]
+            inner = match[2]
+            if !name.include?(":") && inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
+              needle = inner[1..-2]
+              return { kind: :class, name: name, needle: needle } unless needle.include?(" ")
+            end
+          elsif (match = ATTR_EQUALS.match(source))
+            name = match[1]
+            unless name.include?(":")
+              return { kind: :attr, name: name, expected: match[2] || match[3] }
+            end
+          end
+          source
+        end
+
         def filter_predicate(nodes, source)
+          if source.is_a?(Hash)
+            if source[:kind] == :class
+              name = source[:name]
+              needle = source[:needle]
+              return nodes.select { |node| attribute_class?(node, name, needle) }
+            end
+
+            name = source[:name]
+            expected = source[:expected]
+            return nodes.select { |node| attribute_equals?(node, name, expected) }
+          end
+
           if (match = CLASS_CONTAINS.match(source))
             name = match[1]
             inner = match[2]
