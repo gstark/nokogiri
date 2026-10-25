@@ -266,7 +266,17 @@ module Nokogiri
       ]
       BASEFONT_ATTRS = ["id", "size", "color", "face"]
       QUOTE_ATTRS = [ATTRS, "cite"]
-      BODY_CONTENTS = [FLOW, "ins", "del"]
+      BODY_CONTENTS = %w[
+        a abbr acronym address applet area article aside b bdo big blink
+        blockquote br button center cite code del details dfn dir div dd dl
+        dt em embed fieldset figcaption figure font footer form h1 h2 h3 h4
+        h5 h6 header hr i iframe ilayer img image input ins isindex kbd
+        keygen label layer legend li listing main map marquee menu multicol
+        nav nextid nobr noembed nolayer noscript object ol optgroup option p
+        plaintext pre q rp rt ruby s samp script section select small spacer
+        span strike strong style sub summary sup svg table template textarea
+        title tt u ul var wbr xml xmp
+      ]
       BODY_ATTRS = [ATTRS, "onload", "onunload"]
       BODY_DEPR = [
         "background",

@@ -28,13 +28,17 @@ module Nokogiri
       MULT    = 3
       PLUS    = 4
 
-      attr_reader :document
+      attr_reader :document, :name, :prefix, :type, :occur
 
       ###
       # Get the children of this ElementContent node
       def children
         [c1, c2].compact
       end
+
+      private
+
+      attr_reader :c1, :c2
 
       private
 

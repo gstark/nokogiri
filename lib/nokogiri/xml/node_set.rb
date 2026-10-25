@@ -393,11 +393,16 @@ module Nokogiri
       # of elements and if each element is equal to the corresponding
       # element in the other NodeSet
       def ==(other)
-        return false unless other.is_a?(Nokogiri::XML::NodeSet)
-        return false unless length == other.length
+        list = case other
+        when Nokogiri::XML::NodeSet, Array
+          other
+        else
+          return false
+        end
+        return false unless length == list.length
 
         each_with_index do |node, i|
-          return false unless node == other[i]
+          return false unless node == list[i]
         end
         true
       end
