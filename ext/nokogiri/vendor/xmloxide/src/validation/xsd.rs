@@ -1229,6 +1229,22 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
         };
     };
     let root_name = doc.node_name(root).unwrap_or("");
+    if let Some(target) = schema.target_namespace.as_deref() {
+        if doc.node_namespace(root) != Some(target) {
+            errors.push(ValidationError {
+                message: format!(
+                    "element <{root_name}> is in the wrong namespace for targetNamespace '{target}'"
+                ),
+                line: None,
+                column: None,
+            });
+            return ValidationResult {
+                is_valid: false,
+                errors,
+                warnings: vec![],
+            };
+        }
+    }
     if let Some(decl) = schema.elements.get(root_name) {
         validate_element(doc, root, decl, schema, &mut errors);
     } else {
@@ -2216,141 +2232,10 @@ fn validate_attributes(
 // Pattern matching
 // ---------------------------------------------------------------------------
 
-/// Simple XSD pattern matching using basic character class support.
+/// XSD pattern facets match the entire value. Counted quantifiers such as
+/// `{3}` come from the XPath regular-expression engine.
 fn matches_xsd_pattern(value: &str, pattern: &str) -> bool {
-    match_pattern_chars(value.as_bytes(), pattern.as_bytes(), 0, 0)
-}
-
-/// Recursive pattern matcher.
-fn match_pattern_chars(value: &[u8], pattern: &[u8], vi: usize, pi: usize) -> bool {
-    if pi >= pattern.len() {
-        return vi >= value.len();
-    }
-    let (cc, next_pi) = parse_pattern_element(pattern, pi);
-    let has_star = next_pi < pattern.len() && pattern[next_pi] == b'*';
-    let has_plus = next_pi < pattern.len() && pattern[next_pi] == b'+';
-    let has_question = next_pi < pattern.len() && pattern[next_pi] == b'?';
-    let aq = if has_star || has_plus || has_question {
-        next_pi + 1
-    } else {
-        next_pi
-    };
-
-    if has_star {
-        match_quantified(value, pattern, vi, aq, &cc, 0)
-    } else if has_plus {
-        match_quantified(value, pattern, vi, aq, &cc, 1)
-    } else if has_question {
-        if match_pattern_chars(value, pattern, vi, aq) {
-            return true;
-        }
-        vi < value.len()
-            && matches_char_class(value[vi], &cc)
-            && match_pattern_chars(value, pattern, vi + 1, aq)
-    } else {
-        vi < value.len()
-            && matches_char_class(value[vi], &cc)
-            && match_pattern_chars(value, pattern, vi + 1, next_pi)
-    }
-}
-
-/// Matches `min_count` or more occurrences of a character class.
-fn match_quantified(
-    value: &[u8],
-    pattern: &[u8],
-    vi: usize,
-    aq: usize,
-    cc: &CharClass,
-    min_count: usize,
-) -> bool {
-    let mut i = vi;
-    let mut count = 0;
-    // Try zero matches first (for star)
-    if min_count == 0 && match_pattern_chars(value, pattern, i, aq) {
-        return true;
-    }
-    while i < value.len() && matches_char_class(value[i], cc) {
-        i += 1;
-        count += 1;
-        if count >= min_count && match_pattern_chars(value, pattern, i, aq) {
-            return true;
-        }
-    }
-    false
-}
-
-/// A character class element in a pattern.
-enum CharClass {
-    Literal(u8),
-    Dot,
-    Digit,
-    Word,
-    CharSet(Vec<u8>),
-    NegCharSet(Vec<u8>),
-}
-
-/// Parses one pattern element.
-fn parse_pattern_element(pattern: &[u8], pi: usize) -> (CharClass, usize) {
-    if pi >= pattern.len() {
-        return (CharClass::Literal(0), pi);
-    }
-    match pattern[pi] {
-        b'.' => (CharClass::Dot, pi + 1),
-        b'\\' if pi + 1 < pattern.len() => match pattern[pi + 1] {
-            b'd' => (CharClass::Digit, pi + 2),
-            b'w' => (CharClass::Word, pi + 2),
-            ch => (CharClass::Literal(ch), pi + 2),
-        },
-        b'[' => parse_char_set(pattern, pi),
-        ch => (CharClass::Literal(ch), pi + 1),
-    }
-}
-
-/// Parses a character set `[...]` or `[^...]`.
-fn parse_char_set(pattern: &[u8], pi: usize) -> (CharClass, usize) {
-    let negated = pi + 1 < pattern.len() && pattern[pi + 1] == b'^';
-    let start = if negated { pi + 2 } else { pi + 1 };
-    let mut end = start;
-    while end < pattern.len() && pattern[end] != b']' {
-        end += 1;
-    }
-    let chars = expand_char_ranges(&pattern[start..end]);
-    let class = if negated {
-        CharClass::NegCharSet(chars)
-    } else {
-        CharClass::CharSet(chars)
-    };
-    (class, if end < pattern.len() { end + 1 } else { end })
-}
-
-/// Expands character ranges like `a-z`.
-fn expand_char_ranges(set: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < set.len() {
-        if i + 2 < set.len() && set[i + 1] == b'-' {
-            for ch in set[i]..=set[i + 2] {
-                result.push(ch);
-            }
-            i += 3;
-        } else {
-            result.push(set[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-/// Tests whether a byte matches a character class.
-fn matches_char_class(byte: u8, class: &CharClass) -> bool {
-    match class {
-        CharClass::Literal(ch) => byte == *ch,
-        CharClass::Dot => true,
-        CharClass::Digit => byte.is_ascii_digit(),
-        CharClass::Word => byte.is_ascii_alphanumeric() || byte == b'_',
-        CharClass::CharSet(chars) => chars.contains(&byte),
-        CharClass::NegCharSet(chars) => !chars.contains(&byte),
-    }
+    crate::xpath::regex::xsd_full_match(value, pattern)
 }
 
 /// Counts total significant digits.
@@ -2699,6 +2584,17 @@ mod tests {
         assert!(validate(xsd, "<zip>12345</zip>").is_valid);
         assert!(!validate(xsd, "<zip>1234</zip>").is_valid);
         assert!(!validate(xsd, "<zip>abcde</zip>").is_valid);
+
+        let sku = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="SKU"><xs:restriction base="xs:string">
+                <xs:pattern value="\d{3}-[A-Z]{2}"/>
+            </xs:restriction></xs:simpleType>
+            <xs:element name="item"><xs:complexType>
+                <xs:attribute name="partNum" type="SKU"/>
+            </xs:complexType></xs:element>
+        </xs:schema>"#;
+        assert!(validate(sku, r#"<item partNum="872-AA"/>"#).is_valid);
+        assert!(!validate(sku, r#"<item partNum="87-AA"/>"#).is_valid);
     }
 
     #[test]

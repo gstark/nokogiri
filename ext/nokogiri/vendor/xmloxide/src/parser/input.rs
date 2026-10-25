@@ -1846,9 +1846,18 @@ pub(crate) fn parse_pi_content(
     input.expect_str(b"<?")?;
     let target = input.parse_name()?;
 
-    // "xml" (case-insensitive) is reserved for the XML declaration
-    if target.eq_ignore_ascii_case("xml") {
+    // "xml" (case-insensitive) is reserved for the XML declaration.
+    // Recovery records the error and still consumes the instruction so the
+    // rest of the document can be parsed. Nokogiri's SAX recovery test stops
+    // only when recovery is off.
+    if target.eq_ignore_ascii_case("xml") && !input.recover() {
         return Err(input.fatal("PI target 'xml' is reserved"));
+    }
+    if target.eq_ignore_ascii_case("xml") {
+        input.push_diagnostic(
+            ErrorSeverity::Error,
+            "PI target 'xml' is reserved".to_string(),
+        );
     }
 
     // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).

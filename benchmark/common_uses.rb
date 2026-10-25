@@ -8,17 +8,23 @@
 # Builder, and SAX are the other entry points the project documents.
 #
 # benchmark-ips cannot load two copies of Nokogiri in one process.
-# This file uses Job#save! so each backend runs in its own process, then
-# the second process prints the comparison. The first report is "main"
-# and is the baseline.
+# This file uses Job#save! so each backend runs in its own process. The
+# last process prints the comparison. The first report is "libxml2" and
+# is the baseline.
 #
 #   ruby benchmark/common_uses.rb
 #   BENCH_WARMUP=2 BENCH_TIME=5 ruby benchmark/common_uses.rb
 #   ruby benchmark/common_uses.rb --check
 #   ruby benchmark/common_uses.rb --task css_scrape
 #
-# The pure-ruby branch must exist. The native extension on main must already
-# be compiled for this Ruby. Install the timer with: gem install benchmark-ips
+# Backends, in comparison order:
+#   libxml2    git main, with lib/nokogiri/nokogiri.so already compiled
+#   pure-ruby  git branch pure-ruby
+#   xmloxide   this worktree
+#
+# BENCH_LIBXML_WORKTREE defaults to /tmp/nokogiri-main.
+# BENCH_PURE_WORKTREE defaults to /tmp/nokogiri-pure-ruby-bench.
+# Install the timer with: gem install benchmark-ips
 
 require "rbconfig"
 
@@ -27,6 +33,7 @@ module NokogiriCommonBench
   HTML_PATH = File.join(ROOT, "test/files/tlm.html")
   ATOM_PATH = File.join(ROOT, "test/files/atom.xml")
   ATOM_NS = "http://www.w3.org/2005/Atom"
+  LIBXML_WORKTREE = ENV.fetch("BENCH_LIBXML_WORKTREE", "/tmp/nokogiri-main")
   PURE_WORKTREE = ENV.fetch("BENCH_PURE_WORKTREE", "/tmp/nokogiri-pure-ruby-bench")
   HOLD_DIR = ENV.fetch("BENCH_HOLD_DIR", "/tmp/nokogiri-bench-holds")
 
@@ -175,7 +182,7 @@ module NokogiriCommonBench
       job.config(warmup: warmup, time: seconds)
       job.report(label) { work.call }
       job.save!(hold)
-      job.compare!(order: :baseline)
+      job.compare!(order: :baseline) if ENV["BENCH_FINAL"] == "1"
     end
     0
   end
@@ -207,20 +214,46 @@ module NokogiriCommonBench
     Float(ENV.fetch("BENCH_TIME", "2"))
   end
 
-  def pure_lib
-    marker = File.join(PURE_WORKTREE, "lib/nokogiri/pure/boot.rb")
-    return File.join(PURE_WORKTREE, "lib") if File.file?(marker)
+  def ensure_worktree(path, revision)
+    return if File.directory?(path)
 
-    FileUtils.rm_rf(PURE_WORKTREE) if File.directory?(PURE_WORKTREE)
-    command = ["git", "worktree", "add", "--detach", PURE_WORKTREE, "pure-ruby"]
-    ok = system(*command, chdir: ROOT)
-    abort "Cannot create the pure-ruby worktree" unless ok
+    ok = system("git", "worktree", "add", "--detach", path, revision, chdir: ROOT)
+    abort "Cannot create the worktree at #{path}" unless ok
+  end
+
+  def libxml_lib
+    ensure_worktree(LIBXML_WORKTREE, "main")
+    so = File.join(LIBXML_WORKTREE, "lib/nokogiri/nokogiri.so")
+    abort "Missing #{so}. Compile main for this Ruby before the bench." unless File.file?(so)
+
+    File.join(LIBXML_WORKTREE, "lib")
+  end
+
+  def pure_lib
+    ensure_worktree(PURE_WORKTREE, "pure-ruby")
+    marker = File.join(PURE_WORKTREE, "lib/nokogiri/pure/boot.rb")
+    abort "Missing #{marker}" unless File.file?(marker)
 
     File.join(PURE_WORKTREE, "lib")
   end
 
-  def main_lib
+  def xmloxide_lib
+    so = File.join(ROOT, "lib/nokogiri/nokogiri.so")
+    abort "Missing #{so}. Compile this worktree for this Ruby before the bench." unless File.file?(so)
+
     File.join(ROOT, "lib")
+  end
+
+  def backends
+    [
+      ["libxml2", libxml_lib, LIBXML_WORKTREE],
+      ["pure-ruby", pure_lib, PURE_WORKTREE],
+      ["xmloxide", xmloxide_lib, ROOT],
+    ]
+  end
+
+  def revision(dir)
+    IO.popen(["git", "-C", dir, "rev-parse", "--short", "HEAD"], &:read).strip
   end
 
   def selected_tasks
@@ -231,7 +264,7 @@ module NokogiriCommonBench
     only ? [only] : names
   end
 
-  def run_child(lib, label, task_name, hold)
+  def run_child(lib, label, task_name, hold, final:)
     env = {
       "BENCH_CHILD" => "1",
       "BENCH_LABEL" => label,
@@ -240,6 +273,8 @@ module NokogiriCommonBench
       "BENCH_WARMUP" => warmup_seconds.to_s,
       "BENCH_TIME" => measure_seconds.to_s,
       "BENCH_CHECK" => ARGV.include?("--check") ? "1" : "0",
+      "BENCH_FINAL" => final ? "1" : "0",
+      "NOKOGIRI_PURE" => nil,
       "PATH" => ENV["PATH"].to_s,
     }
     script = File.join(ROOT, "benchmark/common_uses.rb")
@@ -247,10 +282,16 @@ module NokogiriCommonBench
   end
 
   def identify(lib, label)
-    env = {"PATH" => ENV["PATH"].to_s}
+    env = {"PATH" => ENV["PATH"].to_s, "NOKOGIRI_PURE" => nil}
     script = <<~RUBY
       require "nokogiri"
-      mode = Nokogiri.uses_libxml? ? "native libxml2" : "pure Ruby"
+      mode = if defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY
+        "pure Ruby"
+      elsif Nokogiri.uses_libxml?
+        "libxml2"
+      else
+        "xmloxide"
+      end
       gumbo = Nokogiri.respond_to?(:uses_gumbo?) && Nokogiri.uses_gumbo? ? "gumbo" : "no gumbo"
       so = $LOADED_FEATURES.grep(/nokogiri\\.so\\z/).first
       puts format("%s  ruby %s  %s  %s  %s", #{label.inspect}, RUBY_VERSION, mode, gumbo, so || "no nokogiri.so")
@@ -258,12 +299,34 @@ module NokogiriCommonBench
     system(env, ruby_bin, "-I", lib, "-e", script)
   end
 
+  # The final backend prints the comparison. A failure there skips that
+  # print, so replay the saved rows when the hold file still has results.
+  def print_held_comparison(hold)
+    return unless File.file?(hold) && !File.empty?(hold)
+
+    script = <<~RUBY
+      require "json"
+      require "benchmark/ips"
+      rows = JSON.parse(File.read(#{hold.inspect}))
+      exit 0 if rows.size < 2
+      reports = rows.map do |row|
+        stats = Benchmark::IPS::Stats::SD.new(row["samples"], row["measured_us"], row["iter"])
+        Benchmark::IPS::Report::Entry.new(row["item"], row["measured_us"], row["iter"], stats, row["cycles"])
+      end
+      Benchmark.compare(*reports, order: :baseline)
+    RUBY
+    system({"PATH" => ENV["PATH"].to_s}, ruby_bin, "-e", script)
+  end
+
   def compare
     check = ARGV.include?("--check")
+    rows = backends
     puts "Common Nokogiri operations"
     puts "Warmup #{warmup_seconds}s, measure #{measure_seconds}s" unless check
-    identify(main_lib, "main")
-    identify(pure_lib, "pure-ruby")
+    rows.each do |label, lib, dir|
+      puts format("%-10s %s", label, revision(dir))
+      identify(lib, label)
+    end
     puts
 
     FileUtils.mkdir_p(HOLD_DIR)
@@ -272,14 +335,13 @@ module NokogiriCommonBench
       hold = File.join(HOLD_DIR, "#{name}.json")
       FileUtils.rm_f(hold)
       puts "---- #{name} ----"
-      unless run_child(main_lib, "main", name, hold)
-        warn "main failed on #{name}"
+      rows.each_with_index do |(label, lib, _dir), index|
+        final = index == rows.length - 1
+        next if run_child(lib, label, name, hold, final: final)
+
+        warn "#{label} failed on #{name}"
         failed = true
-        next
-      end
-      unless run_child(pure_lib, "pure-ruby", name, hold)
-        warn "pure-ruby failed on #{name}"
-        failed = true
+        print_held_comparison(hold) if final && !check
       end
     end
     exit 1 if failed

@@ -51,6 +51,17 @@ pub fn xpath_matches(input: &str, pattern: &str, flags: &str) -> Result<bool, St
     Ok(false)
 }
 
+/// Matches `input` against an XSD pattern facet.
+///
+/// The pattern is anchored to the whole value. A match of a prefix or a
+/// substring does not count.
+pub(crate) fn xsd_full_match(input: &str, pattern: &str) -> bool {
+    let Ok(compiled) = compile(pattern, false) else {
+        return false;
+    };
+    match_seq(&compiled, 0, input, 0, false, false) == Some(input.len())
+}
+
 /// Replaces all occurrences of `pattern` in `input` with `replacement`.
 ///
 /// Supports `$0` in the replacement string to refer to the whole match.

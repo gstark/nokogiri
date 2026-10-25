@@ -2,11 +2,25 @@
 
 mod oxide;
 mod parse;
+mod extras;
+mod sax_bridge;
 mod serialize;
 mod store;
 mod xpath;
 
-use std::cell::RefCell;
+use extras::{
+    canonicalize, process_xincludes, relax_from_document, relax_validate_document, schema_from_document,
+    schema_validate_document, schema_validate_file,
+};
+
+use sax_bridge::{
+    html_sax_context_file, html_sax_context_memory, html_sax_native_write, html_sax_parse_with,
+    html_sax_push_initialize, sax_column, sax_context_file, sax_context_io, sax_context_memory,
+    sax_line, sax_native_write, sax_options, sax_options_set, sax_parse_with, sax_push_initialize,
+    sax_recovery, sax_recovery_set, sax_replace_entities, sax_replace_entities_set,
+};
+
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +37,7 @@ use magnus::{
 };
 
 use crate::parse::{FragmentResult, Parsed, ParseError, RECOVER, parse_fragment, parse_html, parse_xml};
-use crate::serialize::{AS_HTML, AS_XML, escape_text, html_standard, write_node};
+use crate::serialize::{AS_HTML, AS_XML, NO_DECLARATION, escape_text, html_standard, write_node};
 use crate::store::{
     ATTRIBUTE, ATTRIBUTE_DECL, CDATA, COMMENT, DOCUMENT, DOCUMENT_FRAG, DTD, ELEMENT, ELEMENT_DECL,
     ENTITY_DECL, ENTITY_REF, HTML_DOCUMENT, PI, Store, TEXT, copy_subtree, copy_within,
@@ -215,7 +229,14 @@ struct ReaderHandle {
     events: RefCell<Vec<ReaderEvent>>,
     index: RefCell<isize>,
     encoding: RefCell<Option<String>>,
+    doc_encoding: RefCell<Option<String>>,
     source: RefCell<Value>,
+    fatal: RefCell<Option<String>>,
+    io: RefCell<Option<Value>>,
+    buffer: RefCell<String>,
+    eof: Cell<bool>,
+    options: i32,
+    url: Option<String>,
 }
 
 unsafe impl Send for ReaderHandle {}
@@ -225,18 +246,29 @@ impl DataTypeFunctions for ReaderHandle {
         if let Ok(source) = self.source.try_borrow() {
             marker.mark(*source);
         }
+        if let Ok(io) = self.io.try_borrow() {
+            if let Some(io) = *io {
+                marker.mark(io);
+            }
+        }
     }
 }
 
 struct ReaderEvent {
     kind: i32,
     name: String,
+    local_name: String,
     value: String,
     depth: i32,
     empty: bool,
     attrs: Vec<(String, String)>,
+    ns_decls: Vec<(String, String)>,
     prefix: String,
     href: String,
+    lang: String,
+    base_uri: String,
+    inner_xml: String,
+    outer_xml: String,
 }
 
 fn class_for_kind(kind: i32, html_doc: bool) -> RClass {
@@ -1790,78 +1822,251 @@ fn foreign_error_handler(ruby: &Ruby, _module: RModule) -> Result<Value, Error> 
 
 fn reader_from_memory(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
     let input = *args.first().ok_or_else(|| Error::new(ruby.exception_arg_error(), "wrong number of arguments"))?;
+    if input.is_nil() {
+        return Err(Error::new(ruby.exception_arg_error(), "string cannot be nil"));
+    }
+    let url = args.get(1).copied().and_then(|value| string_arg(value).ok()).flatten();
     let encoding = args.get(2).copied().and_then(|value| string_arg(value).ok()).flatten();
     let text = String::from_utf8_lossy(&bytes_of(input)?).into_owned();
     let options = args.get(3).and_then(|value| <i32 as TryConvert>::try_convert(*value).ok()).unwrap_or(0);
-    let parsed = parse_xml(&text, args.get(1).copied().and_then(|value| string_arg(value).ok()).flatten(), encoding.clone(), options, next_key());
-    let events = reader_events(&parsed.store.borrow());
+    let (events, doc_encoding, fatal) = reader_parse(&text, url, encoding.clone(), options);
     let reader = ruby.obj_wrap_as(ReaderHandle {
         events: RefCell::new(events),
         index: RefCell::new(-1),
-        encoding: RefCell::new(encoding.clone().or(parsed.store.borrow().nodes[0].encoding.clone())),
+        encoding: RefCell::new(encoding.clone()),
+        doc_encoding: RefCell::new(doc_encoding),
         source: RefCell::new(input),
+        fatal: RefCell::new(fatal),
+        io: RefCell::new(None),
+        buffer: RefCell::new(String::new()),
+        eof: Cell::new(true),
+        options,
+        url: None,
     }, class).as_value();
     let init_args = [input, args.get(1).copied().unwrap_or_else(|| ruby.qnil().as_value()), encoding.map(|text| ruby.str_new(&text).as_value()).unwrap_or_else(|| ruby.qnil().as_value())];
     reader.funcall::<_, _, Value>("initialize", &init_args[..])?;
     Ok(reader)
 }
 
+fn reader_parse(text: &str, url: Option<String>, encoding: Option<String>, options: i32) -> (Vec<ReaderEvent>, Option<String>, Option<String>) {
+    let strict = parse_xml(text, url.clone(), encoding.clone(), options, next_key());
+    let fatal = strict.errors.iter().find(|error| error.level >= 3).map(|error| reader_fatal_message(&error.message));
+    let parsed = if fatal.is_some() {
+        parse_xml(text, url, encoding, options | RECOVER, next_key())
+    } else {
+        strict
+    };
+    let doc_encoding = parsed.store.borrow().nodes[0].encoding.clone().filter(|value| !value.is_empty());
+    let events = reader_events(&parsed.store.borrow());
+    (events, doc_encoding, fatal)
+}
+
+fn reader_fatal_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("end of input")
+        || lower.contains("end of data")
+        || lower.contains("extra content")
+        || lower.contains("unclosed")
+        || lower.contains("mismatched")
+        || lower.contains("premature")
+    {
+        return "FATAL: Extra content at the end of the document".to_string();
+    }
+    if message.starts_with("FATAL:") {
+        message.to_string()
+    } else {
+        format!("FATAL: {message}")
+    }
+}
+
 fn reader_events(store: &Store) -> Vec<ReaderEvent> {
     let mut events = Vec::new();
-    fn walk(store: &Store, id: u32, depth: i32, events: &mut Vec<ReaderEvent>) {
-        for child in store.nodes[id as usize].children.clone() {
-            let node = &store.nodes[child as usize];
-            match node.kind {
-                ELEMENT => {
-                    let empty = node.children.is_empty();
-                    let attrs = node.attrs.iter().map(|attr| {
-                        (store.nodes[*attr as usize].name.clone().unwrap_or_default(), store.nodes[*attr as usize].content.clone())
-                    }).collect();
-                    events.push(ReaderEvent {
-                        kind: 1,
-                        name: node.name.clone().unwrap_or_default(),
-                        value: String::new(),
-                        depth,
-                        empty,
-                        attrs,
-                        prefix: String::new(),
-                        href: String::new(),
-                    });
-                    if !empty {
-                        walk(store, child, depth + 1, events);
-                        events.push(ReaderEvent {
-                            kind: 15,
-                            name: store.nodes[child as usize].name.clone().unwrap_or_default(),
-                            value: String::new(),
-                            depth,
-                            empty: false,
-                            attrs: Vec::new(),
-                            prefix: String::new(),
-                            href: String::new(),
-                        });
-                    }
+    let base = store.nodes[0].url.clone().unwrap_or_default();
+    walk_reader(store, 0, 0, &base, "", &mut events);
+    events
+}
+
+fn walk_reader(store: &Store, id: u32, depth: i32, inherited_base: &str, inherited_lang: &str, events: &mut Vec<ReaderEvent>) {
+    for child in store.nodes[id as usize].children.clone() {
+        let kind = store.nodes[child as usize].kind;
+        match kind {
+            ELEMENT => {
+                let empty = store.nodes[child as usize].children.is_empty();
+                let base = match xml_attr(store, child, "base") {
+                    Some(value) => join_base(inherited_base, &value),
+                    None => inherited_base.to_string(),
+                };
+                let lang = match xml_attr(store, child, "lang") {
+                    Some(value) => value,
+                    None => inherited_lang.to_string(),
+                };
+                let qualified = store.qualified_name(child);
+                let local = store.local_name(child);
+                let (prefix, href) = reader_ns(store, child);
+                let attrs = reader_attrs(store, child);
+                let ns_decls = reader_ns_decls(store, child);
+                let outer = write_node(store, child, None, "", AS_XML | NO_DECLARATION);
+                let inner = reader_inner(store, child);
+                events.push(reader_element_event(1, &qualified, &local, depth, empty, &attrs, &ns_decls, &prefix, &href, &lang, &base, inner, outer));
+                if !empty {
+                    walk_reader(store, child, depth + 1, &base, &lang, events);
+                    events.push(reader_element_event(15, &qualified, &local, depth, false, &attrs, &ns_decls, &prefix, &href, &lang, &base, String::new(), format!("<{qualified}/>")));
                 }
-                TEXT | CDATA => {
-                    let blank = node.content.chars().all(char::is_whitespace);
-                    events.push(ReaderEvent {
-                        kind: if node.kind == CDATA { 4 } else if blank { 13 } else { 3 },
-                        name: if node.kind == CDATA { "#cdata-section".to_string() } else { "#text".to_string() },
-                        value: node.content.clone(),
-                        depth,
-                        empty: false,
-                        attrs: Vec::new(),
-                        prefix: String::new(),
-                        href: String::new(),
-                    });
-                }
-                COMMENT => events.push(ReaderEvent { kind: 8, name: "#comment".to_string(), value: node.content.clone(), depth, empty: false, attrs: Vec::new(), prefix: String::new(), href: String::new() }),
-                PI => events.push(ReaderEvent { kind: 7, name: node.name.clone().unwrap_or_default(), value: node.content.clone(), depth, empty: false, attrs: Vec::new(), prefix: String::new(), href: String::new() }),
-                _ => {}
             }
+            TEXT | CDATA => {
+                let content = store.nodes[child as usize].content.clone();
+                let blank = content.chars().all(char::is_whitespace);
+                let parent_kind = store.nodes[id as usize].kind;
+                if blank && kind == TEXT && (parent_kind == DOCUMENT || parent_kind == HTML_DOCUMENT) {
+                    continue;
+                }
+                let name = if kind == CDATA { "#cdata-section" } else { "#text" };
+                events.push(ReaderEvent {
+                    kind: if kind == CDATA { 4 } else if blank { 14 } else { 3 },
+                    name: name.to_string(),
+                    local_name: name.to_string(),
+                    value: content.clone(),
+                    depth,
+                    empty: false,
+                    attrs: Vec::new(),
+                    ns_decls: Vec::new(),
+                    prefix: String::new(),
+                    href: String::new(),
+                    lang: inherited_lang.to_string(),
+                    base_uri: inherited_base.to_string(),
+                    inner_xml: String::new(),
+                    outer_xml: write_node(store, child, None, "", AS_XML | NO_DECLARATION),
+                });
+            }
+            COMMENT => events.push(reader_leaf(8, "#comment", &store.nodes[child as usize].content, depth, inherited_base, inherited_lang, &write_node(store, child, None, "", AS_XML | NO_DECLARATION))),
+            PI => {
+                let name = store.nodes[child as usize].name.clone().unwrap_or_default();
+                let value = store.nodes[child as usize].content.clone();
+                events.push(reader_leaf(7, &name, &value, depth, inherited_base, inherited_lang, &write_node(store, child, None, "", AS_XML | NO_DECLARATION)));
+            }
+            _ => {}
         }
     }
-    walk(store, 0, 0, &mut events);
-    events
+}
+
+fn reader_element_event(
+    kind: i32,
+    name: &str,
+    local: &str,
+    depth: i32,
+    empty: bool,
+    attrs: &[(String, String)],
+    ns_decls: &[(String, String)],
+    prefix: &str,
+    href: &str,
+    lang: &str,
+    base: &str,
+    inner_xml: String,
+    outer_xml: String,
+) -> ReaderEvent {
+    ReaderEvent {
+        kind,
+        name: name.to_string(),
+        local_name: local.to_string(),
+        value: String::new(),
+        depth,
+        empty,
+        attrs: attrs.to_vec(),
+        ns_decls: ns_decls.to_vec(),
+        prefix: prefix.to_string(),
+        href: href.to_string(),
+        lang: lang.to_string(),
+        base_uri: base.to_string(),
+        inner_xml,
+        outer_xml,
+    }
+}
+
+fn reader_leaf(kind: i32, name: &str, value: &str, depth: i32, base: &str, lang: &str, outer: &str) -> ReaderEvent {
+    ReaderEvent {
+        kind,
+        name: name.to_string(),
+        local_name: name.to_string(),
+        value: value.to_string(),
+        depth,
+        empty: false,
+        attrs: Vec::new(),
+        ns_decls: Vec::new(),
+        prefix: String::new(),
+        href: String::new(),
+        lang: lang.to_string(),
+        base_uri: base.to_string(),
+        inner_xml: String::new(),
+        outer_xml: outer.to_string(),
+    }
+}
+
+fn reader_ns(store: &Store, id: u32) -> (String, String) {
+    match store.nodes[id as usize].ns {
+        Some(ns) => {
+            let data = &store.nss[ns as usize];
+            (data.prefix.clone().unwrap_or_default(), data.href.clone())
+        }
+        None => (String::new(), String::new()),
+    }
+}
+
+fn reader_attrs(store: &Store, id: u32) -> Vec<(String, String)> {
+    store.nodes[id as usize].attrs.iter().map(|attr| {
+        let node = &store.nodes[*attr as usize];
+        let name = node.name.clone().unwrap_or_default();
+        let local = if node.ns.is_some() {
+            name.rsplit_once(':').map(|(_, local)| local.to_string()).unwrap_or(name)
+        } else {
+            name
+        };
+        (local, node.content.clone())
+    }).collect()
+}
+
+fn reader_ns_decls(store: &Store, id: u32) -> Vec<(String, String)> {
+    store.nodes[id as usize].ns_defs.iter().map(|ns| {
+        let data = &store.nss[*ns as usize];
+        let key = match data.prefix.as_deref() {
+            Some(prefix) if !prefix.is_empty() => format!("xmlns:{prefix}"),
+            _ => "xmlns".to_string(),
+        };
+        (key, data.href.clone())
+    }).collect()
+}
+
+fn reader_inner(store: &Store, id: u32) -> String {
+    let mut out = String::new();
+    for child in &store.nodes[id as usize].children {
+        out.push_str(&write_node(store, *child, None, "", AS_XML | NO_DECLARATION));
+    }
+    out
+}
+
+fn xml_attr(store: &Store, id: u32, local: &str) -> Option<String> {
+    for attr in &store.nodes[id as usize].attrs {
+        let node = &store.nodes[*attr as usize];
+        let name = node.name.as_deref().unwrap_or("");
+        let xml_ns = node.ns.is_some_and(|ns| store.nss[ns as usize].prefix.as_deref() == Some("xml")) || name.starts_with("xml:");
+        let attr_local = name.rsplit_once(':').map(|(_, local)| local).unwrap_or(name);
+        if xml_ns && attr_local == local {
+            return Some(node.content.clone());
+        }
+    }
+    None
+}
+
+fn join_base(inherited: &str, value: &str) -> String {
+    if value.contains("://") || inherited.is_empty() {
+        return value.to_string();
+    }
+    if inherited.ends_with('/') {
+        return format!("{inherited}{value}");
+    }
+    match inherited.rfind('/') {
+        Some(index) => format!("{}{}", &inherited[..=index], value.trim_start_matches('/')),
+        None => value.to_string(),
+    }
 }
 
 fn reader_current(handle: &ReaderHandle) -> Option<std::cell::Ref<'_, ReaderEvent>> {
@@ -1876,25 +2081,94 @@ fn reader_current(handle: &ReaderHandle) -> Option<std::cell::Ref<'_, ReaderEven
     Some(std::cell::Ref::map(events, |events| &events[index as usize]))
 }
 
-fn reader_read(rb_self: Value) -> Result<Value, Error> {
+fn reader_read(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
     let handle: &ReaderHandle = TryConvert::try_convert(rb_self)?;
-    let mut index = handle.index.borrow_mut();
-    *index += 1;
-    let events_len = handle.events.borrow().len() as isize;
-    let ruby = Ruby::get().unwrap();
-    if *index >= events_len {
-        Ok(ruby.qnil().as_value())
-    } else {
-        Ok(rb_self)
+    {
+        let mut index = handle.index.borrow_mut();
+        *index += 1;
     }
+    loop {
+        let index = *handle.index.borrow();
+        if index >= 0 && (index as usize) < handle.events.borrow().len() {
+            return Ok(rb_self);
+        }
+        if !reader_fill(ruby, handle)? {
+            if handle.fatal.borrow().is_some() {
+                return reader_fail(ruby, rb_self, handle);
+            }
+            return Ok(ruby.qnil().as_value());
+        }
+    }
+}
+
+fn reader_fill(_ruby: &Ruby, handle: &ReaderHandle) -> Result<bool, Error> {
+    let Some(io) = handle.io.borrow().as_ref().copied() else {
+        return Ok(false);
+    };
+    if handle.eof.get() {
+        return Ok(false);
+    }
+    let chunk: Value = io.funcall("read", (4096,))?;
+    if chunk.is_nil() {
+        handle.eof.set(true);
+    } else if let Some(bytes) = string_bytes(chunk) {
+        let take = bytes.len().min(4096);
+        if take == 0 {
+            handle.eof.set(true);
+        } else {
+            handle.buffer.borrow_mut().push_str(&String::from_utf8_lossy(&bytes[..take]));
+        }
+    } else {
+        handle.eof.set(true);
+        return Ok(false);
+    }
+    if handle.buffer.borrow().is_empty() {
+        return Ok(false);
+    }
+    let (events, doc_encoding, fatal) = reader_parse(
+        &handle.buffer.borrow(),
+        handle.url.clone(),
+        handle.encoding.borrow().clone(),
+        handle.options,
+    );
+    *handle.events.borrow_mut() = events;
+    *handle.doc_encoding.borrow_mut() = doc_encoding;
+    *handle.fatal.borrow_mut() = fatal;
+    Ok((*handle.index.borrow() as usize) < handle.events.borrow().len() || !handle.eof.get())
+}
+
+fn string_bytes(value: Value) -> Option<Vec<u8>> {
+    let text: RString = TryConvert::try_convert(value).ok()?;
+    Some(unsafe { text.as_slice() }.to_vec())
+}
+
+fn reader_fail<T>(ruby: &Ruby, reader: Value, handle: &ReaderHandle) -> Result<T, Error> {
+    let message = handle.fatal.borrow().clone().unwrap_or_else(|| "FATAL: Extra content at the end of the document".to_string());
+    let errors_value: Value = reader.funcall("errors", ())?;
+    let errors: RArray = TryConvert::try_convert(errors_value)?;
+    errors.push(syntax_error(ruby, &ParseError {
+        message: message.clone(),
+        line: 0,
+        column: 0,
+        level: 3,
+        domain: 1,
+        code: 77,
+    })?)?;
+    let exception = classes().syntax_error.new_instance((message.as_str(),))?;
+    let exception: Exception = TryConvert::try_convert(exception)?;
+    Err(exception.into())
 }
 
 fn reader_name(handle: &ReaderHandle) -> Option<String> {
     reader_current(handle).map(|event| event.name.clone())
 }
 
+fn reader_local_name(handle: &ReaderHandle) -> Option<String> {
+    reader_current(handle).map(|event| event.local_name.clone())
+}
+
 fn reader_value(handle: &ReaderHandle) -> Option<String> {
-    reader_current(handle).and_then(|event| if event.value.is_empty() && event.kind == 1 { None } else { Some(event.value.clone()) })
+    reader_current(handle).and_then(|event| if event.value.is_empty() { None } else { Some(event.value.clone()) })
 }
 
 fn reader_node_type(handle: &ReaderHandle) -> i32 {
@@ -1910,29 +2184,61 @@ fn reader_empty(handle: &ReaderHandle) -> bool {
 }
 
 fn reader_attr_count(handle: &ReaderHandle) -> usize {
-    reader_current(handle).map(|event| event.attrs.len()).unwrap_or(0)
+    reader_current(handle).map(|event| if event.kind == 1 { event.attrs.len() + event.ns_decls.len() } else { 0 }).unwrap_or(0)
 }
 
-fn reader_attr(handle: &ReaderHandle, name: String) -> Option<String> {
-    reader_current(handle)?.attrs.iter().find(|(key, _)| key == &name).map(|(_, value)| value.clone())
+fn reader_attr(handle: &ReaderHandle, name: Option<String>) -> Option<String> {
+    let name = name?;
+    let event = reader_current(handle)?;
+    if let Some((_, value)) = event.attrs.iter().find(|(key, _)| key == &name) {
+        return Some(value.clone());
+    }
+    event.ns_decls.iter().find(|(key, _)| key == &name).map(|(_, value)| value.clone())
 }
 
-fn reader_attr_at(handle: &ReaderHandle, index: usize) -> Option<String> {
-    reader_current(handle)?.attrs.get(index).map(|(_, value)| value.clone())
+fn reader_attr_at(handle: &ReaderHandle, index: Option<i64>) -> Option<String> {
+    let index = index?;
+    if index < 0 {
+        return None;
+    }
+    let event = reader_current(handle)?;
+    let index = index as usize;
+    if index < event.ns_decls.len() {
+        return Some(event.ns_decls[index].1.clone());
+    }
+    event.attrs.get(index - event.ns_decls.len()).map(|(_, value)| value.clone())
 }
 
-fn reader_attr_hash(ruby: &Ruby, handle: &ReaderHandle) -> RHash {
+fn reader_attr_hash(ruby: &Ruby, rb_self: Value) -> Result<RHash, Error> {
+    let handle: &ReaderHandle = TryConvert::try_convert(rb_self)?;
+    if reader_expand_fails(handle) {
+        return reader_fail(ruby, rb_self, handle);
+    }
     let hash = ruby.hash_new();
     if let Some(event) = reader_current(handle) {
         for (key, value) in &event.attrs {
             let _ = hash.aset(key.as_str(), value.as_str());
         }
     }
-    hash
+    Ok(hash)
 }
 
-fn reader_namespaces(ruby: &Ruby, _handle: &ReaderHandle) -> RHash {
-    ruby.hash_new()
+fn reader_namespaces(ruby: &Ruby, rb_self: Value) -> Result<RHash, Error> {
+    let handle: &ReaderHandle = TryConvert::try_convert(rb_self)?;
+    if reader_expand_fails(handle) {
+        return reader_fail(ruby, rb_self, handle);
+    }
+    let hash = ruby.hash_new();
+    if let Some(event) = reader_current(handle) {
+        for (key, value) in &event.ns_decls {
+            let _ = hash.aset(key.as_str(), value.as_str());
+        }
+    }
+    Ok(hash)
+}
+
+fn reader_expand_fails(handle: &ReaderHandle) -> bool {
+    handle.fatal.borrow().is_some() && reader_current(handle).is_some_and(|event| !event.attrs.is_empty() || !event.ns_decls.is_empty())
 }
 
 fn reader_value_eh(handle: &ReaderHandle) -> bool {
@@ -1940,7 +2246,7 @@ fn reader_value_eh(handle: &ReaderHandle) -> bool {
 }
 
 fn reader_attributes_eh(handle: &ReaderHandle) -> bool {
-    reader_attr_count(handle) > 0
+    reader_current(handle).is_some_and(|event| !event.attrs.is_empty() || !event.ns_decls.is_empty())
 }
 
 macro_rules! ni {
@@ -2017,8 +2323,6 @@ fn html_standard_serialize(handle: &NodeHandle, preserve: bool) -> String {
 }
 
 ni!(safe_process_xinclude(_handle: &NodeHandle, _options: i32) "safe_process_xinclude");
-ni!(process_xincludes(_self: Value, _options: i32) "process_xincludes");
-ni!(canonicalize(_handle: &NodeHandle, _args: &[Value]) "canonicalize");
 
 fn create_entity(ruby: &Ruby, handle: &NodeHandle, args: &[Value]) -> Result<Value, Error> {
     let name = args.first().map(|value| string_arg(*value)).transpose()?.flatten().unwrap_or_default();
@@ -2051,14 +2355,33 @@ fn nodeset_or(ruby: &Ruby, rb_self: Value, other: Value) -> Result<Value, Error>
 
 fn reader_from_io(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
     let io = *args.first().ok_or_else(|| Error::new(ruby.exception_arg_error(), "io cannot be nil"))?;
-    let data: Value = io.funcall("read", ())?;
-    let mut owned = vec![data];
-    owned.extend_from_slice(&args[1..]);
-    reader_from_memory(ruby, class, &owned)
+    if io.is_nil() {
+        return Err(Error::new(ruby.exception_arg_error(), "io cannot be nil"));
+    }
+    let url = args.get(1).copied().and_then(|value| string_arg(value).ok()).flatten();
+    let encoding = args.get(2).copied().and_then(|value| string_arg(value).ok()).flatten();
+    let options = args.get(3).and_then(|value| <i32 as TryConvert>::try_convert(*value).ok()).unwrap_or(0);
+    let reader = ruby.obj_wrap_as(ReaderHandle {
+        events: RefCell::new(Vec::new()),
+        index: RefCell::new(-1),
+        encoding: RefCell::new(encoding.clone()),
+        doc_encoding: RefCell::new(None),
+        source: RefCell::new(io),
+        fatal: RefCell::new(None),
+        io: RefCell::new(Some(io)),
+        buffer: RefCell::new(String::new()),
+        eof: Cell::new(false),
+        options,
+        url: url.clone(),
+    }, class).as_value();
+    let init_args = [io, args.get(1).copied().unwrap_or_else(|| ruby.qnil().as_value()), encoding.map(|text| ruby.str_new(&text).as_value()).unwrap_or_else(|| ruby.qnil().as_value())];
+    reader.funcall::<_, _, Value>("initialize", &init_args[..])?;
+    let _ = url;
+    Ok(reader)
 }
 
-fn reader_base_uri(_handle: &ReaderHandle) -> Option<String> {
-    None
+fn reader_base_uri(handle: &ReaderHandle) -> Option<String> {
+    reader_current(handle).and_then(|event| if event.base_uri.is_empty() { None } else { Some(event.base_uri.clone()) })
 }
 
 fn reader_default(_handle: &ReaderHandle) -> bool {
@@ -2066,35 +2389,38 @@ fn reader_default(_handle: &ReaderHandle) -> bool {
 }
 
 fn reader_encoding(handle: &ReaderHandle) -> Option<String> {
-    handle.encoding.borrow().clone()
+    if *handle.index.borrow() < 0 {
+        return handle.encoding.borrow().clone();
+    }
+    handle.doc_encoding.borrow().clone().filter(|value| !value.is_empty()).or_else(|| handle.encoding.borrow().clone()).or_else(|| Some("UTF-8".to_string()))
 }
 
 fn reader_inner_xml(handle: &ReaderHandle) -> String {
-    reader_current(handle).map(|event| event.value.clone()).unwrap_or_default()
+    reader_current(handle).map(|event| event.inner_xml.clone()).unwrap_or_default()
 }
 
-fn reader_lang(_handle: &ReaderHandle) -> Option<String> {
-    None
+fn reader_lang(handle: &ReaderHandle) -> Option<String> {
+    reader_current(handle).and_then(|event| if event.lang.is_empty() { None } else { Some(event.lang.clone()) })
 }
 
 fn reader_namespace_uri(handle: &ReaderHandle) -> Option<String> {
-    reader_current(handle).map(|event| event.href.clone())
+    reader_current(handle).and_then(|event| if event.href.is_empty() { None } else { Some(event.href.clone()) })
 }
 
 fn reader_outer_xml(handle: &ReaderHandle) -> String {
-    reader_current(handle).map(|event| event.value.clone()).unwrap_or_default()
+    reader_current(handle).map(|event| event.outer_xml.clone()).unwrap_or_default()
 }
 
 fn reader_prefix(handle: &ReaderHandle) -> Option<String> {
-    reader_current(handle).map(|event| event.prefix.clone())
+    reader_current(handle).and_then(|event| if event.prefix.is_empty() { None } else { Some(event.prefix.clone()) })
 }
 
 fn reader_state(_handle: &ReaderHandle) -> i32 {
     0
 }
 
-fn reader_xml_version(_handle: &ReaderHandle) -> String {
-    "1.0".to_string()
+fn reader_xml_version(handle: &ReaderHandle) -> Option<String> {
+    reader_current(handle).map(|_| "1.0".to_string())
 }
 
 fn description_implied_start(handle: &ElementDescription) -> bool {
@@ -2310,64 +2636,14 @@ fn entity_system_id(handle: &NodeHandle) -> Option<String> {
     handle.store().borrow().nodes[handle.id() as usize].system_id.clone()
 }
 
-ni!(schema_from_document(_class: RClass, _args: &[Value]) "Schema.from_document");
-ni!(schema_validate_document(_self: Value, _document: Value) "Schema#validate_document");
-ni!(schema_validate_file(_self: Value, _path: Value) "Schema#validate_file");
-ni!(relax_from_document(_class: RClass, _args: &[Value]) "RelaxNG.from_document");
-ni!(relax_validate_document(_self: Value, _document: Value) "RelaxNG#validate_document");
 ni!(xslt_register(_module: RModule, _name: String, _class: Value) "XSLT.register");
 ni!(xslt_parse(_class: RClass, _document: Value) "XSLT::Stylesheet.parse_stylesheet_doc");
 ni!(xslt_serialize(_self: Value, _document: Value) "XSLT#serialize");
 ni!(xslt_transform(_self: Value, _args: &[Value]) "XSLT#transform");
-ni!(sax_native_write(_self: Value, _chunk: Value, _last: Value) "SAX push write");
-ni!(html_sax_native_write(_self: Value, _chunk: Value, _last: Value) "HTML SAX push write");
-ni!(sax_context_memory(_class: RClass, _args: &[Value]) "SAX ParserContext");
-ni!(sax_context_file(_class: RClass, _args: &[Value]) "SAX ParserContext file");
-ni!(sax_context_io(_class: RClass, _args: &[Value]) "SAX ParserContext io");
-ni!(sax_parse_with(_self: Value, _parser: Value) "SAX parse_with");
-ni!(html_sax_context_memory(_class: RClass, _args: &[Value]) "HTML SAX ParserContext");
-ni!(html_sax_context_file(_class: RClass, _args: &[Value]) "HTML SAX ParserContext file");
-ni!(html_sax_parse_with(_self: Value, _parser: Value) "HTML SAX parse_with");
 ni!(gumbo_parse(_module: RModule, _args: &[Value]) "Gumbo.parse");
 ni!(gumbo_fragment(_module: RModule, _args: &[Value]) "Gumbo.fragment");
 
 fn sax_initialize_native(_self: Value) {}
-
-fn sax_options(_self: Value) -> i32 {
-    0
-}
-
-fn sax_options_set(_self: Value, options: i32) -> i32 {
-    options
-}
-
-fn sax_replace_entities(_self: Value) -> bool {
-    false
-}
-
-fn sax_replace_entities_set(_self: Value, value: bool) -> bool {
-    value
-}
-
-fn sax_push_initialize(_self: Value, _parser: Value, _encoding: Value) {}
-
-fn html_sax_push_initialize(_self: Value, _parser: Value, _filename: Value, _encoding: Value) {}
-
-fn sax_recovery(_self: Value) -> bool {
-    false
-}
-
-fn sax_recovery_set(_self: Value, value: bool) -> bool {
-    value
-}
-
-fn sax_line(_self: Value) -> i32 {
-    0
-}
-
-fn sax_column(_self: Value) -> i32 {
-    0
-}
 
 fn define_node_methods(node: RClass) -> Result<(), Error> {
     node.define_alloc_func::<NodeHandle>();
@@ -2457,7 +2733,7 @@ fn define_reader(reader: RClass) -> Result<(), Error> {
     reader.define_method("encoding", method!(reader_encoding, 0))?;
     reader.define_method("inner_xml", method!(reader_inner_xml, 0))?;
     reader.define_method("lang", method!(reader_lang, 0))?;
-    reader.define_method("local_name", method!(reader_name, 0))?;
+    reader.define_method("local_name", method!(reader_local_name, 0))?;
     reader.define_method("name", method!(reader_name, 0))?;
     reader.define_method("namespace_uri", method!(reader_namespace_uri, 0))?;
     reader.define_method("namespaces", method!(reader_namespaces, 0))?;
@@ -2522,11 +2798,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let relax = xml.define_class("RelaxNG", schema)?;
     let stylesheet = xslt.define_class("Stylesheet", ruby.class_object())?;
     let sax_parser = xml_sax.define_class("Parser", ruby.class_object())?;
+    let _parser_state = xml_sax.define_class("ParserState", ruby.class_object())?;
     let sax_context = xml_sax.define_class("ParserContext", ruby.class_object())?;
     let sax_push = xml_sax.define_class("PushParser", ruby.class_object())?;
     let html_sax_parser = html4_sax.define_class("Parser", sax_parser)?;
     let html_sax_context = html4_sax.define_class("ParserContext", sax_context)?;
-    let html_sax_push = html4_sax.define_class("PushParser", ruby.class_object())?;
+    let html_sax_push = html4_sax.define_class("PushParser", sax_push)?;
 
     CLASSES.with(|slot| {
         *slot.borrow_mut() = Some(Classes {
