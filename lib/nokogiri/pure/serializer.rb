@@ -52,6 +52,8 @@ module Nokogiri
       end
 
       def write(node)
+        owner = node.document? ? node : node.document
+        @html = !owner.nil? && owner.html?
         if node.document?
           write_document(node)
         else
@@ -102,44 +104,47 @@ module Nokogiri
       end
 
       def write_node(node, depth)
-        case node.node_type
+        state = node.instance_variable_get(:@pure)
+        case state.type
         when XML::Node::ELEMENT_NODE
-          write_element(node, depth)
+          write_element(node, depth, state)
         when XML::Node::TEXT_NODE
-          emit(raw_text?(node) ? node.content.to_s : Entities.escape_text(node.content))
+          text = state.content.to_s
+          emit(raw_text?(state) ? text : Entities.escape_text(text))
         when XML::Node::CDATA_SECTION_NODE
-          emit("<![CDATA[#{node.content}]]>")
+          emit("<![CDATA[#{state.content}]]>")
         when XML::Node::COMMENT_NODE
-          emit("<!--#{node.content}-->")
+          emit("<!--#{state.content}-->")
         when XML::Node::PI_NODE
-          if node.content.empty?
-            emit("<?#{node.name}?>")
+          if state.content.to_s.empty?
+            emit("<?#{state.name}?>")
           else
-            emit("<?#{node.name} #{node.content}?>")
+            emit("<?#{state.name} #{state.content}?>")
           end
         when XML::Node::DTD_NODE
           write_dtd(node)
         when XML::Node::ENTITY_REF_NODE
-          emit("&#{node.name};")
+          emit("&#{state.name};")
         when XML::Node::ATTRIBUTE_NODE
           emit(attribute_text(node))
         when XML::Node::DOCUMENT_FRAG_NODE
-          node.pure.children.each { |child| write_node(child, depth) }
+          state.children.each { |child| write_node(child, depth) }
         else
-          node.pure.children.each { |child| write_node(child, depth) }
+          state.children.each { |child| write_node(child, depth) }
         end
       end
 
-      def write_element(node, depth)
-        emit("<#{qualified_name(node)}")
+      def write_element(node, depth, state)
+        name = qualified_name(state)
+        emit("<#{name}")
         write_namespace_declarations(node)
         write_attributes(node)
-        children = node.pure.children
+        children = state.children
         if children.empty?
-          if html_void?(node) && @options & AS_XML == 0
+          if html_void?(state) && @options & AS_XML == 0
             emit(@options & AS_XHTML != 0 ? " />" : ">")
           elsif @options & NO_EMPTY_TAGS != 0 || @options & AS_HTML != 0 || @options & AS_XHTML != 0
-            emit("></#{qualified_name(node)}>")
+            emit("></#{name}>")
           else
             emit("/>")
           end
@@ -156,7 +161,7 @@ module Nokogiri
         else
           children.each { |child| write_node(child, depth + 1) }
         end
-        emit("</#{qualified_name(node)}>")
+        emit("</#{name}>")
       end
 
       def format_children?(node)
@@ -186,32 +191,36 @@ module Nokogiri
       end
 
       def attribute_text(attr)
-        name = if attr.namespace&.prefix && !attr.namespace.prefix.empty?
-          "#{attr.namespace.prefix}:#{attr.name}"
+        state = attr.instance_variable_get(:@pure)
+        prefix = state.namespace&.prefix
+        name = if prefix && !prefix.empty?
+          "#{prefix}:#{state.name}"
         else
-          attr.name
+          state.name
         end
-        return name if html_boolean?(attr)
+        value = state.content.to_s
+        return name if html_boolean?(state, value)
 
-        value = charset_value(attr, attr.value)
-        escaped = Entities.escape_attr(value)
-        escaped = escaped.gsub("&quot;", "%22") if html_attribute_quoting?
+        value = charset_value(attr, state, value)
+        escaped = Entities.escape_attr(value, percent_quotes: html_attribute_quoting?)
         %(#{name}="#{escaped}")
       end
 
-      def html_void?(node)
-        return false unless node.document&.html?
-        return false unless node.element?
+      def html_void?(state)
+        return false unless @html
+        return false unless state.type == XML::Node::ELEMENT_NODE
 
-        HTML4::ElementDescription[node.name]&.empty?
+        HTML4::ElementDescription[state.name]&.empty?
       end
 
-      def raw_text?(node)
-        parent = node.parent
-        return false unless parent&.element?
-        return false unless parent.document&.html?
+      def raw_text?(state)
+        return false unless @html
 
-        RAW_TEXT.include?(parent.name.to_s.downcase)
+        parent = state.parent
+        parent_state = parent&.instance_variable_get(:@pure)
+        return false unless parent_state&.type == XML::Node::ELEMENT_NODE
+
+        RAW_TEXT.include?(parent_state.name.to_s.downcase)
       end
 
       def html_attribute_quoting?
@@ -220,26 +229,28 @@ module Nokogiri
         @options & AS_HTML != 0
       end
 
-      def charset_value(attr, value)
+      def charset_value(_attr, state, value)
         return value unless @encoding_name
-        return value unless attr.parent&.element?
-        return value unless attr.parent.document&.html?
-        return value unless attr.parent.name.to_s.casecmp?("meta")
+        return value unless @html
 
-        if attr.name.to_s.casecmp?("charset")
+        parent_state = state.parent&.instance_variable_get(:@pure)
+        return value unless parent_state&.type == XML::Node::ELEMENT_NODE
+        return value unless parent_state.name.to_s.casecmp?("meta")
+
+        if state.name.to_s.casecmp?("charset")
           @encoding_name
-        elsif attr.name.to_s.casecmp?("content") && value.to_s.match?(/charset\s*=/i)
+        elsif state.name.to_s.casecmp?("content") && value.to_s.match?(/charset\s*=/i)
           value.to_s.sub(/charset\s*=\s*[^;"'\s]+/i, "charset=#{@encoding_name}")
         else
           value
         end
       end
 
-      def html_boolean?(attr)
-        return false unless attr.document&.html?
-        return false unless attr.value.nil? || attr.value.empty?
+      def html_boolean?(state, value)
+        return false unless @html
+        return false unless value.nil? || value.empty?
 
-        HTML_BOOLEAN.include?(attr.name.to_s.downcase)
+        HTML_BOOLEAN.include?(state.name.to_s.downcase)
       end
 
       def write_dtd(node)
@@ -253,12 +264,12 @@ module Nokogiri
         emit(">")
       end
 
-      def qualified_name(node)
-        prefix = node.namespace&.prefix
+      def qualified_name(state)
+        prefix = state.namespace&.prefix
         if prefix && !prefix.empty?
-          "#{prefix}:#{node.name}"
+          "#{prefix}:#{state.name}"
         else
-          node.name
+          state.name
         end
       end
     end

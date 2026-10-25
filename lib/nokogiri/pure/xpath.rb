@@ -9,8 +9,18 @@ module Nokogiri
     class XPath
       NODE_TESTS = %w[text node comment processing-instruction].freeze
 
+      def self.node_limit(limit)
+        previous = Thread.current[:nokogiri_pure_node_limit]
+        Thread.current[:nokogiri_pure_node_limit] = limit
+        yield
+      ensure
+        Thread.current[:nokogiri_pure_node_limit] = previous
+      end
+
       def self.evaluate(context_node, path, namespaces, variables = nil, handler = nil)
-        value = Engine.new(path.to_s, namespaces || {}, variables || {}, handler).evaluate(context_node)
+        limit = Thread.current[:nokogiri_pure_node_limit]
+        Thread.current[:nokogiri_pure_node_limit] = nil if limit
+        value = Engine.new(path.to_s, namespaces || {}, variables || {}, handler, node_limit: limit).evaluate(context_node)
         document = context_node.document
         case value.type
         when :nodeset
@@ -22,6 +32,8 @@ module Nokogiri
         else
           value.text
         end
+      ensure
+        Thread.current[:nokogiri_pure_node_limit] = limit if limit
       end
 
       # One XPath value: a node set, a string, a number, or a boolean.
@@ -110,12 +122,13 @@ module Nokogiri
 
       # Evaluates one expression against one context node.
       class Engine
-        def initialize(source, namespaces, variables, handler = nil, evaluating: true)
+        def initialize(source, namespaces, variables, handler = nil, evaluating: true, node_limit: nil)
           @scanner = Scanner.new(source)
           @namespaces = namespaces
           @variables = variables
           @handler = handler
           @evaluating = evaluating
+          @node_limit = node_limit
           @position = 1
           @size = 1
         end
@@ -224,6 +237,9 @@ module Nokogiri
           while @scanner.operator?("|")
             right = parse_path_expr
             left = Value.nodes(dedup(left.nodes + right.nodes))
+            if @node_limit && left.nodes.length > @node_limit
+              left = Value.nodes(left.nodes.take(@node_limit))
+            end
           end
           left
         end
@@ -388,17 +404,154 @@ module Nokogiri
           { axis: axis, test: { kind: :node }, predicates: [] }
         end
 
+        # A single context node already yields these axes in document order.
+        # Reverse axes come back nearest-first. Callers reverse them after predicates.
+        FORWARD_AXES = {
+          child: true,
+          self: true,
+          attribute: true,
+          descendant: true,
+          :"descendant-or-self" => true,
+          :"following-sibling" => true,
+        }.freeze
+        REVERSE_AXES = {
+          parent: true,
+          ancestor: true,
+          :"ancestor-or-self" => true,
+          :"preceding-sibling" => true,
+        }.freeze
+
+        # CSS compiles //div[class] to descendant-or-self::node()/child::div[class].
+        # The child step keeps its own position() scope. One context is already in document order.
+        CLASS_CONTAINS = /\Acontains\(concat\(' ',normalize-space\(@([^)]+)\),' '\),' ([^']*)'\)\z/
+        ATTR_EQUALS = /\A@([A-Za-z_][\w.\-]*)=(?:"([^"]*)"|'([^']*)')\z/
+
         def apply_steps(nodes, steps)
-          steps.each do |step|
-            nodes = apply_step(nodes, step)
+          index = 0
+          while index < steps.length
+            step = steps[index]
+            nxt = steps[index + 1]
+            final = false
+            if descendant_child_pair?(step, nxt)
+              final = index + 2 == steps.length
+              nodes = apply_descendant_child(nodes, nxt, limit: final ? @node_limit : nil)
+              index += 2
+            else
+              final = index + 1 == steps.length
+              nodes = apply_step(nodes, step, limit: final ? @node_limit : nil)
+              index += 1
+            end
+            break if @node_limit && final && nodes.length >= @node_limit
           end
           nodes
         end
 
-        def apply_step(nodes, step)
+        def descendant_child_pair?(step, nxt)
+          nxt &&
+            step[:axis] == :"descendant-or-self" &&
+            step[:test][:kind] == :node &&
+            step[:predicates].empty? &&
+            nxt[:axis] == :child
+        end
+
+        def apply_descendant_child(nodes, step, limit: nil)
+          list = []
+          if nodes.length == 1
+            gather_descendant_children(nodes[0], step, list, limit)
+            return list
+          end
+
+          nodes.each do |node|
+            gather_descendant_children(node, step, list, limit)
+            break if limit && list.length >= limit
+          end
+          return list if list.length < 2
+
+          dedup(list)
+        end
+
+        def gather_descendant_children(node, step, out, limit)
+          test = step[:test]
+          if step[:predicates].empty? && test[:kind] == :name && test[:prefix].nil?
+            gather_named_iter(node, test[:local], out, limit)
+            return
+          end
+
+          state = node.instance_variable_get(:@pure)
+          return unless state
+
+          children = state.children
+          return if children.empty?
+
+          if step[:predicates].empty?
+            children.each do |child|
+              out << child if match_test?(child, test, :child)
+              return if limit && out.length >= limit
+
+              gather_descendant_children(child, step, out, limit)
+              return if limit && out.length >= limit
+            end
+            return
+          end
+
+          matched = []
+          children.each { |child| matched << child if match_test?(child, test, :child) }
+          kept = apply_predicates(matched, step[:predicates])
+          kept_ids = {}
+          kept.each { |item| kept_ids[item.object_id] = true }
+          children.each do |child|
+            if kept_ids[child.object_id]
+              out << child
+              return if limit && out.length >= limit
+            end
+            gather_descendant_children(child, step, out, limit)
+            return if limit && out.length >= limit
+          end
+        end
+
+        # Preorder walk. One context emits matches in document order.
+        def gather_named_iter(root, local, out, limit)
+          state = root.instance_variable_get(:@pure)
+          return unless state
+
+          children = state.children
+          return if children.empty?
+
+          stack = []
+          index = children.length
+          while index > 0
+            index -= 1
+            stack << children[index]
+          end
+          element = XML::Node::ELEMENT_NODE
+          while (node = stack.pop)
+            child_state = node.instance_variable_get(:@pure)
+            next unless child_state
+
+            if child_state.type == element && child_state.name == local && child_state.namespace.nil?
+              out << node
+              return if limit && out.length >= limit
+            end
+            kids = child_state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor]
+            end
+          end
+        end
+
+        def apply_step(nodes, step, limit: nil)
+          axis = step[:axis]
+          if nodes.length == 1 && (FORWARD_AXES[axis] || REVERSE_AXES[axis])
+            found = axis_nodes(nodes[0], axis, step[:test])
+            kept = apply_predicates(found, step[:predicates])
+            return REVERSE_AXES[axis] ? kept.reverse : kept
+          end
+
           matched = []
           nodes.each do |node|
-            found = axis_nodes(node, step[:axis], step[:test])
+            found = axis_nodes(node, axis, step[:test])
             matched.concat(apply_predicates(found, step[:predicates]))
           end
           dedup(matched)
@@ -407,15 +560,61 @@ module Nokogiri
         def apply_predicates(nodes, predicates)
           current = nodes
           predicates.each do |source|
-            kept = []
-            current.each_with_index do |node, index|
-              value = child_engine(source).evaluate(node, position: index + 1, size: current.length)
-              keep = value.number? ? value.number.to_i == index + 1 : value.truthy
-              kept << node if keep
-            end
-            current = kept
+            current = filter_predicate(current, source)
           end
           current
+        end
+
+        def filter_predicate(nodes, source)
+          if (match = CLASS_CONTAINS.match(source))
+            name = match[1]
+            inner = match[2]
+            if !name.include?(":") && inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
+              needle = inner[1..-2]
+              unless needle.include?(" ")
+                return nodes.select { |node| attribute_class?(node, name, needle) }
+              end
+            end
+          elsif (match = ATTR_EQUALS.match(source))
+            name = match[1]
+            unless name.include?(":")
+              expected = match[2] || match[3]
+              return nodes.select { |node| attribute_equals?(node, name, expected) }
+            end
+          end
+
+          kept = []
+          nodes.each_with_index do |node, index|
+            value = child_engine(source).evaluate(node, position: index + 1, size: nodes.length)
+            keep = value.number? ? value.number.to_i == index + 1 : value.truthy
+            kept << node if keep
+          end
+          kept
+        end
+
+        def attribute_class?(node, name, needle)
+          value = attribute_value(node, name)
+          return needle.empty? unless value
+
+          css_class?(value, needle)
+        end
+
+        def attribute_equals?(node, name, expected)
+          value = attribute_value(node, name) || ""
+          value == expected
+        end
+
+        def attribute_value(node, name)
+          state = node.instance_variable_get(:@pure)
+          return unless state
+
+          state.attributes.each do |attr|
+            attr_state = attr.instance_variable_get(:@pure)
+            next unless attr_state&.name == name && attr_state.namespace.nil?
+
+            return attr_state.content.to_s
+          end
+          nil
         end
 
         def apply_value_predicates(value)
@@ -443,7 +642,8 @@ module Nokogiri
             parent = parent_of(node)
             parent ? [parent] : []
           when :attribute
-            node.respond_to?(:element?) && node.element? ? node.pure.attributes : []
+            state = node.instance_variable_get(:@pure)
+            state&.type == XML::Node::ELEMENT_NODE ? state.attributes : []
           when :namespace
             namespace_axis(node)
           when :descendant
@@ -477,15 +677,13 @@ module Nokogiri
         end
 
         def children_of(node)
-          return [] unless node.respond_to?(:pure)
-
-          node.pure.children
+          state = node.instance_variable_get(:@pure)
+          state ? state.children : []
         end
 
         def parent_of(node)
-          return unless node.respond_to?(:parent)
-
-          node.parent
+          state = node.instance_variable_get(:@pure)
+          state&.parent
         end
 
         def collect_descendants(node, include_self)
@@ -496,9 +694,10 @@ module Nokogiri
         end
 
         def walk_children(node, list)
-          return unless node.respond_to?(:pure)
+          state = node.instance_variable_get(:@pure)
+          return unless state
 
-          node.pure.children.each do |child|
+          state.children.each do |child|
             list << child
             walk_children(child, list)
           end
@@ -517,9 +716,10 @@ module Nokogiri
 
         def siblings_from(node, direction)
           parent = parent_of(node)
-          return [] unless parent&.respond_to?(:pure)
+          parent_state = parent&.instance_variable_get(:@pure)
+          return [] unless parent_state
 
-          siblings = parent.pure.children
+          siblings = parent_state.children
           index = siblings.index(node)
           return [] unless index
 
@@ -531,38 +731,39 @@ module Nokogiri
         end
 
         def match_test?(node, test, axis)
+          state = node.instance_variable_get(:@pure)
           case test[:kind]
           when :node
             !node.is_a?(XML::Namespace)
           when :text
-            node.respond_to?(:text?) && node.text?
+            state&.type == XML::Node::TEXT_NODE
           when :comment
-            node.respond_to?(:comment?) && node.comment?
+            state&.type == XML::Node::COMMENT_NODE
           when :processing_instruction
-            return false unless node.respond_to?(:processing_instruction?) && node.processing_instruction?
+            return false unless state&.type == XML::Node::PI_NODE
 
-            test[:argument].nil? || node.name == test[:argument]
+            test[:argument].nil? || state.name == test[:argument]
           when :star
-            star_match?(node, axis)
+            star_match?(node, state, axis)
           when :name
-            name_match?(node, test, axis)
+            name_match?(node, state, test, axis)
           else
             false
           end
         end
 
-        def star_match?(node, axis)
+        def star_match?(node, state, axis)
           case axis
           when :attribute
-            node.respond_to?(:node_type) && node.node_type == XML::Node::ATTRIBUTE_NODE
+            state&.type == XML::Node::ATTRIBUTE_NODE
           when :namespace
             node.is_a?(XML::Namespace)
           else
-            node.respond_to?(:element?) && node.element?
+            state&.type == XML::Node::ELEMENT_NODE
           end
         end
 
-        def name_match?(node, test, axis)
+        def name_match?(node, state, test, axis)
           if axis == :namespace
             return false unless node.is_a?(XML::Namespace)
 
@@ -570,18 +771,18 @@ module Nokogiri
           end
           href_for(test[:prefix]) unless test[:prefix].nil?
           if axis == :attribute
-            return false unless node.respond_to?(:node_type) && node.node_type == XML::Node::ATTRIBUTE_NODE
-          elsif !node.respond_to?(:element?) || !node.element?
+            return false unless state&.type == XML::Node::ATTRIBUTE_NODE
+          elsif state&.type != XML::Node::ELEMENT_NODE
             return false
           end
-          return false unless node.name == test[:local]
+          return false unless state.name == test[:local]
           return test[:prefix] == "*" if test[:local] == "*"
 
           href = href_for(test[:prefix])
           if test[:prefix].nil?
-            node.namespace.nil?
+            state.namespace.nil?
           else
-            node.namespace&.href == href
+            state.namespace&.href == href
           end
         end
 
@@ -891,30 +1092,121 @@ module Nokogiri
 
         def dedup(nodes)
           seen = {}
-          list = nodes.each_with_object([]) do |node, collected|
-            next if seen[node.object_id]
+          list = []
+          nodes.each do |node|
+            id = node.object_id
+            next if seen[id]
 
-            seen[node.object_id] = true
-            collected << node
+            seen[id] = true
+            list << node
           end
           sort_document_order(list)
         end
 
         # Array#index inside Node#compare makes a comparison sort quadratic on a wide tree.
-        # One document-order walk is enough when every node hangs from the same root.
+        # Small sets use a parent-chain key. Large sets use one preorder stamp.
         def sort_document_order(list)
           return list if list.length < 2
 
-          root = order_root(list.first)
-          return compare_sort(list) unless list.all? { |node| order_root(node).equal?(root) }
+          root = order_root(list[0])
+          list.each { |node| return compare_sort(list) unless order_root(node).equal?(root) }
+          return sort_by_stamp(list, root) if list.length >= 64
 
-          wanted = {}
-          list.each { |node| wanted[node.object_id] = true }
-          ordered = []
-          collect_in_order(root, wanted, ordered)
-          return ordered if ordered.length == list.length
+          sort_by_keys(list)
+        end
 
-          compare_sort(list)
+        def sort_by_keys(list)
+          prepare_order_cache
+          keys = Array.new(list.length)
+          list.each_with_index do |node, index|
+            key = order_key(node)
+            return compare_sort(list) unless key
+
+            keys[index] = key
+          end
+          list.sort_by!.with_index { |_, index| keys[index] }
+        end
+
+        def sort_by_stamp(list, root)
+          index = stamp_index(root)
+          return compare_sort(list) unless list.all? { |node| index.key?(node.object_id) }
+
+          list.sort_by! { |node| index[node.object_id] }
+        end
+
+        def prepare_order_cache
+          @order_keys ||= {}
+          @child_indexes ||= {}
+          @attr_indexes ||= {}
+        end
+
+        def order_key(node)
+          id = node.object_id
+          return @order_keys[id] if @order_keys.key?(id)
+
+          state = node.instance_variable_get(:@pure)
+          return @order_keys[id] = nil unless state
+
+          parent = state.parent
+          return @order_keys[id] = [] unless parent
+
+          parent_key = order_key(parent)
+          return @order_keys[id] = nil unless parent_key
+
+          slot = if state.type == XML::Node::ATTRIBUTE_NODE
+            attribute_index(parent, id)
+          else
+            child_index(parent, id)
+          end
+          return @order_keys[id] = nil unless slot
+
+          @order_keys[id] = parent_key + slot
+        end
+
+        def child_index(parent, child_id)
+          cache = @child_indexes[parent.object_id]
+          unless cache
+            cache = {}
+            parent_state = parent.instance_variable_get(:@pure)
+            parent_state.children.each_with_index { |child, index| cache[child.object_id] = index }
+            @child_indexes[parent.object_id] = cache
+          end
+          index = cache[child_id]
+          index && [1, index]
+        end
+
+        def attribute_index(parent, attr_id)
+          cache = @attr_indexes[parent.object_id]
+          unless cache
+            cache = {}
+            parent_state = parent.instance_variable_get(:@pure)
+            parent_state.attributes.each_with_index { |attr, index| cache[attr.object_id] = index }
+            @attr_indexes[parent.object_id] = cache
+          end
+          index = cache[attr_id]
+          index && [0, index]
+        end
+
+        def stamp_index(root)
+          return @stamp_index if @stamp_root.equal?(root) && @stamp_index
+
+          index = {}
+          counter = 0
+          walk = lambda do |node|
+            counter += 1
+            index[node.object_id] = counter
+            state = node.instance_variable_get(:@pure)
+            return unless state
+
+            state.attributes.each do |attr|
+              counter += 1
+              index[attr.object_id] = counter
+            end
+            state.children.each { |child| walk.call(child) }
+          end
+          walk.call(root)
+          @stamp_root = root
+          @stamp_index = index
         end
 
         def compare_sort(list)
@@ -924,24 +1216,15 @@ module Nokogiri
         def order_root(node)
           current = node
           guard = 0
-          while current.respond_to?(:parent) && guard < 10_000
-            parent = current.parent
-            break if parent.nil?
+          while guard < 10_000
+            state = current.instance_variable_get(:@pure)
+            parent = state&.parent
+            break unless parent
 
             current = parent
             guard += 1
           end
           current
-        end
-
-        def collect_in_order(node, wanted, ordered)
-          ordered << node if wanted[node.object_id]
-          return unless node.respond_to?(:pure)
-
-          node.pure.attributes.each do |attr|
-            ordered << attr if wanted[attr.object_id]
-          end
-          node.pure.children.each { |child| collect_in_order(child, wanted, ordered) }
         end
 
         # XPath node-sets are returned in document order. position() uses axis order
@@ -970,6 +1253,7 @@ module Nokogiri
           @source = source
           @index = 0
           @slash_consumed = false
+          @ascii = source.ascii_only?
         end
 
         attr_reader :slash_consumed
@@ -985,6 +1269,8 @@ module Nokogiri
 
         def peek(length = 1)
           skip_space
+          return "" if @index >= @source.length
+
           @source[@index, length].to_s
         end
 
@@ -1003,13 +1289,31 @@ module Nokogiri
         def operator?(*tokens)
           skip_space
           tokens.each do |token|
-            next unless @source[@index, token.length] == token
+            next unless starts_with?(token)
 
             @index += token.length
             @slash_consumed = token == "/"
             return token
           end
           false
+        end
+
+        def starts_with?(token)
+          unless @ascii
+            return @source[@index, token.length] == token
+          end
+
+          base = @index
+          size = token.bytesize
+          return false if base + size > @source.bytesize
+
+          cursor = 0
+          while cursor < size
+            return false unless @source.getbyte(base + cursor) == token.getbyte(cursor)
+
+            cursor += 1
+          end
+          true
         end
 
         def keyword?(word)
@@ -1021,10 +1325,24 @@ module Nokogiri
 
         def keyword_ahead?(word)
           skip_space
-          return false unless @source[@index, word.length] == word
+          return false unless starts_with?(word)
+
+          if @ascii
+            next_byte = @source.getbyte(@index + word.bytesize)
+            return true unless next_byte
+
+            return !name_byte?(next_byte)
+          end
 
           next_char = @source[@index + word.length]
           !(next_char && next_char.match?(/[\p{L}\p{N}_.\-]/))
+        end
+
+        def name_byte?(byte)
+          (byte >= 48 && byte <= 57) ||
+            (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) ||
+            byte == 95 || byte == 46 || byte == 45
         end
 
         def location_path?
@@ -1104,21 +1422,24 @@ module Nokogiri
           value
         end
 
+        NUMBER = /\G\d+(?:\.\d+)?/
+        NCNAME = /\G[\p{L}_][\p{L}\p{N}_.\-]*/
+
         def number
           skip_space
-          match = @source[@index..].match(/\A\d+(?:\.\d+)?/)
+          match = NUMBER.match(@source, @index)
           return unless match
 
-          @index += match[0].length
+          @index = match.end(0)
           match[0].to_f
         end
 
         def ncname
           skip_space
-          match = @source[@index..].match(/\A[\p{L}_][\p{L}\p{N}_.\-]*/)
+          match = NCNAME.match(@source, @index)
           return unless match
 
-          @index += match[0].length
+          @index = match.end(0)
           match[0]
         end
 
@@ -1157,7 +1478,20 @@ module Nokogiri
         private
 
         def skip_space
-          @index += 1 while @index < @source.length && @source[@index].match?(/\s/)
+          source = @source
+          length = @ascii ? source.bytesize : source.length
+          index = @index
+          while index < length
+            ord = @ascii ? source.getbyte(index) : source[index].ord
+            if ord == 32 || ord == 9 || ord == 10 || ord == 13 || ord == 12 || ord == 11
+              index += 1
+            elsif !@ascii && ord > 127 && source[index].match?(/\s/)
+              index += 1
+            else
+              break
+            end
+          end
+          @index = index
         end
       end
     end

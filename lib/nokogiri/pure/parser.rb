@@ -8,6 +8,13 @@ module Nokogiri
     class Parser
       RECOVER = 1
       NAME = /[\p{L}_:][\p{L}\p{N}_:.\-]*/.freeze
+      HTML_MARKUP = %r{</?[A-Za-z]|<!--|<!\[CDATA\[|<\?|<!DOCTYPE|<!}
+      MARKUP_CHAR = /</
+      UNQUOTED = /[^\s>\/]*/
+      QUOTED_DQ = /[^"&]+/
+      QUOTED_SQ = /[^'&]+/
+      AMP_START = /[#A-Za-z_:]/
+      SPACE_RUN = /\s+/
 
       def self.parse(document, string, options)
         new(document, string, options).parse_document
@@ -97,7 +104,7 @@ module Nokogiri
       end
 
       def html_markup?
-        @scanner.check(%r{</?[A-Za-z]|<!--|<!\[CDATA\[|<\?|<!DOCTYPE|<!})
+        @scanner.check(HTML_MARKUP)
       end
 
       def parse_markup
@@ -736,8 +743,17 @@ module Nokogiri
       end
 
       def read_until_markup
-        text = +""
-        text << take_char while !@scanner.eos? && !@scanner.check(/</)
+        chunk = @scanner.scan_until(MARKUP_CHAR)
+        unless chunk
+          rest = @scanner.rest
+          @scanner.terminate
+          account_text(rest)
+          return rest
+        end
+
+        @scanner.pos -= 1
+        text = chunk.chop
+        account_text(text)
         text
       end
 
@@ -770,8 +786,8 @@ module Nokogiri
       end
 
       def read_unquoted
-        value = +""
-        value << take_char until @scanner.eos? || @scanner.check(/[\s>\/]/)
+        value = @scanner.scan(UNQUOTED) || ""
+        account_text(value)
         value
       end
 
@@ -781,12 +797,20 @@ module Nokogiri
           error("AttValue: \" or ' expected")
           return ""
         end
+        pattern = quote == '"' ? QUOTED_DQ : QUOTED_SQ
         value = +""
         until @scanner.eos?
+          run = @scanner.scan(pattern)
+          if run
+            value << run
+            account_text(run)
+            next
+          end
+
           char = take_char
           break if char == quote
 
-          if char == "&" && (!html_document? || @scanner.check(/[#A-Za-z_:]/))
+          if char == "&" && (!html_document? || @scanner.check(AMP_START))
             ref = +char
             until @scanner.eos?
               next_char = take_char
@@ -964,20 +988,20 @@ module Nokogiri
       end
 
       def skip_space
-        while (char = @scanner.check(/\s/))
-          take_char if char
-          break unless char
-        end
+        spaces = @scanner.scan(SPACE_RUN)
+        account_text(spaces) if spaces
       end
 
       def skip_through(token)
-        until @scanner.eos?
-          if @scanner.check(Regexp.new(Regexp.escape(token)))
-            advance(token)
-            return
-          end
-          take_char
+        chunk = @scanner.scan_until(token_pattern(token))
+        unless chunk
+          rest = @scanner.rest
+          @scanner.terminate
+          account_text(rest)
+          return
         end
+
+        account_text(chunk)
       end
 
       def expect(token)
@@ -987,10 +1011,28 @@ module Nokogiri
       end
 
       def advance(token)
-        return false unless @scanner.check(Regexp.new(Regexp.escape(token)))
+        return false unless @scanner.peek(token.length) == token
 
-        token.each_char { take_char }
+        @scanner.pos += token.bytesize
+        account_text(token)
         true
+      end
+
+      def token_pattern(token)
+        @token_patterns ||= {}
+        @token_patterns[token] ||= Regexp.new(Regexp.escape(token))
+      end
+
+      def account_text(string)
+        return if string.nil? || string.empty?
+
+        newlines = string.count("\n")
+        if newlines.zero?
+          @column += string.length
+        else
+          @line += newlines
+          @column = string.length - string.rindex("\n")
+        end
       end
 
       def take_char
