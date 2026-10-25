@@ -1,0 +1,17 @@
+[package]
+name = "nokogiri"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+magnus = { version = "0.9.3", features = ["rb-sys"] }
+
+[profile.release]
+lto = false
+codegen-units = 16

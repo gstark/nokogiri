@@ -1,0 +1,5 @@
+commit	score	worst_bench_delta	status	description
+76595a9	1.000	+0.0%	keep	baseline pure Ruby search, parse, and serialize
+bba2b49	1.077	-2.4%	keep	compile class and attribute predicates once; match unprefixed names inline
+03a3c7e	1.128	-13.0%	keep	link fresh parser nodes without a cycle check; HTML skips namespace adoption
+643981a	1.147	-8.0%	discard	SAX attribute scan; sax_html +30% but geomean versus parent only +1.7%, inside noise

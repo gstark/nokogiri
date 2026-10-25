@@ -6,6 +6,7 @@
 # building and packaging
 /ext/nokogiri/**/nokogiri.dll
 /ext/nokogiri/include
+/ext/nokogiri/target/
 /gems/
 /lib/nokogiri/**/nokogiri.bundle
 /lib/nokogiri/**/nokogiri.so
