@@ -1,2 +1,3 @@
 commit	geomean_ratio	status	description
 ac87983f	4.056096	baseline	median of three settled YJIT runs after per-case processes; threshold 0.1235
+68a706e2	3.638386	keep	namespaced child XPath on the flat table; xpath median 1.877; run geomeans 3.316 3.687 3.638
