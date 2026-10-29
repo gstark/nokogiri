@@ -16,6 +16,8 @@ module Nokogiri
       # Quote-aware tag. The match stops at the tag's ">", including one
       # that sits inside a quoted attribute value.
       FLAT_TAG = /<(?:[^>"']|"[^"]*"|'[^']*')*>/.freeze
+      P_END_MESSAGE = 'The element type "p" must be terminated by the matching end-tag "</p>".'.freeze
+      P_END_ERROR = [P_END_MESSAGE, 0, 0, nil, false].freeze
 
       def self.parse(document, string, options)
         new(document, string, options).parse_document
@@ -99,18 +101,21 @@ module Nokogiri
 
       def parse_loop
         # A "<!" starts a comment, a doctype, or CDATA. Those stay on the
-        # general loop. Plain XML is elements, text, and end tags.
+        # general loop for XML. Plain XML is elements, text, and end tags.
         # A document with only elements and text is stored as flat records.
+        # HTML can use the same table when every construct has a record.
         saved_pos = @scanner.pos
         saved_line = @line
         saved_column = @column
-        tree = try_flat_tree
+        tree = @html ? try_flat_html : try_flat_tree
         if tree
           @document.instance_variable_set(:@flat, tree)
           tree.attach_top
           @scanner.terminate
+          flush_flat_errors
           return
         end
+        @flat_errors = nil
         @scanner.pos = saved_pos
         @line = saved_line
         @column = saved_column
@@ -256,6 +261,605 @@ module Nokogiri
         return nil unless stack.empty?
 
         tree
+      end
+
+      # HTML records stay on the flat table until a reader asks for a node.
+      # A construct this path does not represent returns nil. The caller then
+      # runs the general reader. Errors are buffered so a failed scan adds none.
+      def try_flat_html
+        return nil unless @html && @root.document?
+
+        string = @scanner.string
+        limit = string.bytesize
+        @flat_errors = []
+        @flat_nl = flat_newline_table(string)
+        @flat_nl_i = 0
+        tree = FlatTree.new(@document, string)
+        tree.mark_html
+        stack = []
+        pos = @scanner.pos
+        while pos < limit
+          unless html_markup_at?(string, pos, limit)
+            nxt = pos
+            nxt = string.byteindex("<", pos) || limit if string.getbyte(pos) != 60
+            while nxt < limit && !html_markup_at?(string, nxt, limit)
+              found = string.byteindex("<", nxt + 1)
+              nxt = found || limit
+            end
+            if nxt > pos
+              parent = stack.empty? ? -1 : stack[-1]
+              return nil unless add_html_text(tree, string, pos, nxt, parent)
+            end
+            pos = nxt
+            next
+          end
+
+          byte = string.getbyte(pos + 1)
+          if byte == 33
+            if string.getbyte(pos + 2) == 45 && string.getbyte(pos + 3) == 45
+              pos = read_html_comment(tree, string, pos, limit, stack)
+              return nil if pos.nil?
+            elsif string.byteslice(pos, 9) == "<!DOCTYPE"
+              pos = read_html_doctype(tree, string, pos, limit, stack)
+              return nil if pos.nil?
+            else
+              return nil
+            end
+          elsif byte == 63
+            return nil
+          elsif byte == 47
+            pos = read_html_end(tree, string, pos, limit, stack)
+            return nil if pos.nil?
+          else
+            pos = read_html_start(tree, string, pos, limit, stack)
+            return nil if pos.nil?
+          end
+        end
+        finish_html_flat(tree, string, limit, stack)
+        tree
+      end
+
+      def finish_html_flat(tree, string, limit, stack)
+        return if stack.empty? || flat_fatal?
+
+        index = stack[-1]
+        line, column = flat_location(string, limit)
+        name = tree.folded_name(index)
+        @flat_errors << ["Premature end of data in tag #{name} line #{tree.line_of(index)}", line, column, 3, true]
+      end
+
+      def flat_fatal?
+        list = @flat_errors
+        index = 0
+        length = list.length
+        while index < length
+          return true if list[index][3] == 3
+
+          index += 1
+        end
+        false
+      end
+
+      def flush_flat_errors
+        list = @flat_errors
+        @flat_errors = nil
+        return unless list
+
+        index = 0
+        length = list.length
+        while index < length
+          message, line, column, level, location = list[index]
+          if location
+            @line = line
+            @column = column
+          end
+          error(message, level: level, location: location)
+          index += 1
+        end
+      end
+
+      def add_html_text(tree, string, from, to, parent)
+        if parent < 0
+          return add_html_root_text(string, from, to)
+        end
+
+        line = flat_line(to)
+        span = from
+        pos = from
+        split = false
+        names = nil
+        while (amp = string.byteindex("&", pos)) && amp < to
+          kind = entity_kind(string, amp, to)
+          if kind.nil?
+            pos = amp + 1
+            next
+          end
+          if kind[0] == :keep
+            pos = kind[1] + 1
+            next
+          end
+
+          name = string.byteslice(kind[1], kind[2])
+          return nil if noent? || lookup_entity(name)
+
+          split = true
+          tree.add_text_range(parent, span, amp - span, line) if amp > span
+          tree.add_entity_ref(parent, kind[1], kind[2])
+          span = kind[3] + 1
+          pos = span
+          names ||= []
+          names << name
+        end
+        if split
+          tree.add_text_range(parent, span, to - span, line) if span < to
+          column = flat_column(string, to)
+          names.each do |name|
+            @flat_errors << ["Entity '#{name}' not defined", line, column, 3, true]
+          end
+        elsif to > from
+          tree.add_text_range(parent, from, to - from, line)
+        end
+        true
+      end
+
+      def add_html_root_text(string, from, to)
+        index = from
+        while index < to
+          byte = string.getbyte(index)
+          return nil if byte >= 128
+          unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+            line, column = flat_location(string, to)
+            @flat_errors << ["Start tag expected, '<' not found", line, column, 3, true]
+            return true
+          end
+          index += 1
+        end
+        true
+      end
+
+      def read_html_comment(tree, string, pos, limit, stack)
+        close = string.byteindex("-->", pos + 4)
+        return limit if close.nil?
+
+        parent = stack.empty? ? -1 : stack[-1]
+        body = close - (pos + 4)
+        tree.add_comment(parent, pos + 4, body, nil) if body >= 0
+        close + 3
+      end
+
+      def read_html_doctype(tree, string, pos, limit, stack)
+        index = skip_tag_space(string, pos + 9, limit)
+        return nil if index.nil?
+
+        name_off = index
+        while index < limit
+          byte = string.getbyte(index)
+          break unless byte && byte < 128 && name_byte?(byte)
+
+          index += 1
+        end
+        name = string.byteslice(name_off, index - name_off)
+        index = skip_tag_space(string, index, limit)
+        return nil if index.nil?
+
+        external_id = nil
+        system_id = nil
+        if keyword_at?(string, index, limit, "PUBLIC")
+          index = skip_tag_space(string, index + 6, limit)
+          return nil if index.nil?
+
+          external_id, index = read_html_id(string, index, limit)
+          return nil if index.nil?
+
+          index = skip_tag_space(string, index, limit)
+          return nil if index.nil?
+
+          quote = string.getbyte(index)
+          if quote == 34 || quote == 39
+            system_id, index = read_html_id(string, index, limit)
+            return nil if index.nil?
+
+            index = skip_tag_space(string, index, limit)
+            return nil if index.nil?
+          end
+        elsif keyword_at?(string, index, limit, "SYSTEM")
+          index = skip_tag_space(string, index + 6, limit)
+          return nil if index.nil?
+
+          system_id, index = read_html_id(string, index, limit)
+          return nil if index.nil?
+
+          index = skip_tag_space(string, index, limit)
+          return nil if index.nil?
+        end
+        return nil if index >= limit || string.getbyte(index) == 91
+        return nil unless string.getbyte(index) == 62
+
+        parent = stack.empty? ? -1 : stack[-1]
+        tree.add_dtd(parent, name, external_id, system_id)
+        index + 1
+      end
+
+      def read_html_id(string, index, limit)
+        quote = string.getbyte(index)
+        return [nil, nil] unless quote == 34 || quote == 39
+
+        close = string.byteindex(quote == 34 ? "\"" : "'", index + 1)
+        return [nil, nil] unless close && close < limit
+        return [nil, nil] if string.byteindex("&", index + 1)&.between?(index + 1, close - 1)
+
+        [string.byteslice(index + 1, close - index - 1), close + 1]
+      end
+
+      def keyword_at?(string, index, limit, word)
+        length = word.bytesize
+        return false if index + length > limit
+        return false unless string.getbyte(index) == word.getbyte(0)
+        return false unless string.byteslice(index, length) == word
+
+        nxt = string.getbyte(index + length)
+        nxt.nil? || nxt == 32 || nxt == 9 || nxt == 10 || nxt == 13 || nxt == 62
+      end
+
+      def read_html_end(tree, string, pos, limit, stack)
+        index = skip_tag_space(string, pos + 2, limit)
+        return nil if index.nil? || index >= limit
+
+        byte = string.getbyte(index)
+        return nil unless byte && byte < 128 && ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))
+
+        name_off = index
+        index += 1
+        while index < limit
+          byte = string.getbyte(index)
+          break unless byte && byte < 128 && name_byte?(byte)
+
+          index += 1
+        end
+        name_len = index - name_off
+        index = skip_tag_space(string, index, limit)
+        return nil if index.nil? || index >= limit || string.getbyte(index) != 62
+
+        if html_stack_has?(tree, stack, string, name_off, name_len)
+          finish_html_end(tree, string, name_off, name_len, index + 1, stack)
+        elsif html_p_or_br?(string, name_off, name_len)
+          parent = stack.empty? ? -1 : stack[-1]
+          tree.add_element(parent, name_off, name_len, 0, -1, nil, EMPTY_SCOPE)
+          index + 1
+        else
+          note_html_mismatch(tree, string, name_off, name_len, index + 1, stack)
+          index + 1
+        end
+      end
+
+      def finish_html_end(tree, string, name_off, name_len, next_pos, stack)
+        unless stack.empty? || tree.html_name_eq?(stack[-1], string, name_off, name_len)
+          if stack.empty?
+            note_html_mismatch(tree, string, name_off, name_len, next_pos, stack)
+          elsif tree.p_open?(stack[-1])
+            @flat_errors << P_END_ERROR
+          else
+            name = tree.folded_name(stack[-1])
+            @flat_errors << [%(The element type "#{name}" must be terminated by the matching end-tag "</#{name}>."), 0, 0, nil, false]
+          end
+          stack.pop while stack.any? && !tree.html_name_eq?(stack[-1], string, name_off, name_len)
+        end
+        stack.pop if stack.any? && tree.html_name_eq?(stack[-1], string, name_off, name_len)
+        next_pos
+      end
+
+      def note_html_mismatch(tree, string, name_off, name_len, next_pos, stack)
+        if stack.empty?
+          name = string.byteslice(name_off, name_len)
+          name = name.downcase if name.match?(/[A-Z]/)
+          line, column = flat_location(string, next_pos)
+          @flat_errors << ["Opening and ending tag mismatch: #{name}", line, column, 3, true]
+        elsif tree.p_open?(stack[-1])
+          @flat_errors << P_END_ERROR
+        else
+          name = tree.folded_name(stack[-1])
+          @flat_errors << [%(The element type "#{name}" must be terminated by the matching end-tag "</#{name}>."), 0, 0, nil, false]
+        end
+      end
+
+      def read_html_start(tree, string, pos, limit, stack)
+        index = pos + 1
+        name_off = index
+        index += 1
+        while index < limit
+          byte = string.getbyte(index)
+          break unless byte && byte < 128 && name_byte?(byte)
+
+          index += 1
+        end
+        return nil if index == name_off
+
+        name_len = index - name_off
+        parent = stack.empty? ? -1 : stack[-1]
+        element = tree.add_element(parent, name_off, name_len, 0, -1, flat_line(pos), EMPTY_SCOPE)
+        closed = false
+        self_closing = false
+        while index < limit
+          index = skip_tag_space(string, index, limit)
+          return nil if index.nil?
+          break if index >= limit
+
+          byte = string.getbyte(index)
+          if byte == 62
+            closed = true
+            index += 1
+            break
+          end
+          if byte == 47
+            return nil unless index + 1 < limit && string.getbyte(index + 1) == 62
+
+            self_closing = true
+            closed = true
+            index += 2
+            break
+          end
+          return nil if byte >= 128 || !name_start_byte?(byte)
+
+          attr_off = index
+          index += 1
+          while index < limit
+            byte = string.getbyte(index)
+            break unless byte && byte < 128 && name_byte?(byte)
+
+            index += 1
+          end
+          attr_len = index - attr_off
+          index = skip_tag_space(string, index, limit)
+          return nil if index.nil?
+
+          if index < limit && string.getbyte(index) == 61
+            index += 1
+            index = skip_tag_space(string, index, limit)
+            return nil if index.nil? || index >= limit
+
+            quote = string.getbyte(index)
+            if quote == 34 || quote == 39
+              close = string.byteindex(quote == 34 ? "\"" : "'", index + 1)
+              return nil unless close && close < limit
+
+              value_off = index + 1
+              value_len = close - value_off
+              tree.add_html_attr(element, attr_off, attr_len, value_off, value_len, 1)
+              if value_len.positive?
+                amp = string.byteindex("&", value_off)
+                return nil unless amp.nil? || amp >= value_off + value_len || note_quoted_entities(string, value_off, value_off + value_len)
+              end
+              index = close + 1
+            else
+              value_off = index
+              while index < limit
+                byte = string.getbyte(index)
+                break if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 62 || byte == 47
+
+                index += 1
+              end
+              tree.add_html_attr(element, attr_off, attr_len, value_off, index - value_off, 0)
+            end
+          else
+            tree.add_html_attr(element, attr_off, attr_len, -1, 0, 0)
+          end
+        end
+        return nil unless closed
+
+        stack << element unless self_closing || void_at?(string, name_off, name_len)
+        index
+      end
+
+      def skip_tag_space(string, index, limit)
+        while index < limit
+          byte = string.getbyte(index)
+          if byte == 32 || byte == 9 || byte == 10 || byte == 13
+            index += 1
+          elsif byte == 11 || byte == 12 || (byte && byte >= 128)
+            return nil
+          else
+            return index
+          end
+        end
+        index
+      end
+
+      def html_markup_at?(string, pos, limit)
+        return false if pos < 0 || pos >= limit
+
+        byte = string.getbyte(pos)
+        return false unless byte == 60
+
+        nxt = string.getbyte(pos + 1)
+        return false unless nxt
+        return true if nxt == 33 || nxt == 63
+        if nxt == 47
+          third = string.getbyte(pos + 2)
+          return false unless third
+
+          return (third >= 65 && third <= 90) || (third >= 97 && third <= 122)
+        end
+        (nxt >= 65 && nxt <= 90) || (nxt >= 97 && nxt <= 122)
+      end
+
+      def html_stack_has?(tree, stack, string, off, len)
+        index = stack.length
+        while index > 0
+          index -= 1
+          return true if tree.html_name_eq?(stack[index], string, off, len)
+        end
+        false
+      end
+
+      def html_p_or_br?(string, off, len)
+        if len == 1
+          byte = string.getbyte(off)
+          byte == 112 || byte == 80
+        elsif len == 2
+          first = string.getbyte(off)
+          second = string.getbyte(off + 1)
+          first += 32 if first >= 65 && first <= 90
+          second += 32 if second >= 65 && second <= 90
+          first == 98 && second == 114
+        else
+          false
+        end
+      end
+
+      def void_at?(string, off, len)
+        list = self.class.void_name_groups[len]
+        return false unless list
+
+        index = 0
+        while index < list.length
+          return true if same_ascii_name?(string, off, list[index])
+
+          index += 1
+        end
+        false
+      end
+
+      def same_ascii_name?(string, off, name)
+        index = 0
+        length = name.bytesize
+        while index < length
+          byte = string.getbyte(off + index)
+          byte += 32 if byte >= 65 && byte <= 90
+          return false if byte != name.getbyte(index)
+
+          index += 1
+        end
+        true
+      end
+
+      def note_quoted_entities(string, from, to)
+        pos = from
+        while (amp = string.byteindex("&", pos)) && amp < to
+          kind = entity_kind(string, amp, to)
+          if kind.nil?
+            pos = amp + 1
+            next
+          end
+          if kind[0] == :keep
+            pos = kind[1] + 1
+            next
+          end
+
+          name = string.byteslice(kind[1], kind[2])
+          return nil if noent? || lookup_entity(name)
+
+          line, column = flat_location(string, kind[3] + 1)
+          @flat_errors << ["Entity '#{name}' not defined", line, column, 3, true]
+          pos = kind[3] + 1
+        end
+        true
+      end
+
+      # :keep means a predefined or numeric reference that stays in the text.
+      # :bad is an unknown name. nil is a bare "&".
+      def entity_kind(string, amp, limit)
+        nxt = amp + 1
+        return nil if nxt >= limit
+
+        byte = string.getbyte(nxt)
+        if byte == 35
+          semi = numeric_semi(string, nxt, limit)
+          return nil unless semi
+
+          return [:keep, semi]
+        end
+        return nil unless byte && ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))
+
+        index = nxt + 1
+        while index < limit
+          byte = string.getbyte(index)
+          break unless entity_name_byte?(byte)
+
+          index += 1
+        end
+        return nil if index >= limit || string.getbyte(index) != 59
+
+        if predefined_at?(string, nxt, index - nxt)
+          [:keep, index]
+        else
+          [:bad, nxt, index - nxt, index]
+        end
+      end
+
+      def numeric_semi(string, hash_pos, limit)
+        index = hash_pos + 1
+        return nil if index >= limit
+
+        byte = string.getbyte(index)
+        if byte == 120 || byte == 88
+          index += 1
+          start = index
+          while index < limit && hex_byte?(string.getbyte(index))
+            index += 1
+          end
+          return nil if index == start
+        else
+          start = index
+          while index < limit
+            byte = string.getbyte(index)
+            break unless byte >= 48 && byte <= 57
+
+            index += 1
+          end
+          return nil if index == start
+        end
+        return nil if index >= limit || string.getbyte(index) != 59
+
+        index
+      end
+
+      def entity_name_byte?(byte)
+        return false unless byte
+        return true if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        return true if byte >= 48 && byte <= 57
+
+        byte == 45 || byte == 46
+      end
+
+      def hex_byte?(byte)
+        return false unless byte
+        return true if byte >= 48 && byte <= 57
+        return true if byte >= 65 && byte <= 70
+
+        byte >= 97 && byte <= 102
+      end
+
+      def predefined_at?(string, off, len)
+        case len
+        when 2
+          first = string.getbyte(off)
+          second = string.getbyte(off + 1)
+          (first == 108 && second == 116) || (first == 103 && second == 116)
+        when 3
+          string.getbyte(off) == 97 && string.getbyte(off + 1) == 109 && string.getbyte(off + 2) == 112
+        when 4
+          first = string.getbyte(off)
+          if first == 113
+            string.getbyte(off + 1) == 117 && string.getbyte(off + 2) == 111 && string.getbyte(off + 3) == 116
+          elsif first == 97
+            string.getbyte(off + 1) == 112 && string.getbyte(off + 2) == 111 && string.getbyte(off + 3) == 115
+          else
+            false
+          end
+        else
+          false
+        end
+      end
+
+      def flat_location(string, pos)
+        [flat_line(pos), flat_column(string, pos)]
+      end
+
+      def flat_column(string, pos)
+        index = @flat_nl_i
+        last = index.positive? ? @flat_nl[index - 1] : -1
+        start = last + 1
+        string.byteslice(start, pos - start).length + 1
       end
 
       def flat_newline_table(string)
@@ -1337,6 +1941,16 @@ module Nokogiri
         return false unless @html
 
         self.class.void_html_names[name]
+      end
+
+      def self.void_name_groups
+        @void_name_groups ||= begin
+          groups = {}
+          void_html_names.each_key do |name|
+            (groups[name.bytesize] ||= []) << name
+          end
+          groups
+        end
       end
 
       def ensure_html_tree
