@@ -4,3 +4,4 @@ ac87983f	4.056096	baseline	median of three settled YJIT runs after per-case proc
 eb896325	2.983484	keep	default XML from the flat table; serialize_xml 1.115 and 1.138; run geomeans 2.983 2.803
 7b828b66	2.565930	keep	element text skips the escape and decode scans; edit ratios 0.932 and 0.724; run geomeans 2.566 2.552
 a0cce8f8	2.248783	keep	default HTML replays recorded pieces; serialize_html 0.315 and 0.271; run geomeans 2.113 2.249
+4b9c8559	2.248783	discard	HTML byte scanner for tags and comments; medium pure 0.489 s versus about 0.67 s; short of 1.971
