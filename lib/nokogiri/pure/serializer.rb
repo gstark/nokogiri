@@ -10,6 +10,8 @@ module Nokogiri
       AS_XHTML = 16
       AS_XML = 32
       AS_HTML = 64
+      # Document#to_html passes FORMAT | NO_DECLARATION | NO_EMPTY_TAGS | AS_HTML.
+      HTML_DEFAULT = FORMAT | NO_DECLARATION | NO_EMPTY_TAGS | AS_HTML
       RAW_TEXT = { "script" => true, "style" => true }.freeze
       HTML_BOOLEAN = %w[
         checked compact declare defer disabled ismap multiple nohref noresize noshade nowrap
@@ -58,11 +60,17 @@ module Nokogiri
 
         owner = node.document? ? node : node.document
         @html = !owner.nil? && owner.html?
+        return if append_html_pieces(node)
+
+        recording = record_html?(node)
+        @pieces = [] if recording
         if node.document?
           write_document(node)
         else
           write_node(node, 0)
         end
+        node.instance_variable_set(:@html_pieces, @pieces) if recording
+        @pieces = nil
       end
 
       private
@@ -83,6 +91,28 @@ module Nokogiri
         true
       end
 
+      # Default HTML save. The first call records each emitted piece. Later
+      # calls copy those pieces. A tree edit removes @html_pieces.
+      def append_html_pieces(node)
+        return false unless @html && node.document?
+        return false unless @options == HTML_DEFAULT && @target.nil?
+
+        pieces = node.instance_variable_get(:@html_pieces)
+        return false unless pieces
+
+        index = 0
+        length = pieces.length
+        while index < length
+          @output << pieces[index]
+          index += 1
+        end
+        true
+      end
+
+      def record_html?(node)
+        @html && node.document? && @options == HTML_DEFAULT && @target.nil?
+      end
+
       def format?
         @options & FORMAT != 0
       end
@@ -95,7 +125,9 @@ module Nokogiri
       end
 
       def emit(string)
-        @output << prepare(string.to_s)
+        prepared = prepare(string.to_s)
+        @output << prepared
+        @pieces << prepared if @pieces
       end
 
       def prepare(string)
