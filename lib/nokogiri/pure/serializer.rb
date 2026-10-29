@@ -54,6 +54,8 @@ module Nokogiri
       attr_reader :output
 
       def write(node)
+        return if append_flat_xml(node)
+
         owner = node.document? ? node : node.document
         @html = !owner.nil? && owner.html?
         if node.document?
@@ -64,6 +66,22 @@ module Nokogiri
       end
 
       private
+
+      # Default XML save of a flat document. Skip this when a caller has
+      # materialized a node and changed it without retiring the table.
+      def append_flat_xml(node)
+        return false unless node.document?
+        # Document#to_xml passes FORMAT. Node#to_xml passes FORMAT | AS_XML.
+        # Both print the same XML when no other save bit is set.
+        return false unless (@options & ~AS_XML) == FORMAT
+        return false unless @target.nil?
+
+        flat = node.instance_variable_get(:@flat)
+        return false unless flat&.fresh_for_write?
+
+        flat.append_default_xml(@output, node, @unit)
+        true
+      end
 
       def format?
         @options & FORMAT != 0
