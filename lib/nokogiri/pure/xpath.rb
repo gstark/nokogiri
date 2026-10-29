@@ -47,6 +47,10 @@ module Nokogiri
       FAST_ATTR_CHILD = /\A\/\/(#{FAST_NAME})\[@(#{FAST_NAME})=(?:"([^"]*)"|'([^']*)')\]\/(#{FAST_NAME})\z/
       FAST_CLASS = /\A(\.\/\/|\/\/)(#{FAST_NAME})\[contains\(concat\(' ',normalize-space\(@class\),' '\),' ([^']*)'\)\]\z/
       FAST_CHILD = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/(#{FAST_NAME})\z/
+      # Optional prefixes on both steps: //ns:item/ns:name, //ns:item/name, //item/ns:name.
+      # xpath_impl rewrites the prefix xmlns: to " :" before evaluate.
+      # That space is the default namespace, stored under the empty prefix.
+      FAST_QCHILD = /\A(\.\/\/|\/\/)(?:(?:(#{FAST_NAME})|( )):)?(#{FAST_NAME})\/(?:(?:(#{FAST_NAME})|( )):)?(#{FAST_NAME})\z/
       FAST_DESC = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/\/(#{FAST_NAME})\z/
       FAST_UNION = /\A\.\/\/(#{FAST_NAME}) \| self::\1\z/
       FAST_QNAME = /\A\/\/(#{FAST_NAME}):(#{FAST_NAME})\z/
@@ -73,6 +77,18 @@ module Nokogiri
         if (match = FAST_CHILD.match(path))
           return named_children(fast_origin(context, match[1] == "//"), match[2], match[3], limit)
         end
+        if (match = FAST_QCHILD.match(path))
+          parent_href = step_href(match[2], match[3], namespaces)
+          child_href = step_href(match[5], match[6], namespaces)
+          return nil if parent_href == :missing || child_href == :missing
+          # //a/b is FAST_CHILD. Do not handle the unprefixed form here.
+          return nil if match[2].nil? && match[3].nil? && match[5].nil? && match[6].nil?
+
+          return qnamed_children(
+            fast_origin(context, match[1] == "//"),
+            match[4], parent_href, match[7], child_href, limit
+          )
+        end
         if (match = FAST_DESC.match(path))
           return named_descendant(fast_origin(context, match[1] == "//"), match[2], match[3], limit)
         end
@@ -89,6 +105,21 @@ module Nokogiri
         end
 
         nil
+      end
+
+      # A space mark is the rewritten xmlns prefix. Its URI is under "".
+      # A nil prefix is an unprefixed name, which has no namespace.
+      # An unbound prefix returns :missing so the full evaluator reports it.
+      def self.step_href(prefix, default_mark, namespaces)
+        if default_mark
+          return :missing unless namespaces.key?("")
+
+          return namespaces[""]
+        end
+        return nil if prefix.nil?
+        return :missing unless namespaces.key?(prefix)
+
+        namespaces[prefix]
       end
 
       def self.fast_origin(context, absolute)
@@ -184,6 +215,32 @@ module Nokogiri
             cursor -= 1
             stack << [kids[cursor], now]
           end
+        end
+        out
+      end
+
+      # //prefix:parent/prefix:child. href nil means the step has no namespace.
+      # Emit the child when its parent matches, so nested pairs stay in document order.
+      def self.qnamed_children(root, parent_name, parent_href, child_name, child_href, limit)
+        if root.is_a?(XML::Document) && (flat = root.instance_variable_get(:@flat))
+          return flat.named_children_in(parent_name, parent_href, child_name, child_href, limit)
+        end
+
+        out = []
+        element = XML::Node::ELEMENT_NODE
+        each_element(root) do |node, state|
+          next unless state.name == child_name && href_match?(state, child_href)
+
+          parent = state.parent
+          # .//P/C does not treat the context node as P. child::P never selects it.
+          next if parent.nil? || parent.equal?(root)
+
+          parent_state = parent.instance_variable_get(:@pure)
+          next unless parent_state&.type == element
+          next unless parent_state.name == parent_name && href_match?(parent_state, parent_href)
+
+          out << node
+          return out if limit && out.length >= limit
         end
         out
       end
