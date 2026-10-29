@@ -207,6 +207,7 @@ module Nokogiri
       end
 
       def node_name=(value)
+        retire_html_cache!
         pure.name = value.to_s
       end
 
@@ -277,6 +278,7 @@ module Nokogiri
       private :replace_element_text
 
       def native_content=(string)
+        retire_html_cache!
         value = string.nil? ? nil : string.to_s
         if text? || cdata? || comment? || processing_instruction? || node_type == ATTRIBUTE_NODE
           pure.content = value
@@ -383,6 +385,7 @@ module Nokogiri
       end
 
       def add_next_sibling_node(node)
+        retire_html_cache!
         parent_node = pure.parent
         raise "Cannot add sibling to a node with no parent" unless parent_node
 
@@ -400,6 +403,7 @@ module Nokogiri
       end
 
       def add_previous_sibling_node(node)
+        retire_html_cache!
         parent_node = pure.parent
         raise "Cannot add sibling to a node with no parent" unless parent_node
 
@@ -417,6 +421,7 @@ module Nokogiri
       end
 
       def replace_node(node)
+        retire_html_cache!
         parent_node = pure.parent
         raise "Cannot replace a node with no parent" unless parent_node
 
@@ -491,6 +496,7 @@ module Nokogiri
       end
 
       def add_namespace_definition(prefix, href)
+        retire_html_cache!
         prefix = prefix&.to_str
         prefix = nil if prefix.nil? || prefix.empty?
         if href.nil?
@@ -568,6 +574,7 @@ module Nokogiri
       end
 
       def create_external_subset(name, external_id, system_id)
+        retire_html_cache!
         owner = document? ? self : document
         raise "Document already has an external subset" if owner.pure.external_subset
 
@@ -577,6 +584,7 @@ module Nokogiri
       end
 
       def remove_namespaces!
+        retire_html_cache!
         owner = document? ? self : document
         flat = owner&.instance_variable_get(:@flat)
         if flat
@@ -593,7 +601,16 @@ module Nokogiri
       def retire_flat_tree!
         owner = document? ? self : document
         owner&.instance_variable_get(:@flat)&.retire!
+        retire_html_cache!(owner)
       end
+
+      def retire_html_cache!(owner = nil)
+        owner ||= document? ? self : document
+        return unless owner&.instance_variable_defined?(:@html_pieces)
+
+        owner.remove_instance_variable(:@html_pieces)
+      end
+      private :retire_html_cache!
 
       def create_entity(name, type = nil, external_id = nil, system_id = nil, content = nil)
         node = XML::EntityDecl.allocate
@@ -694,6 +711,7 @@ module Nokogiri
       end
 
       def set_namespace(ns)
+        retire_html_cache!
         pure.namespace = ns
         ns
       end
@@ -1110,6 +1128,7 @@ module Nokogiri
       end
 
       def encoding=(value)
+        retire_html_cache!
         if value.nil?
           pure.encoding = nil
           return
@@ -1143,6 +1162,7 @@ module Nokogiri
         super(other, level, self)
         # Object#dup copies @flat. The copy owns the duplicated nodes, not the table.
         remove_instance_variable(:@flat) if instance_variable_defined?(:@flat)
+        remove_instance_variable(:@html_pieces) if instance_variable_defined?(:@html_pieces)
         pure.document = self
         pure.version = other.version
         pure.encoding = other.encoding
@@ -1272,6 +1292,7 @@ module Nokogiri
       end
 
       def value=(content)
+        retire_html_cache!
         pure.content = content.nil? ? nil : content.to_s
         content
       end
