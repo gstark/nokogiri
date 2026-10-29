@@ -2,17 +2,21 @@
 
 module Nokogiri
   module Pure
-    # Element and text records for one XML document.
+    # Element and text records for one document.
     #
     # The parser writes indexes here and does not allocate a Ruby node per
     # tag. A node is built when a query or a reader asks for that index.
-    # Documents that contain comments, doctypes, or processing instructions
-    # never use this table.
+    # XML documents that contain comments, doctypes, or processing
+    # instructions never use this table. An HTML document can store
+    # comments, a doctype, and entity references as records too.
     class FlatTree
-      # These match XML::Node::ELEMENT_NODE and TEXT_NODE. The node
-      # constants are defined after this file is loaded.
+      # These match XML::Node constants. The node constants are defined
+      # after this file is loaded.
       ELEMENT = 1
       TEXT = 3
+      ENTITY_REF = 5
+      COMMENT = 8
+      DTD = 14
 
       attr_reader :document
 
@@ -80,6 +84,63 @@ module Nokogiri
         list << [local_name, ns_id.nil? ? -1 : ns_id, value]
       end
 
+      # HTML attributes stay as source offsets until a reader asks for them.
+      # value_off < 0 is a boolean attribute. decode is 1 for a quoted value.
+      def add_html_attr(index, name_off, name_len, value_off, value_len, decode)
+        list = (@attrs[index] ||= [])
+        list << [:h, name_off, name_len, value_off, value_len, decode]
+      end
+
+      def mark_html
+        @html = true
+      end
+
+      def add_comment(parent, off, len, line)
+        add_span(COMMENT, parent, line, off, len, nil)
+      end
+
+      def add_entity_ref(parent, off, len)
+        add_span(ENTITY_REF, parent, nil, off, len, nil)
+      end
+
+      def add_dtd(parent, name, external_id, system_id)
+        index = add_span(DTD, parent, nil, -1, 0, name)
+        @attrs[index] = [external_id, system_id]
+        index
+      end
+
+      def html_name_eq?(index, string, off, len)
+        return false unless @len[index] == len
+
+        start = @off[index]
+        cursor = 0
+        while cursor < len
+          left = @source.getbyte(start + cursor)
+          right = string.getbyte(off + cursor)
+          left += 32 if left >= 65 && left <= 90
+          right += 32 if right >= 65 && right <= 90
+          return false if left != right
+
+          cursor += 1
+        end
+        true
+      end
+
+      def p_open?(index)
+        return false unless @len[index] == 1
+
+        byte = @source.getbyte(@off[index])
+        byte == 112 || byte == 80
+      end
+
+      def folded_name(index)
+        local_name(index)
+      end
+
+      def line_of(index)
+        @line[index]
+      end
+
       def define_ns(prefix, href)
         id = @prefixes.length
         @prefixes << prefix
@@ -103,9 +164,63 @@ module Nokogiri
         @lang[index] = value
       end
 
-      def local_name(index)
-        delta = @local[index]
-        @source.byteslice(@off[index] + delta, @len[index] - delta)
+      def add_span(type, parent, line, off, len, string)
+        index = @type.length
+        @type << type
+        @parent << parent
+        @nex << -1
+        @child << -1
+        @off << -1
+        @len << 0
+        @local << 0
+        @ns << -1
+        @line << line
+        @text_off << off
+        @text_len << len
+        @text_str << string
+        @attrs << nil
+        @defs << nil
+        @lang << nil
+        @tail << -1
+        link(parent, index)
+        index
+      end
+
+      def comment_node(index)
+        content = @source.byteslice(@text_off[index], @text_len[index])
+        node = XML::Comment.allocate
+        state = State.leaf_new
+        state.fast_fill(COMMENT, "comment", @document, content, nil)
+        parent = @parent[index]
+        state.parent = parent < 0 ? @document : wrapper(parent)
+        node.instance_variable_set(:@pure, state)
+        node
+      end
+
+      def entity_node(index)
+        name = @source.byteslice(@text_off[index], @text_len[index])
+        node = XML::EntityReference.allocate
+        state = State.new
+        state.fast_fill(ENTITY_REF, name, @document, nil, nil)
+        parent = @parent[index]
+        state.parent = parent < 0 ? @document : wrapper(parent)
+        node.instance_variable_set(:@pure, state)
+        node
+      end
+
+      def dtd_node(index)
+        node = XML::DTD.allocate
+        state = State.new
+        state.fast_fill(DTD, @text_str[index], @document, nil, nil)
+        ids = @attrs[index]
+        if ids
+          state.external_id = ids[0]
+          state.system_id = ids[1]
+        end
+        parent = @parent[index]
+        state.parent = parent < 0 ? @document : wrapper(parent)
+        node.instance_variable_set(:@pure, state)
+        node
       end
 
       def raw_eq?(index, off, len)
@@ -225,10 +340,12 @@ module Nokogiri
             state = node.pure
             if @type[i] == TEXT
               return false unless state.content.to_s == text_content(i)
-            else
+            elsif @type[i] == ELEMENT
               return false if state.instance_variable_get(:@flat_kids)
               return false if state.instance_variable_get(:@flat_attrs)
               return false unless state.name == local_name(i)
+            else
+              return false
             end
           end
           i += 1
@@ -308,10 +425,36 @@ module Nokogiri
         stored = @attrs[index]
         if stored
           owner = @cache[index]
-          stored.each do |attr_name, ns_id, value|
+          stored.each do |row|
+            if row[0] == :h
+              name = @source.byteslice(row[1], row[2])
+              if name
+                cursor = 0
+                length = name.bytesize
+                while cursor < length
+                  byte = name.getbyte(cursor)
+                  if byte >= 65 && byte <= 90
+                    name = name.downcase
+                    break
+                  end
+                  cursor += 1
+                end
+              end
+              if row[3] < 0
+                value = +""
+              else
+                value = @source.byteslice(row[3], row[4])
+                value = Entities.decode_predefined(value) if row[5] == 1 && value.byteindex("&")
+              end
+              ns_id = -1
+            else
+              name = row[0]
+              ns_id = row[1]
+              value = row[2]
+            end
             attr = XML::Attr.allocate
             attr_state = State.leaf_new
-            attr_state.fast_fill(XML::Node::ATTRIBUTE_NODE, attr_name.dup, @document, value.dup, nil)
+            attr_state.fast_fill(XML::Node::ATTRIBUTE_NODE, name.dup, @document, value.dup, nil)
             attr_state.parent = owner
             attr_state.namespace = ns_object(ns_id) if ns_id >= 0
             attr.instance_variable_set(:@pure, attr_state)
@@ -326,8 +469,21 @@ module Nokogiri
         cached = @cache[index]
         return cached if cached
 
-        if @type[index] == TEXT
+        case @type[index]
+        when TEXT
           node = text_node(index)
+          @cache[index] = node
+          return node
+        when COMMENT
+          node = comment_node(index)
+          @cache[index] = node
+          return node
+        when ENTITY_REF
+          node = entity_node(index)
+          @cache[index] = node
+          return node
+        when DTD
+          node = dtd_node(index)
           @cache[index] = node
           return node
         end
@@ -392,11 +548,46 @@ module Nokogiri
         @tail[parent] = index
       end
 
+      def local_name(index)
+        stored = @folded_name && @folded_name[index]
+        return stored if stored
+
+        delta = @local[index]
+        name = @source.byteslice(@off[index] + delta, @len[index] - delta)
+        if @html && name
+          cursor = 0
+          length = name.bytesize
+          while cursor < length
+            byte = name.getbyte(cursor)
+            if byte >= 65 && byte <= 90
+              name = name.downcase
+              (@folded_name ||= [])[index] = name
+              break
+            end
+            cursor += 1
+          end
+        end
+        name
+      end
+
       def local_eq?(index, text, want)
         delta = @local[index]
         return false unless @len[index] - delta == want
 
-        @source.byteslice(@off[index] + delta, want) == text
+        start = @off[index] + delta
+        if @html
+          cursor = 0
+          while cursor < want
+            byte = @source.getbyte(start + cursor)
+            byte += 32 if byte >= 65 && byte <= 90
+            return false if byte != text.getbyte(cursor)
+
+            cursor += 1
+          end
+          return true
+        end
+
+        @source.byteslice(start, want) == text
       end
 
       def prefix_length(index)
