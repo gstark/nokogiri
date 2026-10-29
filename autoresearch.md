@@ -195,11 +195,12 @@ Kept:
 Discarded in this loop:
 
 - HTML byte scanner for tags, end tags, and comments. The medium HTML pure time fell from about 0.67 s to 0.489 s. Small was 2.42 times libxml. Large stayed near 5 times libxml. A 1.3 times gain on the HTML parse cases does not beat 1.971. The parser change was reset.
+- Packed XML records and attribute offsets, then a tighter tag loop. Large-file objects fell from about 1.3 million to about 0.2 million. In one process the large parse was about 1.4 times faster and the medium parse about 1.3 times faster. The small parse was slower. A YJIT slice of the same loop was several times slower. The change does not beat 1.181. The parser change was reset.
 
 ## Open hypotheses
 
-1. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: high. A 2 times gain on all three XML parse cases yields a geomean near 1.13 and clears 1.181. A CSS-only change does not clear 1.181. A byte loop was already slower than `byteslice` and was reverted before this loop. The higher parse_xml_large ratio is 6.125.
-2. Re-profile XML parse after commit `b3c36df7` before the next edit. The old profile is from before the HTML flat keep.
+1. Parse a repeated sibling from the shape of the first copy. Expected impact: high on the catalog files. A hand-written item scan is the speed ceiling to measure before any parser edit. A 2 times gain on all three XML parse cases clears 1.181. A CSS-only change does not.
+2. The tighter tag loop and packed records did not beat 1.181. Do not repeat that edit. A byte loop was already slower than `byteslice`. The higher parse_xml_large ratio is 6.125.
 
 ## Idea categories
 
