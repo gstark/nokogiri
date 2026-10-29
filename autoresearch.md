@@ -63,11 +63,13 @@ The score after commit `68a706e2` was 3.638386. A kept change had to beat 3.189.
 
 The score after commit `eb896325` was the higher of two runs: 2.983484. The other run scored 2.803185. Both runs beat 3.189.
 
-The current score is the higher of the two runs after commit `7b828b66`: **2.565930**.
+The score after commit `7b828b66` was the higher of two runs: 2.565930. The other run scored 2.552333. Both runs beat 2.615.
 
-The other run scored 2.552333. Both runs beat 2.615.
+The current score is the higher of the two runs after commit `a0cce8f8`: **2.248783**.
 
-The next kept change must beat `2.566 * (1 - 0.1235) = 2.249`.
+The other run scored 2.112761. Both runs beat 2.249.
+
+The next kept change must beat `2.249 * (1 - 0.1235) = 1.971`.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -105,22 +107,22 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Higher of the two runs after commit `7b828b66`:
+Higher of the two runs after commit `a0cce8f8`:
 
 | Case | Baseline | After XPath | Current |
 | --- | --- | --- | --- |
-| parse_xml_small | 2.636 | 2.683 | 2.814 |
-| parse_xml_medium | 2.731 | 2.889 | 2.786 |
-| parse_xml_large | 5.656 | 6.022 | 5.474 |
-| parse_html_small | 3.106 | 3.736 | 3.854 |
-| parse_html_medium | 6.395 | 7.188 | 8.254 |
-| parse_html_large | 5.223 | 4.560 | 6.814 |
-| xpath_xml_medium | 14.303 | 1.877 | 1.850 |
-| css_html_medium | 3.129 | 3.134 | 3.696 |
-| traverse_xml_medium | 0.750 | 0.741 | 0.799 |
-| edit_xml_medium | 7.050 | 5.307 | 0.932 |
-| serialize_xml_medium | 7.581 | 8.580 | 1.128 |
-| serialize_html_medium | 2.977 | 3.477 | 4.021 |
+| parse_xml_small | 2.636 | 2.683 | 3.028 |
+| parse_xml_medium | 2.731 | 2.889 | 3.593 |
+| parse_xml_large | 5.656 | 6.022 | 6.108 |
+| parse_html_small | 3.106 | 3.736 | 3.353 |
+| parse_html_medium | 6.395 | 7.188 | 7.523 |
+| parse_html_large | 5.223 | 4.560 | 8.088 |
+| xpath_xml_medium | 14.303 | 1.877 | 2.065 |
+| css_html_medium | 3.129 | 3.134 | 3.973 |
+| traverse_xml_medium | 0.750 | 0.741 | 0.745 |
+| edit_xml_medium | 7.050 | 5.307 | 0.962 |
+| serialize_xml_medium | 7.581 | 8.580 | 1.004 |
+| serialize_html_medium | 2.977 | 3.477 | 0.315 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
@@ -130,9 +132,13 @@ Serializer run geomeans: 2.983484, 2.803185. Higher value: 2.983484.
 
 Edit run geomeans: 2.565930, 2.552333. Higher value: 2.565930.
 
+HTML serialize run geomeans: 2.112761, 2.248783. Higher value: 2.248783.
+
+The HTML serialize pure times were 0.026 s and 0.026 s. The libxml times were 0.083 s and 0.095 s.
+
 The edit case pure times were 0.078 s and 0.083 s. The libxml edit time moved between 0.084 s and 0.114 s.
 
-Cases other than XPath, XML serialize, and edit still move with machine load.
+Cases other than XPath, XML serialize, HTML serialize, and edit still move with machine load.
 
 ## Current hotspots
 
@@ -143,10 +149,14 @@ XPath `//xmlns:item/xmlns:name` (ratio 1.88):
 - The fast walk handles this query on the flat table.
 - The pure entry point rewrites `xmlns:` to ` :` before evaluate. The space is the default namespace.
 
-XML serialize (ratio 1.14):
+XML serialize (ratio 1.00):
 
 - Default `to_xml` writes from the flat table.
-- HTML serialize still uses the node walker.
+
+HTML serialize (ratio 0.32):
+
+- Default `to_html` copies pieces recorded on the first call.
+- A tree edit drops the record. The node walker still serves other save options.
 
 Node edit (ratio 0.93):
 
@@ -161,7 +171,7 @@ XML parse (ratio about 2.6 to 5.7):
 - `String#byteindex` 11 percent
 - `Parser#flat_read_attrs` 9 percent
 
-HTML parse (ratio about 3.9 to 8.3):
+HTML parse (ratio about 3.4 to 8.1):
 
 - The cost is spread across `parse_loop_general`, entity split, and attribute reads.
 - No single method is above 6 percent self time.
@@ -174,14 +184,14 @@ Kept:
 - Namespaced `//parent/child` on the flat table. Commit `68a706e2`. The XPath ratio fell from 14.303 to 1.877.
 - Default XML serialization from the flat table. Commit `eb896325`. The serialize_xml ratio fell from about 8.6 to about 1.13. Two full runs scored 2.983484 and 2.803185.
 - Element `content=` stores the input text and skips the escape and decode scans. Commit `7b828b66`. The edit ratio fell from about 5.3 to 0.932 and 0.724. Two full runs scored 2.565930 and 2.552333. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
+- Default HTML serialization replays recorded pieces. Commit `a0cce8f8`. The serialize_html ratio fell from about 4.0 to 0.315 and 0.271. Two full runs scored 2.112761 and 2.248783. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 
 Discarded in this loop: none yet.
 
 ## Open hypotheses
 
-1. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining case. The higher ratio is 8.254.
-2. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
-3. Write HTML serialize without the node walker. Expected impact: medium. The higher serialize_html ratio is 4.021. Do not cache the whole document string.
+1. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining steady case. The higher ratio is 7.523. One noisy large-HTML run reached 8.088.
+2. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop. The higher parse_xml_large ratio is 6.108.
 
 ## Idea categories
 
@@ -190,7 +200,7 @@ Discarded in this loop: none yet.
 - YJIT-friendly shapes: not tried in this loop.
 - Data structures: flat table is already in the baseline.
 - XPath and CSS: one kept change. Commit `68a706e2`.
-- Serialization: one kept change. Commit `eb896325`. HTML serialize is still open.
+- Serialization: two kept changes. XML commit `eb896325`. HTML commit `a0cce8f8`. Other save options still use the node walker.
 - Algorithmic: open. XPath document-order stamping looks quadratic in the profile.
 
 ## Assumptions
