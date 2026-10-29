@@ -140,6 +140,27 @@ module Nokogiri
         out
       end
 
+      # //prefix:parent/prefix:child. A nil href matches no namespace.
+      # Scan in record order and test the parent, so nested pairs stay in document order.
+      def named_children_in(parent_name, parent_href, child_name, child_href, limit)
+        parent_len = parent_name.bytesize
+        child_len = child_name.bytesize
+        out = []
+        i = 0
+        last = @type.length
+        while i < last
+          if @type[i] == ELEMENT && local_eq?(i, child_name, child_len) && href_is?(@ns[i], child_href)
+            parent = @parent[i]
+            if parent >= 0 && @type[parent] == ELEMENT && local_eq?(parent, parent_name, parent_len) && href_is?(@ns[parent], parent_href)
+              out << wrapper(i)
+              return out if limit && out.length >= limit
+            end
+          end
+          i += 1
+        end
+        out
+      end
+
       # `//parent/child` after namespaces have been removed. Both names
       # must be in no namespace.
       def named_children(parent_name, child_name, limit)
