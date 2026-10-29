@@ -10,16 +10,16 @@ module Nokogiri
       AS_XHTML = 16
       AS_XML = 32
       AS_HTML = 64
-      RAW_TEXT = %w[script style].freeze
+      RAW_TEXT = { "script" => true, "style" => true }.freeze
       HTML_BOOLEAN = %w[
         checked compact declare defer disabled ismap multiple nohref noresize noshade nowrap
         readonly selected
       ].freeze
 
       def self.write(node, io, encoding, indentation, options)
-        buffer = StringIO.new(+"")
-        new(buffer, indentation, options, encoding).write(node)
-        io.write(recode(buffer.string, encoding))
+        writer = new(indentation, options, encoding)
+        writer.write(node)
+        io.write(recode(writer.output, encoding))
       end
 
       def self.recode(text, encoding)
@@ -33,8 +33,8 @@ module Nokogiri
         text
       end
 
-      def initialize(io, indentation, options, encoding = nil)
-        @io = io
+      def initialize(indentation, options, encoding = nil)
+        @output = +""
         @unit = indentation
         @options = options
         @encoding_name = encoding&.to_s
@@ -50,6 +50,8 @@ module Nokogiri
       rescue ArgumentError, Encoding::ConverterNotFoundError
         nil
       end
+
+      attr_reader :output
 
       def write(node)
         owner = node.document? ? node : node.document
@@ -75,7 +77,7 @@ module Nokogiri
       end
 
       def emit(string)
-        @io.write(prepare(string.to_s))
+        @output << prepare(string.to_s)
       end
 
       def prepare(string)
@@ -175,7 +177,7 @@ module Nokogiri
       end
 
       def write_namespace_declarations(node)
-        node.namespace_definitions.each do |ns|
+        node.pure.namespace_definitions.each do |ns|
           if ns.prefix.nil? || ns.prefix.empty?
             emit(%( xmlns="#{Entities.escape_attr(ns.href)}"))
           else
@@ -210,7 +212,7 @@ module Nokogiri
         return false unless @html
         return false unless state.type == XML::Node::ELEMENT_NODE
 
-        HTML4::ElementDescription[state.name]&.empty?
+        Parser.void_html_names[state.name]
       end
 
       def raw_text?(state)
@@ -220,7 +222,8 @@ module Nokogiri
         parent_state = parent&.instance_variable_get(:@pure)
         return false unless parent_state&.type == XML::Node::ELEMENT_NODE
 
-        RAW_TEXT.include?(parent_state.name.to_s.downcase)
+        name = parent_state.name.to_s
+        RAW_TEXT[name] || RAW_TEXT[name.downcase]
       end
 
       def html_attribute_quoting?

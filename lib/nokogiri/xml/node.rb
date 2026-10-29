@@ -198,7 +198,7 @@ module Nokogiri
       ###
       # Decorate this node with the decorators set up in this node's Document
       def decorate!
-        document.decorate(self)
+        document.decorate(self) if document.instance_variable_get(:@decorators)
       end
 
       # :section: Manipulating Document Structure

@@ -168,8 +168,9 @@ module Nokogiri
       end
 
       def parse_loop
-        until @scanner.eos? || @stopped
-          if @scanner.check(/</)
+        scanner = @scanner
+        until scanner.eos? || @stopped
+          if scanner.string.getbyte(scanner.pos) == 60
             break if @push && !@finishing && !markup_complete?
 
             parse_markup
@@ -216,7 +217,7 @@ module Nokogiri
       end
 
       def void_html?(name)
-        HTML4::ElementDescription[name]&.empty?
+        Parser.void_html_names[name]
       end
 
       def open_html_scaffold(local)
@@ -254,20 +255,26 @@ module Nokogiri
       end
 
       def parse_markup
-        if @scanner.check(/<!--/)
-          callback(:comment, read_marked("<!--", "-->"))
-        elsif @scanner.check(/<!\[CDATA\[/)
-          callback(:cdata_block, read_marked("<![CDATA[", "]]>"))
-        elsif @scanner.check(/<\?/)
+        string = @scanner.string
+        pos = @scanner.pos
+        byte = string.getbyte(pos + 1)
+        if byte == 33
+          second = string.getbyte(pos + 2)
+          if second == 45 && string.getbyte(pos + 3) == 45
+            callback(:comment, read_marked("<!--", "-->"))
+          elsif second == 91 && string.byteslice(pos, 9) == "<![CDATA["
+            callback(:cdata_block, read_marked("<![CDATA[", "]]>"))
+          elsif second == 68 && string.byteslice(pos, 9) == "<!DOCTYPE"
+            read_doctype
+          else
+            error("Unsupported markup declaration")
+            read_before(">")
+            consume(">")
+          end
+        elsif byte == 63
           read_pi
-        elsif @scanner.check(/<!DOCTYPE/)
-          read_doctype
-        elsif @scanner.check(/<\//)
+        elsif byte == 47
           read_end_tag
-        elsif @scanner.check(/<!/)
-          error("Unsupported markup declaration")
-          read_before(">")
-          consume(">")
         else
           read_start_tag
         end
@@ -730,13 +737,18 @@ module Nokogiri
           return ""
         end
 
-        value = +""
-        until @scanner.eos?
-          char = take_char
-          break if char == quote
-
-          value << char
+        string = @scanner.string
+        pos = @scanner.pos
+        limit = string.bytesize
+        qbyte = quote.getbyte(0)
+        cursor = pos
+        while cursor < limit && string.getbyte(cursor) != qbyte
+          cursor += 1
         end
+        value = string.byteslice(pos, cursor - pos) || +""
+        @scanner.pos = cursor
+        account(value) unless value.empty?
+        take_char if cursor < limit
         value
       end
 
@@ -780,8 +792,20 @@ module Nokogiri
       end
 
       def skip_space
-        spaces = @scanner.scan(/[ \t\r\n]+/)
-        account(spaces) if spaces
+        string = @scanner.string
+        pos = @scanner.pos
+        limit = string.bytesize
+        start = pos
+        while pos < limit
+          byte = string.getbyte(pos)
+          break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          pos += 1
+        end
+        return if pos == start
+
+        @scanner.pos = pos
+        account(string.byteslice(start, pos - start))
       end
 
       def consume(token)
