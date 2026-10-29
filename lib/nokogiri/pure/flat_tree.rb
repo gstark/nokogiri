@@ -214,6 +214,43 @@ module Nokogiri
         end
       end
 
+      # True when cached nodes still match the table. A direct rename or
+      # text edit does not retire the table, so those documents use the walker.
+      def fresh_for_write?
+        i = 0
+        last = @cache.length
+        while i < last
+          node = @cache[i]
+          if node
+            state = node.pure
+            if @type[i] == TEXT
+              return false unless state.content.to_s == text_content(i)
+            else
+              return false if state.instance_variable_get(:@flat_kids)
+              return false if state.instance_variable_get(:@flat_attrs)
+              return false unless state.name == local_name(i)
+            end
+          end
+          i += 1
+        end
+        true
+      end
+
+      # Pretty XML for the default save options. One buffer, no Ruby nodes.
+      def append_default_xml(out, document, unit)
+        version = document.version || "1.0"
+        out << %(<?xml version="#{version}")
+        encoding = document.encoding
+        out << %( encoding="#{encoding}") if encoding && !encoding.empty?
+        out << "?>\n"
+        index = @top_head
+        while index >= 0
+          write_record(out, index, 0, unit)
+          out << "\n"
+          index = @nex[index]
+        end
+      end
+
       def attach_top
         return if @attached
 
@@ -397,6 +434,195 @@ module Nokogiri
         state.parent = parent < 0 ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
+      end
+
+      def write_record(out, index, depth, unit)
+        if @type[index] == TEXT
+          out << escaped_text(index)
+          return
+        end
+
+        name = qname(index)
+        out << "<"
+        out << name
+        out << decl_clause(index)
+        out << attr_clause(index)
+        child = @child[index]
+        if child < 0
+          out << "/>"
+          return
+        end
+
+        out << ">"
+        if elements_only?(index)
+          child_pad = pad(depth + 1, unit)
+          while child >= 0
+            out << "\n"
+            out << child_pad
+            write_record(out, child, depth + 1, unit)
+            child = @nex[child]
+          end
+          out << "\n"
+          out << pad(depth, unit) if depth.positive?
+        else
+          while child >= 0
+            write_record(out, child, depth + 1, unit)
+            child = @nex[child]
+          end
+        end
+        out << "</"
+        out << name
+        out << ">"
+      end
+
+      def qname(index)
+        names = (@qnames ||= [])
+        name = names[index]
+        return name if name
+
+        names[index] = @source.byteslice(@off[index], @len[index])
+      end
+
+      def pad(depth, unit)
+        pads = (@pads ||= [""])
+        pads[depth] ||= unit * depth
+      end
+
+      def escaped_text(index)
+        cache = (@esc_text ||= [])
+        string = cache[index]
+        return string if string
+
+        cache[index] = escape_copy(text_content(index), false)
+      end
+
+      def decl_clause(index)
+        return "" unless @defs[index]
+
+        cache = (@decl_clause ||= [])
+        clause = cache[index]
+        return clause if clause
+
+        buf = +""
+        append_ns_decls(buf, index)
+        cache[index] = buf
+      end
+
+      def attr_clause(index)
+        return "" unless @attrs[index]
+
+        cache = (@attr_clause ||= [])
+        clause = cache[index]
+        return clause if clause
+
+        buf = +""
+        append_attrs(buf, index)
+        cache[index] = buf
+      end
+
+      def escape_copy(string, quotes)
+        return string unless needs_escape?(string, quotes)
+
+        buf = +""
+        append_escaped(buf, string, quotes)
+        buf
+      end
+
+      def needs_escape?(string, quotes)
+        return true if string.byteindex("&") || string.byteindex("<") || string.byteindex(">")
+
+        quotes && string.byteindex("\"")
+      end
+
+      def elements_only?(index)
+        child = @child[index]
+        return false if child < 0
+
+        while child >= 0
+          return false unless @type[child] == ELEMENT
+
+          child = @nex[child]
+        end
+        true
+      end
+
+      def append_ns_decls(out, index)
+        list = @defs[index]
+        return unless list
+
+        list.each do |id|
+          prefix = @prefixes[id]
+          if prefix.nil? || prefix.empty?
+            out << " xmlns=\""
+          else
+            out << " xmlns:"
+            out << prefix
+            out << "=\""
+          end
+          append_escaped_attr(out, @hrefs[id].to_s)
+          out << "\""
+        end
+      end
+
+      def append_attrs(out, index)
+        list = @attrs[index]
+        return unless list
+
+        list.each do |name, ns_id, value|
+          out << " "
+          if ns_id >= 0
+            prefix = @prefixes[ns_id]
+            if prefix && !prefix.empty?
+              out << prefix
+              out << ":"
+            end
+          end
+          out << name
+          out << "=\""
+          append_escaped_attr(out, value.to_s)
+          out << "\""
+        end
+      end
+
+      def text_content(index)
+        string = @text_str[index]
+        return string unless string.nil?
+
+        string = @source.byteslice(@text_off[index], @text_len[index])
+        string = Entities.decode_predefined(string) if string.byteindex("&")
+        @text_str[index] = string
+      end
+
+      def append_escaped_attr(out, string)
+        append_escaped(out, string, true)
+      end
+
+      def append_escaped(out, string, quotes)
+        start = 0
+        index = 0
+        last = string.bytesize
+        while index < last
+          byte = string.getbyte(index)
+          if byte == 38 || byte == 60 || byte == 62 || (quotes && byte == 34)
+            out << string.byteslice(start, index - start) if index > start
+            out << if byte == 38
+              "&amp;"
+            elsif byte == 60
+              "&lt;"
+            elsif byte == 62
+              "&gt;"
+            else
+              "&quot;"
+            end
+            start = index + 1
+          end
+          index += 1
+        end
+        if start.zero?
+          out << string
+        elsif start < last
+          out << string.byteslice(start, last - start)
+        end
       end
     end
 
