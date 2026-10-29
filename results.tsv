@@ -6,3 +6,4 @@ eb896325	2.983484	keep	default XML from the flat table; serialize_xml 1.115 and 
 a0cce8f8	2.248783	keep	default HTML replays recorded pieces; serialize_html 0.315 and 0.271; run geomeans 2.113 2.249
 4b9c8559	2.248783	discard	HTML byte scanner for tags and comments; medium pure 0.489 s versus about 0.67 s; short of 1.971
 b3c36df7	1.347284	keep	HTML parse stores tags as indexes; HTML ratios 1.168 1.509 1.060; CSS 2.189; run geomeans 1.279 1.347
+afb4fe49	1.347284	discard	packed XML records and a tighter tag loop; large about 1.4 times, medium about 1.3 times, small slower; short of 1.181
