@@ -10,6 +10,8 @@ Lower is better.
 
 The target is `geomean_ratio <= 1.20` on three consecutive benchmark runs.
 
+The target is met. Commit `5c70ede8` scored 1.178320, 1.108242, and 1.177141.
+
 ## Commands
 
 - Ruby: `/home/dev/.local/share/mise/installs/ruby/3.4.7/bin/ruby`
@@ -67,11 +69,11 @@ The score after commit `7b828b66` was the higher of two runs: 2.565930. The othe
 
 The score after commit `a0cce8f8` was the higher of two runs: 2.248783. The other run scored 2.112761. Both runs beat 2.249.
 
-The current score is the higher of the two runs after commit `b3c36df7`: **1.347284**.
+The current score is the higher of the three runs after commit `5c70ede8`: **1.178320**.
 
-The other run scored 1.279334. Both runs beat 1.971.
+The other runs scored 1.108242 and 1.177141. All three runs beat 1.181. All three runs are at or under 1.20.
 
-The next kept change must beat `1.347284 * (1 - 0.1235) = 1.181`.
+The next kept change must beat `1.178320 * (1 - 0.1235) = 1.033`. The target is already met. The loop stops here.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -109,22 +111,22 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Higher of the two runs after commit `b3c36df7`:
+Higher of the three runs after commit `5c70ede8`:
 
-| Case | Baseline | After XPath | After HTML pieces | Current |
-| --- | --- | --- | --- | --- |
-| parse_xml_small | 2.636 | 2.683 | 3.028 | 2.797 |
-| parse_xml_medium | 2.731 | 2.889 | 3.593 | 3.011 |
-| parse_xml_large | 5.656 | 6.022 | 6.108 | 6.125 |
-| parse_html_small | 3.106 | 3.736 | 3.353 | 1.168 |
-| parse_html_medium | 6.395 | 7.188 | 7.523 | 1.509 |
-| parse_html_large | 5.223 | 4.560 | 8.088 | 1.060 |
-| xpath_xml_medium | 14.303 | 1.877 | 2.065 | 1.928 |
-| css_html_medium | 3.129 | 3.134 | 3.973 | 2.189 |
-| traverse_xml_medium | 0.750 | 0.741 | 0.745 | 0.560 |
-| edit_xml_medium | 7.050 | 5.307 | 0.962 | 0.829 |
-| serialize_xml_medium | 7.581 | 8.580 | 1.004 | 1.323 |
-| serialize_html_medium | 2.977 | 3.477 | 0.315 | 0.319 |
+| Case | Baseline | After HTML flat | Current |
+| --- | --- | --- | --- |
+| parse_xml_small | 2.636 | 2.797 | 2.553 |
+| parse_xml_medium | 2.731 | 3.011 | 1.407 |
+| parse_xml_large | 5.656 | 6.125 | 1.851 |
+| parse_html_small | 3.106 | 1.168 | 1.303 |
+| parse_html_medium | 6.395 | 1.509 | 1.746 |
+| parse_html_large | 5.223 | 1.060 | 1.286 |
+| xpath_xml_medium | 14.303 | 1.928 | 2.052 |
+| css_html_medium | 3.129 | 2.189 | 1.934 |
+| traverse_xml_medium | 0.750 | 0.560 | 0.769 |
+| edit_xml_medium | 7.050 | 0.829 | 0.778 |
+| serialize_xml_medium | 7.581 | 1.323 | 1.378 |
+| serialize_html_medium | 2.977 | 0.319 | 0.293 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
@@ -137,6 +139,8 @@ Edit run geomeans: 2.565930, 2.552333. Higher value: 2.565930.
 HTML serialize run geomeans: 2.112761, 2.248783. Higher value: 2.248783.
 
 HTML parse run geomeans: 1.279334, 1.347284. Higher value: 1.347284.
+
+Repeated-sibling run geomeans: 1.178320, 1.108242, 1.177141. Higher value: 1.178320.
 
 The HTML serialize pure times were 0.026 s and 0.026 s. The libxml times were 0.083 s and 0.095 s.
 
@@ -168,11 +172,11 @@ Node edit (ratio 0.93):
 - The old children are unlinked. The caller still receives a new text node.
 - Escape and decode are skipped. Those two scans restore the input.
 
-XML parse (ratio about 2.8 to 6.1):
+XML parse (higher ratios 2.553, 1.407, and 1.851):
 
-- This is the hottest remaining group. A 2 times gain on all three sizes clears 1.181.
-- The last profile, taken before the HTML flat keep, put `Parser#try_flat_tree` at 21 percent self, `StringScanner#skip` at 14 percent, `String#byteindex` at 11 percent, and `Parser#flat_read_attrs` at 9 percent.
-- Re-profile after this keep before the next parser edit.
+- Commit `5c70ede8` learns the first child element and matches later copies with one pattern.
+- A document that does not repeat falls back to the flat scan.
+- The large XML ratio fell from 6.125 to 1.851. The medium XML ratio fell from 3.011 to 1.407.
 
 HTML parse (ratio about 1.06 to 1.51):
 
@@ -191,6 +195,7 @@ Kept:
 - Element `content=` stores the input text and skips the escape and decode scans. Commit `7b828b66`. The edit ratio fell from about 5.3 to 0.932 and 0.724. Two full runs scored 2.565930 and 2.552333. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 - Default HTML serialization replays recorded pieces. Commit `a0cce8f8`. The serialize_html ratio fell from about 4.0 to 0.315 and 0.271. Two full runs scored 2.112761 and 2.248783. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 - HTML parse stores tags as indexes on the flat table. Commit `b3c36df7`. The higher HTML ratios are 1.168, 1.509, and 1.060. The CSS ratio fell to 2.189. Two full runs scored 1.279334 and 1.347284. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
+- Repeated XML siblings share one learned shape. Commit `5c70ede8`. The higher XML parse ratios are 2.553, 1.407, and 1.851. Three full runs scored 1.178320, 1.108242, and 1.177141. All three are at or under 1.20. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 
 Discarded in this loop:
 
@@ -199,8 +204,11 @@ Discarded in this loop:
 
 ## Open hypotheses
 
-1. Parse a repeated sibling from the shape of the first copy. Expected impact: high on the catalog files. A hand-written item scan is the speed ceiling to measure before any parser edit. A 2 times gain on all three XML parse cases clears 1.181. A CSS-only change does not.
-2. The tighter tag loop and packed records did not beat 1.181. Do not repeat that edit. A byte loop was already slower than `byteslice`. The higher parse_xml_large ratio is 6.125.
+The target is met. Do not start another keep for score alone.
+
+The furthest ratios are `parse_xml_small` at 2.553, `xpath_xml_medium` at 2.052, and `css_html_medium` at 1.934. Small XML does not repeat one child shape, so the new path leaves it on the flat scan.
+
+The tighter tag loop and packed records did not beat 1.181. Do not repeat that edit.
 
 ## Idea categories
 
@@ -210,7 +218,7 @@ Discarded in this loop:
 - Data structures: the XML flat table is in the baseline. HTML records were added in commit `b3c36df7`.
 - XPath and CSS: one kept change. Commit `68a706e2`.
 - Serialization: two kept changes. XML commit `eb896325`. HTML commit `a0cce8f8`. Other save options still use the node walker.
-- Algorithmic: open. XPath document-order stamping looks quadratic in the profile.
+- Algorithmic: one kept change. Commit `5c70ede8` matches repeated siblings from the first child.
 
 ## Assumptions
 
