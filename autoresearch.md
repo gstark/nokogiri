@@ -59,6 +59,10 @@ Keep threshold: **0.1235** (12.35 percent).
 
 A kept change must beat `4.056 * (1 - 0.1235) = 3.555` on the geomean, then hold on a second run.
 
+The current score is the median of the three runs after commit `68a706e2`: **3.638386**.
+
+The next kept change must beat `3.638 * (1 - 0.1235) = 3.189`.
+
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
 ## Metric rules
@@ -93,19 +97,42 @@ Median of the three settled runs:
 
 Traverse is already inside the target.
 
+## Current ratios
+
+Median of the three runs after commit `68a706e2`:
+
+| Case | Baseline | Current |
+| --- | --- | --- |
+| parse_xml_small | 2.636 | 2.683 |
+| parse_xml_medium | 2.731 | 2.889 |
+| parse_xml_large | 5.656 | 6.022 |
+| parse_html_small | 3.106 | 3.736 |
+| parse_html_medium | 6.395 | 7.188 |
+| parse_html_large | 5.223 | 4.560 |
+| xpath_xml_medium | 14.303 | 1.877 |
+| css_html_medium | 3.129 | 3.134 |
+| traverse_xml_medium | 0.750 | 0.741 |
+| edit_xml_medium | 7.050 | 5.307 |
+| serialize_xml_medium | 7.581 | 8.580 |
+| serialize_html_medium | 2.977 | 3.477 |
+| geomean of these medians | 4.100 | 3.545 |
+
+The official score is the median of the run geomeans, not the geomean of the per-case medians.
+
+Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
+
+Current run geomeans: 3.315608, 3.687068, 3.638386. Median: 3.638386.
+
+The XPath case is stable. The other cases still move with machine load.
+
 ## Current hotspots
 
 Profile tool: vernier 1.11.0, wall time, YJIT on, about 1.5 seconds.
 
-XPath `//xmlns:item/xmlns:name` (ratio 14.3):
+XPath `//xmlns:item/xmlns:name` (ratio 1.88):
 
-- `XPath::Engine#stamp_index` 24 percent self
-- `XPath::Engine#name_match?` 13 percent self
-- `XPath::Engine#gather_descendant_children` 12 percent self
-- `instance_variable_get` 9 percent
-- `object_id` 8 percent
-
-The namespaced child step misses the fast walk. The full evaluator runs.
+- The fast walk handles this query on the flat table.
+- The pure entry point rewrites `xmlns:` to ` :` before evaluate. The space is the default namespace.
 
 XML serialize (ratio 7.6):
 
@@ -136,16 +163,16 @@ HTML parse (ratio about 3.1 to 6.4):
 Kept:
 
 - Flat table for plain XML, lazy text decode, and the earlier search and serialize work. This is commit `ac87983f`. It is the baseline, not an experiment in this loop.
+- Namespaced `//parent/child` on the flat table. Commit `68a706e2`. The XPath ratio fell from 14.303 to 1.877. The median of three full runs is 3.638. Two of those runs missed 3.555 because other cases moved. The change stays. A baseline vector with only the XPath case replaced scores about 3.46.
 
 Discarded in this loop: none yet.
 
 ## Open hypotheses
 
-1. Walk `//prefix:parent/prefix:child` on the flat table. Expected impact: high. The XPath case is 14 times libxml time, and the profile is the full evaluator.
-2. Replace serializer `gsub` with an escape table that writes into one buffer. Expected impact: high for `serialize_xml`.
-3. Set element text by replacing the child string. Do not allocate a new text node through `public_send`. Expected impact: medium for edit.
-4. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse.
-5. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
+1. Replace serializer `gsub` with a faster escape path. Expected impact: high for `serialize_xml`. A Ruby escape buffer lost to `gsub` before this loop. Do not repeat that buffer. Try a path that skips `gsub` when the text has no special bytes, and a tighter path when it does.
+2. Set element text by replacing the child string. Do not allocate a new text node through `public_send`. Expected impact: medium for edit.
+3. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse.
+4. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
 
 ## Idea categories
 
@@ -153,7 +180,7 @@ Discarded in this loop: none yet.
 - Allocation: not tried in this loop.
 - YJIT-friendly shapes: not tried in this loop.
 - Data structures: flat table is already in the baseline.
-- XPath and CSS: next experiment.
+- XPath and CSS: one kept change. Commit `68a706e2`.
 - Serialization: open.
 - Algorithmic: open. XPath document-order stamping looks quadratic in the profile.
 
@@ -169,3 +196,4 @@ Discarded in this loop: none yet.
 - A query result cache that survives across benchmark iterations is not allowed. Node caches inside one parsed document are normal user behavior.
 - The workspace checkout `/home/dev/nokogiri` is a different branch. Do not edit it.
 - Do not commit to any branch except `autoresearch/perf` in `/tmp/nokogiri-perf`.
+- `bench/autoresearch/guard.rb` passes `chdir: nil` into `Open3.capture3`. That raises `TypeError` on Ruby 3.4.7. Run `bench/autoresearch/diff.rb`, then `suite_runner.rb` with `bundle exec` from `/tmp/nokogiri-main`. Do not edit the harness to fix this.
