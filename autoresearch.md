@@ -61,11 +61,13 @@ A kept change must beat `4.056 * (1 - 0.1235) = 3.555` on the geomean, then hold
 
 The score after commit `68a706e2` was 3.638386. A kept change had to beat 3.189.
 
-The current score is the higher of the two runs after commit `eb896325`: **2.983484**.
+The score after commit `eb896325` was the higher of two runs: 2.983484. The other run scored 2.803185. Both runs beat 3.189.
 
-The other run scored 2.803185. Both runs beat 3.189.
+The current score is the higher of the two runs after commit `7b828b66`: **2.565930**.
 
-The next kept change must beat `2.983 * (1 - 0.1235) = 2.615`.
+The other run scored 2.552333. Both runs beat 2.615.
+
+The next kept change must beat `2.566 * (1 - 0.1235) = 2.249`.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -103,22 +105,22 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Higher of the two runs after commit `eb896325`:
+Higher of the two runs after commit `7b828b66`:
 
 | Case | Baseline | After XPath | Current |
 | --- | --- | --- | --- |
-| parse_xml_small | 2.636 | 2.683 | 3.234 |
-| parse_xml_medium | 2.731 | 2.889 | 2.985 |
-| parse_xml_large | 5.656 | 6.022 | 4.434 |
-| parse_html_small | 3.106 | 3.736 | 3.444 |
-| parse_html_medium | 6.395 | 7.188 | 8.540 |
-| parse_html_large | 5.223 | 4.560 | 5.139 |
-| xpath_xml_medium | 14.303 | 1.877 | 1.700 |
-| css_html_medium | 3.129 | 3.134 | 3.676 |
-| traverse_xml_medium | 0.750 | 0.741 | 0.842 |
-| edit_xml_medium | 7.050 | 5.307 | 5.338 |
-| serialize_xml_medium | 7.581 | 8.580 | 1.138 |
-| serialize_html_medium | 2.977 | 3.477 | 4.316 |
+| parse_xml_small | 2.636 | 2.683 | 2.814 |
+| parse_xml_medium | 2.731 | 2.889 | 2.786 |
+| parse_xml_large | 5.656 | 6.022 | 5.474 |
+| parse_html_small | 3.106 | 3.736 | 3.854 |
+| parse_html_medium | 6.395 | 7.188 | 8.254 |
+| parse_html_large | 5.223 | 4.560 | 6.814 |
+| xpath_xml_medium | 14.303 | 1.877 | 1.850 |
+| css_html_medium | 3.129 | 3.134 | 3.696 |
+| traverse_xml_medium | 0.750 | 0.741 | 0.799 |
+| edit_xml_medium | 7.050 | 5.307 | 0.932 |
+| serialize_xml_medium | 7.581 | 8.580 | 1.128 |
+| serialize_html_medium | 2.977 | 3.477 | 4.021 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
@@ -126,9 +128,11 @@ XPath run geomeans: 3.315608, 3.687068, 3.638386. Median: 3.638386.
 
 Serializer run geomeans: 2.983484, 2.803185. Higher value: 2.983484.
 
-Cases other than XPath and XML serialize still move with machine load.
+Edit run geomeans: 2.565930, 2.552333. Higher value: 2.565930.
 
-The XPath case is stable. The other cases still move with machine load.
+The edit case pure times were 0.078 s and 0.083 s. The libxml edit time moved between 0.084 s and 0.114 s.
+
+Cases other than XPath, XML serialize, and edit still move with machine load.
 
 ## Current hotspots
 
@@ -144,12 +148,11 @@ XML serialize (ratio 1.14):
 - Default `to_xml` writes from the flat table.
 - HTML serialize still uses the node walker.
 
-Node edit (ratio 7.1):
+Node edit (ratio 0.93):
 
-- `String#gsub` 27 percent self
-- `State.attach` 14 percent self
-- `Kernel#public_send` 9 percent
-- `XML::Text.new` inside `native_content=`
+- Element `content=` stores the input string on a new text node.
+- The old children are unlinked. The caller still receives a new text node.
+- Escape and decode are skipped. Those two scans restore the input.
 
 XML parse (ratio about 2.6 to 5.7):
 
@@ -158,7 +161,7 @@ XML parse (ratio about 2.6 to 5.7):
 - `String#byteindex` 11 percent
 - `Parser#flat_read_attrs` 9 percent
 
-HTML parse (ratio about 3.1 to 6.4):
+HTML parse (ratio about 3.9 to 8.3):
 
 - The cost is spread across `parse_loop_general`, entity split, and attribute reads.
 - No single method is above 6 percent self time.
@@ -170,19 +173,20 @@ Kept:
 - Flat table for plain XML, lazy text decode, and the earlier search and serialize work. This is commit `ac87983f`. It is the baseline, not an experiment in this loop.
 - Namespaced `//parent/child` on the flat table. Commit `68a706e2`. The XPath ratio fell from 14.303 to 1.877.
 - Default XML serialization from the flat table. Commit `eb896325`. The serialize_xml ratio fell from about 8.6 to about 1.13. Two full runs scored 2.983484 and 2.803185.
+- Element `content=` stores the input text and skips the escape and decode scans. Commit `7b828b66`. The edit ratio fell from about 5.3 to 0.932 and 0.724. Two full runs scored 2.565930 and 2.552333. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 
 Discarded in this loop: none yet.
 
 ## Open hypotheses
 
-1. Set element text by replacing the child string. Do not allocate a new text node through `public_send`. Expected impact: medium for edit. The edit ratio is about 5.
-2. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining case.
-3. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
+1. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining case. The higher ratio is 8.254.
+2. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
+3. Write HTML serialize without the node walker. Expected impact: medium. The higher serialize_html ratio is 4.021. Do not cache the whole document string.
 
 ## Idea categories
 
 - Tokenizer: not tried in this loop. Flat XML already uses `StringScanner#skip`.
-- Allocation: not tried in this loop.
+- Allocation: one kept change. Commit `7b828b66`. Element text no longer goes through `public_send`.
 - YJIT-friendly shapes: not tried in this loop.
 - Data structures: flat table is already in the baseline.
 - XPath and CSS: one kept change. Commit `68a706e2`.
