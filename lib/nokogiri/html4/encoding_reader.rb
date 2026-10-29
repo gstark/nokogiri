@@ -60,6 +60,10 @@ module Nokogiri
         (m = chunk.match(/\A(<\?xml[ \t\r\n][^>]*>)/)) &&
           (return Nokogiri.XML(m[1]).encoding)
 
+        if defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY
+          return detect_html_charset(chunk)
+        end
+
         if Nokogiri.jruby?
           (m = chunk.match(/(<meta\s)(.*)(charset\s*=\s*([\w-]+))(.*)/i)) &&
             (return m[4])
@@ -77,6 +81,36 @@ module Nokogiri
           end
           handler.encoding
         end
+      end
+
+      # The pure backend used to run a full HTML SAX parse to find a charset.
+      # A comment-stripped scan matches the same meta rules and stops there.
+      def self.detect_html_charset(chunk)
+        found = nil
+        source = chunk.include?("<!--") ? chunk.gsub(/<!--.*?-->/m, "") : chunk
+        source.scan(/<meta\b([^>]*)>/i) do
+          attrs = Regexp.last_match(1)
+          charset = nil
+          http_equiv = nil
+          content = nil
+          attrs.scan(/([^\s=\/]+)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/i) do
+            name = Regexp.last_match(1).downcase
+            value = Regexp.last_match(2) || Regexp.last_match(3) || Regexp.last_match(4) || ""
+            case name
+            when "charset"
+              charset = value
+            when "http-equiv"
+              http_equiv = value
+            when "content"
+              content = value
+            end
+          end
+          found = charset if charset && !charset.empty?
+          if http_equiv&.match?(/\AContent-Type\z/i) && content && (match = content.match(/;\s*charset\s*=\s*([\w-]+)/))
+            found = match[1]
+          end
+        end
+        found
       end
 
       def initialize(io)

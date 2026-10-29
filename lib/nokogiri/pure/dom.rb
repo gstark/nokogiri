@@ -35,6 +35,8 @@ module Nokogiri
         :external_id, :system_id, :xml_namespace, :external_subset
       attr_reader :children, :attributes, :namespace_definitions
 
+      EMPTY_LIST = [].freeze
+
       def initialize
         @children = []
         @attributes = []
@@ -50,9 +52,26 @@ module Nokogiri
 
       # Parser hot path. Assign the fields directly. Public constructors keep #attach.
       def self.fast_attach(owner, type, name, document, content = nil, line = nil)
-        state = new
+        state = leaf_type?(type) ? leaf_new : new
         state.fast_fill(type, name, document, content, line)
         owner.instance_variable_set(:@pure, state)
+        state
+      end
+
+      # Text-like nodes never gain children or attributes. One frozen list
+      # stands in for the three arrays State#initialize would allocate.
+      def self.leaf_type?(type)
+        type == XML::Node::TEXT_NODE ||
+          type == XML::Node::COMMENT_NODE ||
+          type == XML::Node::CDATA_SECTION_NODE ||
+          type == XML::Node::PI_NODE
+      end
+
+      def self.leaf_new
+        state = allocate
+        state.instance_variable_set(:@children, EMPTY_LIST)
+        state.instance_variable_set(:@attributes, EMPTY_LIST)
+        state.instance_variable_set(:@namespace_definitions, EMPTY_LIST)
         state
       end
 
@@ -65,7 +84,8 @@ module Nokogiri
       end
 
       def duplicate(level, document)
-        copy = self.class.new
+        # Copies are ordinary states. A flat state must not stay lazy on the copy.
+        copy = State.new
         copy.name = name
         copy.type = type
         copy.document = document
@@ -304,6 +324,7 @@ module Nokogiri
       end
 
       def unlink
+        retire_flat_tree!
         parent_node = pure.parent
         if parent_node
           parent_node.pure.children.delete(self)
@@ -314,6 +335,7 @@ module Nokogiri
       end
 
       def add_child_node(node)
+        retire_flat_tree!
         if text? || cdata? || comment? || processing_instruction? || node_type == ATTRIBUTE_NODE || node_type == ENTITY_REF_NODE
           raise ArgumentError, "cannot add a child to a #{name} node"
         end
@@ -526,8 +548,22 @@ module Nokogiri
       end
 
       def remove_namespaces!
+        owner = document? ? self : document
+        flat = owner&.instance_variable_get(:@flat)
+        if flat
+          if document?
+            flat.strip!
+            return self
+          end
+          flat.retire!
+        end
         strip_namespaces(self)
         self
+      end
+
+      def retire_flat_tree!
+        owner = document? ? self : document
+        owner&.instance_variable_get(:@flat)&.retire!
       end
 
       def create_entity(name, type = nil, external_id = nil, system_id = nil, content = nil)
@@ -954,7 +990,8 @@ module Nokogiri
 
       def strip_namespaces(node)
         node.pure.namespace = nil
-        node.pure.namespace_definitions.clear
+        defs = node.pure.namespace_definitions
+        defs.clear unless defs.empty?
         node.pure.attributes.each { |attr| attr.pure.namespace = nil }
         node.pure.children.each { |child| strip_namespaces(child) }
       end
@@ -1075,6 +1112,8 @@ module Nokogiri
 
       def initialize_copy_with_args(other, level)
         super(other, level, self)
+        # Object#dup copies @flat. The copy owns the duplicated nodes, not the table.
+        remove_instance_variable(:@flat) if instance_variable_defined?(:@flat)
         pure.document = self
         pure.version = other.version
         pure.encoding = other.encoding

@@ -47,6 +47,7 @@ module Nokogiri
       FAST_ATTR_CHILD = /\A\/\/(#{FAST_NAME})\[@(#{FAST_NAME})=(?:"([^"]*)"|'([^']*)')\]\/(#{FAST_NAME})\z/
       FAST_CLASS = /\A(\.\/\/|\/\/)(#{FAST_NAME})\[contains\(concat\(' ',normalize-space\(@class\),' '\),' ([^']*)'\)\]\z/
       FAST_CHILD = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/(#{FAST_NAME})\z/
+      FAST_DESC = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/\/(#{FAST_NAME})\z/
       FAST_UNION = /\A\.\/\/(#{FAST_NAME}) \| self::\1\z/
       FAST_QNAME = /\A\/\/(#{FAST_NAME}):(#{FAST_NAME})\z/
       FAST_ONE = /\A(\.\/\/|\/\/)(#{FAST_NAME})\z/
@@ -59,16 +60,21 @@ module Nokogiri
           return named_attr_children(fast_origin(context, true), match[1], match[2], expected, match[5], limit)
         end
         if (match = FAST_CLASS.match(path))
+          # The pattern eats the leading word-boundary space. The capture
+          # keeps the trailing space, so " post " arrives as "post ".
           inner = match[3]
-          return nil unless inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
+          return nil unless inner.end_with?(" ") && inner.length > 1
 
-          needle = inner[1..-2]
-          return nil if needle.include?(" ")
+          needle = inner.chop
+          return nil if needle.empty? || needle.include?(" ")
 
           return named_class(fast_origin(context, match[1] == "//"), match[2], needle, limit)
         end
         if (match = FAST_CHILD.match(path))
           return named_children(fast_origin(context, match[1] == "//"), match[2], match[3], limit)
+        end
+        if (match = FAST_DESC.match(path))
+          return named_descendant(fast_origin(context, match[1] == "//"), match[2], match[3], limit)
         end
         if (match = FAST_UNION.match(path))
           return union_self(context, match[1], limit)
@@ -94,8 +100,12 @@ module Nokogiri
       end
 
       def self.named(root, local, href, limit)
+        if root.is_a?(XML::Document) && (flat = root.instance_variable_get(:@flat))
+          return flat.named(local, href, limit)
+        end
+
         out = []
-        each_element(root) do |node, state|
+        walk_elements(root) do |node, state|
           next unless state.name == local && href_match?(state, href)
 
           out << node
@@ -105,18 +115,84 @@ module Nokogiri
       end
 
       def self.named_class(root, local, needle, limit)
-        out = []
-        each_element(root) do |node, state|
-          next unless state.name == local && state.namespace.nil?
-          next unless class_match?(state, needle)
+        state = root.instance_variable_get(:@pure)
+        return [] unless state
 
-          out << node
-          return out if limit && out.length >= limit
+        children = state.children
+        return [] if children.empty?
+
+        out = []
+        stack = []
+        index = children.length
+        while index > 0
+          index -= 1
+          stack << children[index]
+        end
+        element = XML::Node::ELEMENT_NODE
+        while (node = stack.pop)
+          child_state = node.instance_variable_get(:@pure)
+          next unless child_state
+
+          if child_state.type == element && child_state.name == local && child_state.namespace.nil? && class_match?(child_state, needle)
+            out << node
+            return out if limit && out.length >= limit
+          end
+          kids = child_state.children
+          cursor = kids.length
+          while cursor > 0
+            cursor -= 1
+            stack << kids[cursor]
+          end
+        end
+        out
+      end
+
+      # One preorder walk. `//h2//a` is an `a` under an `h2`. The count is
+      # how many open ancestors have the parent name, so a nested pair
+      # emits the inner node once and in document order.
+      def self.named_descendant(root, parent_name, child_name, limit)
+        state = root.instance_variable_get(:@pure)
+        return [] unless state
+
+        children = state.children
+        return [] if children.empty?
+
+        out = []
+        stack = []
+        index = children.length
+        while index > 0
+          index -= 1
+          stack << [children[index], 0]
+        end
+        element = XML::Node::ELEMENT_NODE
+        while (item = stack.pop)
+          node, under = item
+          child_state = node.instance_variable_get(:@pure)
+          next unless child_state
+
+          now = under
+          if child_state.type == element && child_state.namespace.nil?
+            if under > 0 && child_state.name == child_name
+              out << node
+              return out if limit && out.length >= limit
+            end
+            now += 1 if child_state.name == parent_name
+          end
+          kids = child_state.children
+          cursor = kids.length
+          while cursor > 0
+            cursor -= 1
+            stack << [kids[cursor], now]
+          end
         end
         out
       end
 
       def self.named_children(root, parent_name, child_name, limit)
+        if root.is_a?(XML::Document) && (flat = root.instance_variable_get(:@flat))
+          return flat.named_children(parent_name, child_name, limit)
+        end
+
         out = []
         each_element(root) do |_node, state|
           next unless state.name == parent_name && state.namespace.nil?
@@ -189,6 +265,10 @@ module Nokogiri
           return attr_state.content.to_s == expected
         end
         expected == ""
+      end
+
+      def self.walk_elements(root, &block)
+        each_element(root, &block)
       end
 
       def self.each_element(root)

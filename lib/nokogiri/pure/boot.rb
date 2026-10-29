@@ -174,6 +174,7 @@ module Nokogiri
 end
 
 require_relative "dom"
+require_relative "flat_tree"
 require_relative "parser"
 require_relative "serializer"
 require_relative "xpath"
