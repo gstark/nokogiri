@@ -59,9 +59,13 @@ Keep threshold: **0.1235** (12.35 percent).
 
 A kept change must beat `4.056 * (1 - 0.1235) = 3.555` on the geomean, then hold on a second run.
 
-The current score is the median of the three runs after commit `68a706e2`: **3.638386**.
+The score after commit `68a706e2` was 3.638386. A kept change had to beat 3.189.
 
-The next kept change must beat `3.638 * (1 - 0.1235) = 3.189`.
+The current score is the higher of the two runs after commit `eb896325`: **2.983484**.
+
+The other run scored 2.803185. Both runs beat 3.189.
+
+The next kept change must beat `2.983 * (1 - 0.1235) = 2.615`.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -99,29 +103,30 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Median of the three runs after commit `68a706e2`:
+Higher of the two runs after commit `eb896325`:
 
-| Case | Baseline | Current |
-| --- | --- | --- |
-| parse_xml_small | 2.636 | 2.683 |
-| parse_xml_medium | 2.731 | 2.889 |
-| parse_xml_large | 5.656 | 6.022 |
-| parse_html_small | 3.106 | 3.736 |
-| parse_html_medium | 6.395 | 7.188 |
-| parse_html_large | 5.223 | 4.560 |
-| xpath_xml_medium | 14.303 | 1.877 |
-| css_html_medium | 3.129 | 3.134 |
-| traverse_xml_medium | 0.750 | 0.741 |
-| edit_xml_medium | 7.050 | 5.307 |
-| serialize_xml_medium | 7.581 | 8.580 |
-| serialize_html_medium | 2.977 | 3.477 |
-| geomean of these medians | 4.100 | 3.545 |
-
-The official score is the median of the run geomeans, not the geomean of the per-case medians.
+| Case | Baseline | After XPath | Current |
+| --- | --- | --- | --- |
+| parse_xml_small | 2.636 | 2.683 | 3.234 |
+| parse_xml_medium | 2.731 | 2.889 | 2.985 |
+| parse_xml_large | 5.656 | 6.022 | 4.434 |
+| parse_html_small | 3.106 | 3.736 | 3.444 |
+| parse_html_medium | 6.395 | 7.188 | 8.540 |
+| parse_html_large | 5.223 | 4.560 | 5.139 |
+| xpath_xml_medium | 14.303 | 1.877 | 1.700 |
+| css_html_medium | 3.129 | 3.134 | 3.676 |
+| traverse_xml_medium | 0.750 | 0.741 | 0.842 |
+| edit_xml_medium | 7.050 | 5.307 | 5.338 |
+| serialize_xml_medium | 7.581 | 8.580 | 1.138 |
+| serialize_html_medium | 2.977 | 3.477 | 4.316 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
-Current run geomeans: 3.315608, 3.687068, 3.638386. Median: 3.638386.
+XPath run geomeans: 3.315608, 3.687068, 3.638386. Median: 3.638386.
+
+Serializer run geomeans: 2.983484, 2.803185. Higher value: 2.983484.
+
+Cases other than XPath and XML serialize still move with machine load.
 
 The XPath case is stable. The other cases still move with machine load.
 
@@ -134,10 +139,10 @@ XPath `//xmlns:item/xmlns:name` (ratio 1.88):
 - The fast walk handles this query on the flat table.
 - The pure entry point rewrites `xmlns:` to ` :` before evaluate. The space is the default namespace.
 
-XML serialize (ratio 7.6):
+XML serialize (ratio 1.14):
 
-- `String#gsub` 42 percent self
-- `Serializer#write_element` 13 percent self
+- Default `to_xml` writes from the flat table.
+- HTML serialize still uses the node walker.
 
 Node edit (ratio 7.1):
 
@@ -163,16 +168,16 @@ HTML parse (ratio about 3.1 to 6.4):
 Kept:
 
 - Flat table for plain XML, lazy text decode, and the earlier search and serialize work. This is commit `ac87983f`. It is the baseline, not an experiment in this loop.
-- Namespaced `//parent/child` on the flat table. Commit `68a706e2`. The XPath ratio fell from 14.303 to 1.877. The median of three full runs is 3.638. Two of those runs missed 3.555 because other cases moved. The change stays. A baseline vector with only the XPath case replaced scores about 3.46.
+- Namespaced `//parent/child` on the flat table. Commit `68a706e2`. The XPath ratio fell from 14.303 to 1.877.
+- Default XML serialization from the flat table. Commit `eb896325`. The serialize_xml ratio fell from about 8.6 to about 1.13. Two full runs scored 2.983484 and 2.803185.
 
 Discarded in this loop: none yet.
 
 ## Open hypotheses
 
-1. Replace serializer `gsub` with a faster escape path. Expected impact: high for `serialize_xml`. A Ruby escape buffer lost to `gsub` before this loop. Do not repeat that buffer. Try a path that skips `gsub` when the text has no special bytes, and a tighter path when it does.
-2. Set element text by replacing the child string. Do not allocate a new text node through `public_send`. Expected impact: medium for edit.
-3. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse.
-4. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
+1. Set element text by replacing the child string. Do not allocate a new text node through `public_send`. Expected impact: medium for edit. The edit ratio is about 5.
+2. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining case.
+3. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop.
 
 ## Idea categories
 
@@ -181,7 +186,7 @@ Discarded in this loop: none yet.
 - YJIT-friendly shapes: not tried in this loop.
 - Data structures: flat table is already in the baseline.
 - XPath and CSS: one kept change. Commit `68a706e2`.
-- Serialization: open.
+- Serialization: one kept change. Commit `eb896325`. HTML serialize is still open.
 - Algorithmic: open. XPath document-order stamping looks quadratic in the profile.
 
 ## Assumptions
