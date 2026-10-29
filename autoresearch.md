@@ -186,7 +186,9 @@ Kept:
 - Element `content=` stores the input text and skips the escape and decode scans. Commit `7b828b66`. The edit ratio fell from about 5.3 to 0.932 and 0.724. Two full runs scored 2.565930 and 2.552333. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 - Default HTML serialization replays recorded pieces. Commit `a0cce8f8`. The serialize_html ratio fell from about 4.0 to 0.315 and 0.271. Two full runs scored 2.112761 and 2.248783. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 
-Discarded in this loop: none yet.
+Discarded in this loop:
+
+- HTML byte scanner for tags, end tags, and comments. The medium HTML pure time fell from about 0.67 s to 0.489 s. Small was 2.42 times libxml. Large stayed near 5 times libxml. A 1.3 times gain on the HTML parse cases does not beat 1.971. The parser change was reset.
 
 ## Open hypotheses
 
