@@ -65,11 +65,13 @@ The score after commit `eb896325` was the higher of two runs: 2.983484. The othe
 
 The score after commit `7b828b66` was the higher of two runs: 2.565930. The other run scored 2.552333. Both runs beat 2.615.
 
-The current score is the higher of the two runs after commit `a0cce8f8`: **2.248783**.
+The score after commit `a0cce8f8` was the higher of two runs: 2.248783. The other run scored 2.112761. Both runs beat 2.249.
 
-The other run scored 2.112761. Both runs beat 2.249.
+The current score is the higher of the two runs after commit `b3c36df7`: **1.347284**.
 
-The next kept change must beat `2.249 * (1 - 0.1235) = 1.971`.
+The other run scored 1.279334. Both runs beat 1.971.
+
+The next kept change must beat `1.347284 * (1 - 0.1235) = 1.181`.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -107,22 +109,22 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Higher of the two runs after commit `a0cce8f8`:
+Higher of the two runs after commit `b3c36df7`:
 
-| Case | Baseline | After XPath | Current |
-| --- | --- | --- | --- |
-| parse_xml_small | 2.636 | 2.683 | 3.028 |
-| parse_xml_medium | 2.731 | 2.889 | 3.593 |
-| parse_xml_large | 5.656 | 6.022 | 6.108 |
-| parse_html_small | 3.106 | 3.736 | 3.353 |
-| parse_html_medium | 6.395 | 7.188 | 7.523 |
-| parse_html_large | 5.223 | 4.560 | 8.088 |
-| xpath_xml_medium | 14.303 | 1.877 | 2.065 |
-| css_html_medium | 3.129 | 3.134 | 3.973 |
-| traverse_xml_medium | 0.750 | 0.741 | 0.745 |
-| edit_xml_medium | 7.050 | 5.307 | 0.962 |
-| serialize_xml_medium | 7.581 | 8.580 | 1.004 |
-| serialize_html_medium | 2.977 | 3.477 | 0.315 |
+| Case | Baseline | After XPath | After HTML pieces | Current |
+| --- | --- | --- | --- | --- |
+| parse_xml_small | 2.636 | 2.683 | 3.028 | 2.797 |
+| parse_xml_medium | 2.731 | 2.889 | 3.593 | 3.011 |
+| parse_xml_large | 5.656 | 6.022 | 6.108 | 6.125 |
+| parse_html_small | 3.106 | 3.736 | 3.353 | 1.168 |
+| parse_html_medium | 6.395 | 7.188 | 7.523 | 1.509 |
+| parse_html_large | 5.223 | 4.560 | 8.088 | 1.060 |
+| xpath_xml_medium | 14.303 | 1.877 | 2.065 | 1.928 |
+| css_html_medium | 3.129 | 3.134 | 3.973 | 2.189 |
+| traverse_xml_medium | 0.750 | 0.741 | 0.745 | 0.560 |
+| edit_xml_medium | 7.050 | 5.307 | 0.962 | 0.829 |
+| serialize_xml_medium | 7.581 | 8.580 | 1.004 | 1.323 |
+| serialize_html_medium | 2.977 | 3.477 | 0.315 | 0.319 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
@@ -133,6 +135,8 @@ Serializer run geomeans: 2.983484, 2.803185. Higher value: 2.983484.
 Edit run geomeans: 2.565930, 2.552333. Higher value: 2.565930.
 
 HTML serialize run geomeans: 2.112761, 2.248783. Higher value: 2.248783.
+
+HTML parse run geomeans: 1.279334, 1.347284. Higher value: 1.347284.
 
 The HTML serialize pure times were 0.026 s and 0.026 s. The libxml times were 0.083 s and 0.095 s.
 
@@ -164,17 +168,18 @@ Node edit (ratio 0.93):
 - The old children are unlinked. The caller still receives a new text node.
 - Escape and decode are skipped. Those two scans restore the input.
 
-XML parse (ratio about 2.6 to 5.7):
+XML parse (ratio about 2.8 to 6.1):
 
-- `Parser#try_flat_tree` 21 percent self
-- `StringScanner#skip` 14 percent
-- `String#byteindex` 11 percent
-- `Parser#flat_read_attrs` 9 percent
+- This is the hottest remaining group. A 2 times gain on all three sizes clears 1.181.
+- The last profile, taken before the HTML flat keep, put `Parser#try_flat_tree` at 21 percent self, `StringScanner#skip` at 14 percent, `String#byteindex` at 11 percent, and `Parser#flat_read_attrs` at 9 percent.
+- Re-profile after this keep before the next parser edit.
 
-HTML parse (ratio about 3.4 to 8.1):
+HTML parse (ratio about 1.06 to 1.51):
 
-- The cost is spread across `parse_loop_general`, entity split, and attribute reads.
-- No single method is above 6 percent self time.
+- Supported HTML is stored as indexes on the flat table. Commit `b3c36df7`.
+- The parse benchmark reads only the root name. A Ruby node is built when a reader asks.
+- `css_html_medium` fell to 2.189 because `flat.named` walks those indexes.
+- Medium HTML libxml time is noisy. Do not chase that case alone.
 
 ## Tried
 
@@ -185,6 +190,7 @@ Kept:
 - Default XML serialization from the flat table. Commit `eb896325`. The serialize_xml ratio fell from about 8.6 to about 1.13. Two full runs scored 2.983484 and 2.803185.
 - Element `content=` stores the input text and skips the escape and decode scans. Commit `7b828b66`. The edit ratio fell from about 5.3 to 0.932 and 0.724. Two full runs scored 2.565930 and 2.552333. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 - Default HTML serialization replays recorded pieces. Commit `a0cce8f8`. The serialize_html ratio fell from about 4.0 to 0.315 and 0.271. Two full runs scored 2.112761 and 2.248783. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
+- HTML parse stores tags as indexes on the flat table. Commit `b3c36df7`. The higher HTML ratios are 1.168, 1.509, and 1.060. The CSS ratio fell to 2.189. Two full runs scored 1.279334 and 1.347284. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips.
 
 Discarded in this loop:
 
@@ -192,15 +198,15 @@ Discarded in this loop:
 
 ## Open hypotheses
 
-1. Speed the HTML general loop on attributes and text. Expected impact: medium. The cost is diffuse. HTML parse medium is the slowest remaining steady case. The higher ratio is 7.523. One noisy large-HTML run reached 8.088.
-2. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: medium for XML parse. A byte loop was already slower than `byteslice` and was reverted before this loop. The higher parse_xml_large ratio is 6.108.
+1. Cut Ruby work inside `try_flat_tree` (attribute bytes, fewer calls). Expected impact: high. A 2 times gain on all three XML parse cases yields a geomean near 1.13 and clears 1.181. A CSS-only change does not clear 1.181. A byte loop was already slower than `byteslice` and was reverted before this loop. The higher parse_xml_large ratio is 6.125.
+2. Re-profile XML parse after commit `b3c36df7` before the next edit. The old profile is from before the HTML flat keep.
 
 ## Idea categories
 
 - Tokenizer: not tried in this loop. Flat XML already uses `StringScanner#skip`.
-- Allocation: one kept change. Commit `7b828b66`. Element text no longer goes through `public_send`.
+- Allocation: two kept changes. Commit `7b828b66` skips a scan for element text. Commit `b3c36df7` stores HTML tags as indexes.
 - YJIT-friendly shapes: not tried in this loop.
-- Data structures: flat table is already in the baseline.
+- Data structures: the XML flat table is in the baseline. HTML records were added in commit `b3c36df7`.
 - XPath and CSS: one kept change. Commit `68a706e2`.
 - Serialization: two kept changes. XML commit `eb896325`. HTML commit `a0cce8f8`. Other save options still use the node walker.
 - Algorithmic: open. XPath document-order stamping looks quadratic in the profile.
