@@ -126,3 +126,4 @@ require_relative "nokogiri/html4/builder"
 require_relative "nokogiri/encoding_handler"
 
 require_relative "nokogiri/html5" if Nokogiri.uses_gumbo?
+require_relative "nokogiri/pure/element_content" unless Nokogiri.uses_libxml?

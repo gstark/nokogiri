@@ -250,10 +250,39 @@ module Nokogiri
         end
       end
 
+      # Element content= escapes, then native_content= decodes. The stored
+      # text is the input. xml/node.rb defines content= after this file, so
+      # the override that skips both scans lives in pure/element_content.rb.
+      def replace_element_text(text)
+        retire_flat_tree!
+        kids = pure.children
+        index = kids.length
+        while index > 0
+          index -= 1
+          child_state = kids[index].instance_variable_get(:@pure)
+          child_state.parent = nil if child_state
+        end
+        kids.clear
+        return if text.empty?
+
+        node = XML::Text.allocate
+        state = Pure::State.leaf_new
+        state.fast_fill(TEXT_NODE, "text", document, text, nil)
+        state.parent = self
+        node.instance_variable_set(:@pure, state)
+        kids << node
+        node.decorate!
+        node
+      end
+      private :replace_element_text
+
       def native_content=(string)
         value = string.nil? ? nil : string.to_s
         if text? || cdata? || comment? || processing_instruction? || node_type == ATTRIBUTE_NODE
           pure.content = value
+        elsif element?
+          decoded = value.empty? ? value : Pure::Entities.decode_predefined(value)
+          replace_element_text(decoded)
         else
           pure.children.dup.each(&:unlink)
           decoded = Pure::Entities.decode_predefined(value.to_s)
