@@ -16,6 +16,12 @@ module Nokogiri
       # Quote-aware tag. The match stops at the tag's ">", including one
       # that sits inside a quoted attribute value.
       FLAT_TAG = /<(?:[^>"']|"[^"]*"|'[^']*')*>/.freeze
+      # One repeated sibling is learned from the first copy. A longer unit
+      # stays on the general flat scan. Holes are attribute values and text.
+      REPEAT_UNIT_MAX = 8192
+      REPEAT_TEXT = %q{((?:[^<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
+      REPEAT_DQ = %q{((?:[^"<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
+      REPEAT_SQ = %q{((?:[^'<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
       P_END_MESSAGE = 'The element type "p" must be terminated by the matching end-tag "</p>".'.freeze
       P_END_ERROR = [P_END_MESSAGE, 0, 0, nil, false].freeze
 
@@ -135,6 +141,9 @@ module Nokogiri
         string = @scanner.string
         origin = @scanner.pos
         return nil if string.byteindex("<!", origin) || string.byteindex("<?", origin)
+
+        repeated = try_repeated_flat(string, origin)
+        return repeated if repeated
 
         @flat_nl = flat_newline_table(string)
         @flat_nl_i = 0
@@ -261,6 +270,530 @@ module Nokogiri
         return nil unless stack.empty?
 
         tree
+      end
+
+      # Many copies of one child become one match each. The shape is the
+      # first child, with quoted values and text as captures. Any mismatch
+      # returns nil and the caller runs the general flat scan.
+      def try_repeated_flat(string, origin)
+        limit = string.bytesize
+        pos = repeat_skip_ws(string, origin, limit)
+        return nil if pos >= limit || string.getbyte(pos) != 60 || string.getbyte(pos + 1) == 47
+
+        sc = StringScanner.new(string)
+        sc.pos = pos
+        return nil unless sc.skip(FLAT_TAG)
+
+        root_gt = sc.pos - 1
+        return nil if string.getbyte(root_gt - 1) == 47
+
+        root_pos = pos
+        name_off, name_len = repeat_name_at(string, root_pos, root_gt)
+        return nil unless name_off
+
+        body = root_gt + 1
+        child = repeat_skip_ws(string, body, limit)
+        return nil if child >= limit || child - body > REPEAT_UNIT_MAX
+        return nil if string.getbyte(child) != 60 || string.getbyte(child + 1) == 47
+
+        span = repeat_element_end(string, child, limit)
+        return nil unless span
+
+        nxt = repeat_find_lt(string, span, limit)
+        return nil unless nxt
+        return nil if string.getbyte(nxt + 1) == 47
+        return nil unless repeat_same_name?(string, child, nxt)
+
+        sep_len = nxt - span
+        return nil unless repeat_ws_only?(string, span, sep_len)
+
+        sep = string.byteslice(span, sep_len)
+        built = build_repeat_template(string, child, span)
+        return nil unless built
+
+        re, unresolved_nodes, groups = built
+        md = re.match(string, child)
+        return nil unless md && md.bytebegin(0) == child && md.byteend(0) == span
+
+        md2 = re.match(string, nxt)
+        return nil unless md2 && md2.bytebegin(0) == nxt
+
+        @flat_nl = flat_newline_table(string)
+        @flat_nl_i = 0
+        tree = FlatTree.new(@document, string)
+        @fn_map = {}
+        @fn_stack = []
+        stack = []
+        return nil unless flat_add_tag(tree, string, root_pos, root_gt, stack)
+        return nil if stack.empty?
+
+        root_index = stack.last
+        nodes, hot_groups = resolve_repeat_specs(tree, unresolved_nodes, groups)
+        return nil unless nodes
+
+        return nil unless stamp_repeated(
+          tree, string, nodes, hot_groups, re, sep, root_index,
+          body, child, limit, name_off, name_len, md,
+        )
+
+        tree
+      end
+
+      def stamp_repeated(tree, string, nodes, groups, re, sep, root_index, body, child, limit, name_off, name_len, md)
+        if child > body
+          return false unless repeat_ws_only?(string, body, child - body)
+
+          tree.add_text_range(root_index, body, child - body, flat_line(child))
+        end
+
+        count = 0
+        sep_len = sep.bytesize
+        slots = Array.new(nodes.length)
+        while md
+          return false unless stamp_one(tree, nodes, groups, string, md, root_index, slots)
+
+          count += 1
+          pos = md.byteend(0)
+          md = nil
+          if sep_len.positive? && repeat_eq?(string, pos, sep)
+            after = pos + sep_len
+            nxt = re.match(string, after)
+            if nxt && nxt.bytebegin(0) == after
+              tree.add_text_range(root_index, pos, sep_len, flat_line(after))
+              md = nxt
+              next
+            end
+          elsif sep_len.zero?
+            nxt = re.match(string, pos)
+            if nxt && nxt.bytebegin(0) == pos
+              md = nxt
+              next
+            end
+          end
+          return false unless finish_repeat(tree, string, pos, limit, root_index, name_off, name_len)
+
+          break
+        end
+        count >= 2
+      end
+
+      def finish_repeat(tree, string, pos, limit, root_index, name_off, name_len)
+        if pos < limit && string.getbyte(pos) != 60
+          nxt = repeat_find_lt(string, pos, limit)
+          return false unless nxt
+          return false unless repeat_ws_only?(string, pos, nxt - pos)
+
+          tree.add_text_range(root_index, pos, nxt - pos, flat_line(nxt)) if nxt > pos
+          pos = nxt
+        end
+        ended = repeat_end_at(string, pos, limit, name_off, name_len)
+        return false unless ended
+
+        rest = limit - ended
+        rest.zero? || repeat_ws_only?(string, ended, rest)
+      end
+
+      def stamp_one(tree, nodes, groups, string, md, root_index, slots)
+        i = 0
+        last = nodes.length
+        while i < last
+          spec = nodes[i]
+          parent = spec[1] < 0 ? root_index : slots[spec[1]]
+          if spec[0] == 3
+            cap = spec[2]
+            b = md.bytebegin(cap)
+            e = md.byteend(cap)
+            slots[i] = tree.add_text_range(parent, b, e - b, flat_line(e))
+          else
+            anchor = spec[2]
+            base = anchor < 0 ? md.bytebegin(0) : md.byteend(anchor)
+            name_off = base + spec[3]
+            index = tree.add_element(parent, name_off, spec[4], spec[5], spec[6], flat_line(name_off), EMPTY_SCOPE)
+            group_at = spec[7]
+            if group_at >= 0 && !apply_repeat_attrs(tree, index, groups[group_at], string, md)
+              return false
+            end
+
+            slots[i] = index
+          end
+          i += 1
+        end
+        true
+      end
+
+      def apply_repeat_attrs(tree, index, group, string, md)
+        i = 0
+        last = group.length
+        while i < last
+          local, ns_id, cap, lang = group[i]
+          b = md.bytebegin(cap)
+          e = md.byteend(cap)
+          raw = string.byteslice(b, e - b)
+          if raw.byteindex("&")
+            raw = decode_fast_attr(raw)
+            return false unless raw
+          end
+          tree.add_attr(index, local, ns_id, raw)
+          tree.set_lang(index, raw) if lang
+          i += 1
+        end
+        true
+      end
+
+      def resolve_repeat_specs(tree, nodes, groups)
+        hot_groups = []
+        groups.each do |group|
+          hot = []
+          group.each do |local, prefix, cap|
+            ns_id = -1
+            lang = false
+            if prefix
+              found = flat_lookup(tree, prefix)
+              if found
+                ns_id = found
+                lang = prefix == "xml" && local == "lang"
+              end
+            end
+            hot << [local, ns_id, cap, lang]
+          end
+          hot_groups << hot
+        end
+        hot_nodes = []
+        nodes.each do |spec|
+          if spec[0] == 3
+            hot_nodes << spec
+            next
+          end
+
+          _tag, parent_slot, anchor, delta, name_len, colon, prefix, group_index = spec
+          local_delta = colon
+          ns_id = -1
+          if prefix == :none
+            found = @fn_map[nil]
+            ns_id = found if found
+          else
+            found = flat_lookup(tree, prefix)
+            if found
+              ns_id = found
+            else
+              local_delta = 0
+            end
+          end
+          hot_nodes << [1, parent_slot, anchor, delta, name_len, local_delta, ns_id, group_index]
+        end
+        [hot_nodes, hot_groups]
+      end
+
+      def build_repeat_template(string, from, to)
+        src = +""
+        pos = from
+        hole_ends = []
+        nodes = []
+        groups = []
+        stack = []
+        while pos < to
+          if string.getbyte(pos) != 60
+            text_end = repeat_find_lt(string, pos, to + 1)
+            return nil unless text_end && text_end <= to
+            return nil if stack.empty?
+
+            src << REPEAT_TEXT
+            cap = hole_ends.length + 1
+            hole_ends << text_end
+            nodes << [3, stack.last, cap]
+            pos = text_end
+            next
+          end
+
+          sc = StringScanner.new(string)
+          sc.pos = pos
+          return nil unless sc.skip(FLAT_TAG)
+
+          tag_end = sc.pos
+          if string.getbyte(pos + 1) == 47
+            return nil if stack.empty?
+
+            src << Regexp.escape(string.byteslice(pos, tag_end - pos))
+            stack.pop
+            pos = tag_end
+            next
+          end
+
+          return nil unless repeat_emit_start(
+            string, pos, tag_end, src, hole_ends, groups, nodes, stack, from,
+          )
+
+          pos = tag_end
+        end
+        return nil unless stack.empty?
+
+        [Regexp.new(src), nodes, groups]
+      rescue RegexpError
+        nil
+      end
+
+      def repeat_emit_start(string, pos, tag_end, src, hole_ends, groups, nodes, stack, from)
+        gt = tag_end - 1
+        self_closing = string.getbyte(gt - 1) == 47
+        stop = self_closing ? gt - 1 : gt
+        name_off = pos + 1
+        return nil unless name_start_byte?(string.getbyte(name_off))
+
+        index = name_off + 1
+        while index < stop
+          byte = string.getbyte(index)
+          break unless byte && name_byte?(byte)
+
+          index += 1
+        end
+        name_len = index - name_off
+        anchor, delta = repeat_anchor(hole_ends, name_off, from)
+        colon = 0
+        prefix = :none
+        cursor = name_off
+        last_name = name_off + name_len
+        while cursor < last_name
+          if string.getbyte(cursor) == 58
+            colon = cursor - name_off + 1
+            prefix = string.byteslice(name_off, colon - 1)
+            return nil if prefix.empty?
+
+            break
+          end
+          cursor += 1
+        end
+
+        caps = []
+        lit = pos
+        cursor = pos
+        while cursor < tag_end
+          byte = string.getbyte(cursor)
+          if byte == 34 || byte == 39
+            src << Regexp.escape(string.byteslice(lit, cursor - lit))
+            quote = byte == 34 ? "\"" : "'"
+            src << quote
+            close = string.byteindex(quote, cursor + 1)
+            return nil unless close && close < tag_end
+
+            src << (byte == 34 ? REPEAT_DQ : REPEAT_SQ)
+            src << quote
+            caps << (hole_ends.length + 1)
+            hole_ends << close
+            lit = close + 1
+            cursor = lit
+          else
+            cursor += 1
+          end
+        end
+        src << Regexp.escape(string.byteslice(lit, tag_end - lit)) if tag_end > lit
+
+        parsed = repeat_attr_names(string, index, stop)
+        return nil unless parsed && parsed.length == caps.length
+
+        group_index = -1
+        if parsed.any?
+          group = []
+          parsed.each_with_index do |(local, attr_prefix), cap_at|
+            return nil if local == "xmlns" || attr_prefix == "xmlns"
+
+            group << [local, attr_prefix, caps[cap_at]]
+          end
+          group_index = groups.length
+          groups << group
+        end
+
+        parent_slot = stack.empty? ? -1 : stack.last
+        nodes << [:el, parent_slot, anchor, delta, name_len, colon, prefix, group_index]
+        stack << (nodes.length - 1) unless self_closing
+        true
+      end
+
+      def repeat_attr_names(string, index, stop)
+        attrs = []
+        while index < stop
+          while index < stop
+            byte = string.getbyte(index)
+            break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+            index += 1
+          end
+          break if index >= stop
+
+          byte = string.getbyte(index)
+          return nil if byte == 47
+          return nil unless byte && name_start_byte?(byte)
+
+          start = index
+          index += 1
+          while index < stop
+            byte = string.getbyte(index)
+            break unless byte && name_byte?(byte)
+
+            index += 1
+          end
+          raw = string.byteslice(start, index - start)
+          colon = raw.byteindex(":")
+          if colon
+            attr_prefix = raw.byteslice(0, colon)
+            local = raw.byteslice(colon + 1, raw.bytesize - colon - 1)
+            return nil if local.nil? || local.empty?
+          else
+            attr_prefix = nil
+            local = raw
+          end
+          while index < stop
+            byte = string.getbyte(index)
+            break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+            index += 1
+          end
+          return nil unless string.getbyte(index) == 61
+
+          index += 1
+          while index < stop
+            byte = string.getbyte(index)
+            break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+            index += 1
+          end
+          quote = string.getbyte(index)
+          return nil unless quote == 34 || quote == 39
+
+          index += 1
+          close = string.byteindex(quote == 34 ? "\"" : "'", index)
+          return nil unless close && close < stop
+
+          attrs << [local, attr_prefix]
+          index = close + 1
+        end
+        attrs
+      end
+
+      def repeat_anchor(hole_ends, name_off, from)
+        i = hole_ends.length
+        while i.positive?
+          i -= 1
+          hend = hole_ends[i]
+          return [i + 1, name_off - hend] if hend <= name_off
+        end
+        [-1, name_off - from]
+      end
+
+      def repeat_element_end(string, pos, limit)
+        hard = pos + REPEAT_UNIT_MAX
+        limit = hard if hard < limit
+        sc = StringScanner.new(string)
+        depth = 0
+        while pos < limit
+          if string.getbyte(pos) != 60
+            pos = repeat_find_lt(string, pos, limit)
+            return nil unless pos
+          end
+          sc.pos = pos
+          return nil unless sc.skip(FLAT_TAG)
+
+          gt = sc.pos - 1
+          if string.getbyte(pos + 1) == 47
+            depth -= 1
+            return nil if depth.negative?
+            return sc.pos if depth.zero?
+          elsif string.getbyte(gt - 1) == 47
+            return sc.pos if depth.zero?
+          else
+            depth += 1
+          end
+          pos = sc.pos
+        end
+        nil
+      end
+
+      def repeat_end_at(string, pos, limit, name_off, name_len)
+        return nil unless pos + 2 + name_len < limit
+        return nil unless string.getbyte(pos) == 60 && string.getbyte(pos + 1) == 47
+        return nil unless string.byteslice(pos + 2, name_len) == string.byteslice(name_off, name_len)
+
+        cursor = pos + 2 + name_len
+        while cursor < limit
+          byte = string.getbyte(cursor)
+          break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          cursor += 1
+        end
+        return nil unless string.getbyte(cursor) == 62
+
+        cursor + 1
+      end
+
+      def repeat_name_at(string, pos, gt)
+        start = pos + 1
+        return nil unless name_start_byte?(string.getbyte(start))
+
+        index = start + 1
+        while index < gt
+          byte = string.getbyte(index)
+          break unless byte && name_byte?(byte)
+
+          index += 1
+        end
+        [start, index - start]
+      end
+
+      def repeat_same_name?(string, left, right)
+        i = 1
+        while i < 200
+          byte_l = string.getbyte(left + i)
+          byte_r = string.getbyte(right + i)
+          name_l = byte_l && name_byte?(byte_l)
+          name_r = byte_r && name_byte?(byte_r)
+          return true if !name_l && !name_r && i > 1
+          return false if byte_l != byte_r
+
+          i += 1
+        end
+        false
+      end
+
+      def repeat_find_lt(string, pos, limit)
+        while pos < limit
+          return pos if string.getbyte(pos) == 60
+
+          pos += 1
+        end
+        nil
+      end
+
+      def repeat_skip_ws(string, pos, limit)
+        while pos < limit
+          byte = string.getbyte(pos)
+          break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          pos += 1
+        end
+        pos
+      end
+
+      def repeat_ws_only?(string, pos, length)
+        index = 0
+        while index < length
+          byte = string.getbyte(pos + index)
+          return false unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          index += 1
+        end
+        true
+      end
+
+      def repeat_eq?(string, pos, other)
+        length = other.bytesize
+        return false if pos + length > string.bytesize
+
+        index = 0
+        while index < length
+          return false unless string.getbyte(pos + index) == other.getbyte(index)
+
+          index += 1
+        end
+        true
       end
 
       # HTML records stay on the flat table until a reader asks for a node.
