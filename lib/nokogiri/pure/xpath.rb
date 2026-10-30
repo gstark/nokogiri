@@ -459,6 +459,10 @@ module Nokogiri
 
       # Evaluates one expression against one context node.
       class Engine
+        # Each nested expression uses two recursive calls. Past this depth the
+        # descent overflows the stack (CVE-2025-9714).
+        EXPR_DEPTH_LIMIT = 512
+
         def initialize(source, namespaces, variables, handler = nil, evaluating: true, node_limit: nil)
           @scanner = Scanner.new(source)
           @namespaces = namespaces
@@ -468,6 +472,7 @@ module Nokogiri
           @node_limit = node_limit
           @position = 1
           @size = 1
+          @expr_depth = 0
         end
 
         def evaluate(context_node, position: 1, size: 1)
@@ -482,6 +487,7 @@ module Nokogiri
         private
 
         def parse_or
+          enter_expr
           left = parse_and
           while @scanner.keyword?("or")
             if @evaluating && left.truthy
@@ -492,6 +498,8 @@ module Nokogiri
             end
           end
           left
+        ensure
+          leave_expr
         end
 
         def parse_and
@@ -562,11 +570,23 @@ module Nokogiri
         end
 
         def parse_unary
+          enter_expr
           if @scanner.operator?("-")
             Value.number(-parse_unary.to_number)
           else
             parse_union
           end
+        ensure
+          leave_expr
+        end
+
+        def enter_expr
+          @expr_depth += 1
+          raise_syntax("expression nested too deeply") if @expr_depth > EXPR_DEPTH_LIMIT
+        end
+
+        def leave_expr
+          @expr_depth -= 1
         end
 
         def parse_union
