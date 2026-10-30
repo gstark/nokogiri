@@ -10,7 +10,11 @@ Lower is better.
 
 The target is `geomean_ratio <= 1.20` on three consecutive benchmark runs.
 
-The target is met. Commit `5c70ede8` scored 1.178320, 1.108242, and 1.177141.
+The 1.20 milestone is met. It does not stop the loop.
+
+Commit `5c70ede8` scored 1.178320, 1.108242, and 1.177141.
+
+A quiet rebaseline on commit `a36d4998` scored 1.102807, 1.113009, and 1.215554. The median is 1.113009.
 
 ## Commands
 
@@ -49,15 +53,19 @@ Modes: `parse_xml`, `parse_html`, `xpath`, `css`, `traverse`, `edit`, `to_xml`, 
 
 Noise is `(max - min) / median` of three consecutive geomean runs.
 
-The keep threshold is the larger of 2 percent and twice that noise.
+The keep threshold is the larger of 1 percent and twice that noise.
 
-Settled runs: 4.011415, 4.056096, 4.261804.
+The first settled trio was 4.011415, 4.056096, and 4.261804. Spread 0.0617. That threshold was 0.1235.
 
-Median baseline: **4.056096**.
+Quiet rebaseline on 2026-10-30, commit `a36d4998`. Run 1 started at load 0.39. Run 2 started at load 2.01. Run 3 started at load 2.54. Scores: 1.102807, 1.113009, 1.215554.
 
-Spread: 0.0617.
+Median: **1.113009**.
 
-Keep threshold: **0.1235** (12.35 percent).
+Spread: (1.215554 - 1.102807) / 1.113009 = 0.1013.
+
+Keep threshold: **0.2026** (20.26 percent).
+
+A kept change must beat `1.113009 * (1 - 0.2026) = 0.887` on the median of a confirmed pair.
 
 A kept change must beat `4.056 * (1 - 0.1235) = 3.555` on the geomean, then hold on a second run.
 
@@ -69,11 +77,9 @@ The score after commit `7b828b66` was the higher of two runs: 2.565930. The othe
 
 The score after commit `a0cce8f8` was the higher of two runs: 2.248783. The other run scored 2.112761. Both runs beat 2.249.
 
-The current score is the higher of the three runs after commit `5c70ede8`: **1.178320**.
+The current score is the median of the quiet rebaseline: **1.113009**.
 
-The other runs scored 1.108242 and 1.177141. All three runs beat 1.181. All three runs are at or under 1.20.
-
-The next kept change must beat `1.178320 * (1 - 0.1235) = 1.033`. The target is already met. The loop stops here.
+The higher quiet run is 1.215554. That run started at load 2.54. Two of the three quiet runs are under 1.20.
 
 One earlier run scored 4.490180 before these three. That run is not part of the threshold.
 
@@ -111,22 +117,22 @@ Traverse is already inside the target.
 
 ## Current ratios
 
-Higher of the three runs after commit `5c70ede8`:
+Median of the quiet rebaseline on `a36d4998`. The last column is the higher of those three runs.
 
-| Case | Baseline | After HTML flat | Current |
+| Case | Start | Quiet median | Quiet higher |
 | --- | --- | --- | --- |
-| parse_xml_small | 2.636 | 2.797 | 2.553 |
-| parse_xml_medium | 2.731 | 3.011 | 1.407 |
-| parse_xml_large | 5.656 | 6.125 | 1.851 |
-| parse_html_small | 3.106 | 1.168 | 1.303 |
-| parse_html_medium | 6.395 | 1.509 | 1.746 |
-| parse_html_large | 5.223 | 1.060 | 1.286 |
-| xpath_xml_medium | 14.303 | 1.928 | 2.052 |
-| css_html_medium | 3.129 | 2.189 | 1.934 |
-| traverse_xml_medium | 0.750 | 0.560 | 0.769 |
-| edit_xml_medium | 7.050 | 0.829 | 0.778 |
-| serialize_xml_medium | 7.581 | 1.323 | 1.378 |
-| serialize_html_medium | 2.977 | 0.319 | 0.293 |
+| parse_xml_small | 2.636 | 2.796 | 2.796 |
+| parse_xml_medium | 2.731 | 1.440 | 1.551 |
+| parse_xml_large | 5.656 | 1.610 | 1.757 |
+| parse_html_small | 3.106 | 1.070 | 1.135 |
+| parse_html_medium | 6.395 | 1.430 | 1.520 |
+| parse_html_large | 5.223 | 0.936 | 0.969 |
+| xpath_xml_medium | 14.303 | 1.590 | 1.836 |
+| css_html_medium | 3.129 | 1.718 | 1.961 |
+| traverse_xml_medium | 0.750 | 0.686 | 0.879 |
+| edit_xml_medium | 7.050 | 0.893 | 0.894 |
+| serialize_xml_medium | 7.581 | 1.130 | 1.281 |
+| serialize_html_medium | 2.977 | 0.292 | 0.316 |
 
 Baseline run geomeans: 4.011415, 4.056096, 4.261804. Median: 4.056096.
 
@@ -141,6 +147,8 @@ HTML serialize run geomeans: 2.112761, 2.248783. Higher value: 2.248783.
 HTML parse run geomeans: 1.279334, 1.347284. Higher value: 1.347284.
 
 Repeated-sibling run geomeans: 1.178320, 1.108242, 1.177141. Higher value: 1.178320.
+
+Quiet rebaseline geomeans: 1.102807, 1.113009, 1.215554. Median: 1.113009.
 
 The HTML serialize pure times were 0.026 s and 0.026 s. The libxml times were 0.083 s and 0.095 s.
 
@@ -202,13 +210,50 @@ Discarded in this loop:
 - HTML byte scanner for tags, end tags, and comments. The medium HTML pure time fell from about 0.67 s to 0.489 s. Small was 2.42 times libxml. Large stayed near 5 times libxml. A 1.3 times gain on the HTML parse cases does not beat 1.971. The parser change was reset.
 - Packed XML records and attribute offsets, then a tighter tag loop. Large-file objects fell from about 1.3 million to about 0.2 million. In one process the large parse was about 1.4 times faster and the medium parse about 1.3 times faster. The small parse was slower. A YJIT slice of the same loop was several times slower. The change does not beat 1.181. The parser change was reset.
 
+## Hypothesis log
+
+### H-001
+
+Evidence: vernier wall profile `bench/autoresearch/profiles/a36d4998-xpath_xml_medium.md`. `FlatTree#local_eq?` is 50.2 percent of self time. It slices the source on every name test. The CSS profile shows `Enumerable#find` at 27.7 percent inside attribute reads, and `collect_text` at 9.2 percent.
+
+Proposed change: remember each local name on the flat table the first time it is read. Later tests compare that string.
+
+Mechanism: the benchmark parses once and queries the same document hundreds of times. A user who queries a document more than once gets the same reuse. The first query still slices once per element.
+
+Predicted impact: `xpath_xml_medium` falls from about 1.59 toward 1.0. CSS moves less, because name tests are only 7.1 percent of that profile. Parse cases stay put. The geomean move is a few percent, under the 0.2026 keep bar. Keep the result only if the confirmed geomean beats 0.887. Otherwise record a near miss.
+
+Result: one full bench of the name cache alone, at load 2.00, scored geomean 1.101229. Pure xpath median was 0.086547 s. The quiet pure band is 0.074 s to 0.085 s. Libxml xpath spread was 0.4021, so ratio 1.007 is not a pure-time win. A later three-run loop timed 40 xpath queries at median 0.0148 s versus 0.0191 s. The harness did not show that gap. This does not beat 0.887. The code was reset.
+
+### H-002
+
+Evidence: the same xpath profile shows `Node#collect_text` at 17.8 percent of self time. The CSS profile shows it at 9.2 percent. The harness reads `.text` on every hit, hundreds of times, on one document.
+
+Proposed change: store each element's plain text on the flat table the first time it is read. Later reads return that string. A wrapped text node clears the cache for its ancestors. `content` returns a duplicate so a caller cannot change the stored text.
+
+Mechanism: a catalog `name` element has one text child. The first read copies that text. Later reads skip the child walk. A user who reads text more than once on the same document gets the same reuse. An edit that retires the table, or that materializes children, uses the live walk.
+
+Predicted impact: xpath and CSS move down by a few percent on top of H-001. Parse cases stay put, because they do not read text. The stacked geomean still lands above 0.887. Record a near miss unless the confirmed geomean beats 0.887.
+
+Result: a text-only loop, 40 passes over 666 names, median 0.0055 s versus 0.0053 s on `a36d4998`. The duplicate on each read cost the same as the old child walk. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips. One full bench of H-001 plus H-002 at load 1.44 scored geomean 1.146655. Pure xpath was 0.076091 s. Pure CSS was 0.164661 s. Both sit inside the quiet bands. This does not beat 0.887. The code was reset.
+
 ## Open hypotheses
 
-The target is met. Do not start another keep for score alone.
+The furthest median ratios are `parse_xml_small` at 2.796, `css_html_medium` at 1.718, and `parse_xml_large` at 1.610. Small XML does not repeat one child shape, so it stays on the flat scan. That scan spends 13.9 percent in `String#byteindex`, 13.0 percent in `StringScanner#skip`, and 12.3 percent in `flat_read_attrs`.
 
-The furthest ratios are `parse_xml_small` at 2.553, `xpath_xml_medium` at 2.052, and `css_html_medium` at 1.934. Small XML does not repeat one child shape, so the new path leaves it on the flat scan.
+The tighter tag loop and packed records did not beat the old bar. Do not repeat that edit.
 
-The tighter tag loop and packed records did not beat 1.181. Do not repeat that edit.
+## Near-miss pool
+
+- Cached local names. See H-001. A same-process xpath loop was about 22 percent faster. The harness pure time stayed inside 0.074 s to 0.085 s.
+- Cached element text. See H-002. The text loop did not move, because each read still allocated a duplicate.
+
+## Active campaign
+
+None.
+
+## Escalation
+
+Current level: local algorithmic. Micro changes and the flat-table architecture are already in the kept set. YJIT shape work is not exhausted. Two architectural campaigns since the last keep are not done. The stop rule is not met.
 
 ## Idea categories
 
@@ -230,6 +275,6 @@ The tighter tag loop and packed records did not beat 1.181. Do not repeat that e
 - Medium and large XML are synthetic catalogs in the `urn:bench` namespace. They use only predefined entities and character references, so the flat parser accepts them.
 - Large HTML is synthetic. It includes an unclosed `p`, comments, and predefined entities.
 - A query result cache that survives across benchmark iterations is not allowed. Node caches inside one parsed document are normal user behavior.
-- The workspace checkout `/home/dev/nokogiri` is a different branch. Do not edit it.
-- Do not commit to any branch except `autoresearch/perf` in `/tmp/nokogiri-perf`.
+- The workspace checkout `/home/dev/nokogiri` is branch `pure-ruby`. Commits land there. Fast-forward `autoresearch/perf` in `/tmp/nokogiri-perf` when that worktree is clean.
+- The quiet rebaseline measured `/tmp/nokogiri-perf` at the same commit `a36d4998`.
 - `bench/autoresearch/guard.rb` passes `chdir: nil` into `Open3.capture3`. That raises `TypeError` on Ruby 3.4.7. Run `bench/autoresearch/diff.rb`, then `suite_runner.rb` with `bundle exec` from `/tmp/nokogiri-main`. Do not edit the harness to fix this.
