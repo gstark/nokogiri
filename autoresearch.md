@@ -236,6 +236,18 @@ Predicted impact: xpath and CSS move down by a few percent on top of H-001. Pars
 
 Result: a text-only loop, 40 passes over 666 names, median 0.0055 s versus 0.0053 s on `a36d4998`. The duplicate on each read cost the same as the old child walk. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips. One full bench of H-001 plus H-002 at load 1.44 scored geomean 1.146655. Pure xpath was 0.076091 s. Pure CSS was 0.164661 s. Both sit inside the quiet bands. This does not beat 0.887. The code was reset.
 
+### H-003
+
+Evidence: vernier profile `bench/autoresearch/profiles/a36d4998-css_html_medium.md`. `Enumerable#find` is 27.7 percent of self time inside `Node#get` for `node["href"]`.
+
+Proposed change: for an unprefixed name on a flat element whose attributes are not materialized, read the value from the flat attribute row. Remember that string on the table. A later read returns the same string. A namespaced name, or a write that materializes attributes, keeps the old search.
+
+Mechanism: the CSS harness reads `href` on each anchor, many times, on one document. The first read decodes the value. Later reads skip `Attr` allocation and `Enumerable#find`. A user who reads the same attribute more than once gets the same reuse.
+
+Predicted impact: the CSS ratio moves down from about 1.72. A 20 percent cut on that one case is about 1.5 percent on the geomean. That stays above 0.887. Record a near miss unless the confirmed geomean beats 0.887.
+
+Result: an attribute loop median was 0.0038 s versus 0.0070 s, about 46 percent. One full bench at load 1.06 scored geomean 1.171605. Pure CSS median was 0.119498 s with spread 0.0190. The quiet pure CSS band is 0.151 s to 0.184 s. The CSS ratio was 1.355. The differential check passed. The suite reported 2082 runs, 6080 assertions, 0 failures, 0 errors, and 104 skips. This does not beat 0.887. The code was reset.
+
 ## Open hypotheses
 
 The furthest median ratios are `parse_xml_small` at 2.796, `css_html_medium` at 1.718, and `parse_xml_large` at 1.610. Small XML does not repeat one child shape, so it stays on the flat scan. That scan spends 13.9 percent in `String#byteindex`, 13.0 percent in `StringScanner#skip`, and 12.3 percent in `flat_read_attrs`.
@@ -246,6 +258,7 @@ The tighter tag loop and packed records did not beat the old bar. Do not repeat 
 
 - Cached local names. See H-001. A same-process xpath loop was about 22 percent faster. The harness pure time stayed inside 0.074 s to 0.085 s.
 - Cached element text. See H-002. The text loop did not move, because each read still allocated a duplicate.
+- Direct flat attribute read. See H-003. Pure CSS fell to 0.119 s. The geomean stayed inside the quiet band.
 
 ## Active campaign
 
