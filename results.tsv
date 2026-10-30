@@ -8,3 +8,4 @@ a0cce8f8	2.248783	keep	default HTML replays recorded pieces; serialize_html 0.31
 b3c36df7	1.347284	keep	HTML parse stores tags as indexes; HTML ratios 1.168 1.509 1.060; CSS 2.189; run geomeans 1.279 1.347
 afb4fe49	1.347284	discard	packed XML records and a tighter tag loop; large about 1.4 times, medium about 1.3 times, small slower; short of 1.181
 5c70ede8	1.178320	keep	repeated XML siblings share one learned shape; XML parse ratios 2.553 1.407 1.851; run geomeans 1.178 1.108 1.177
+a36d4998	1.113009	baseline	quiet rebaseline median of 1.102807 1.113009 1.215554; run 3 started at load 2.54; noise 0.1013; threshold 0.2026
