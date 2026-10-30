@@ -1635,13 +1635,16 @@ module Nokogiri
           @index = 0
           @slash_consumed = false
           @ascii = source.ascii_only?
+          # Character index on a UTF-8 string is not O(1). ASCII uses bytes.
+          # Other text keeps one character array so each step stays O(1).
+          @chars = @ascii ? nil : source.chars
         end
 
         attr_reader :slash_consumed
 
         def eof?
           skip_space
-          @index >= @source.length
+          @index >= limit
         end
 
         def pending?
@@ -1650,9 +1653,13 @@ module Nokogiri
 
         def peek(length = 1)
           skip_space
-          return "" if @index >= @source.length
+          return "" if @index >= limit
 
-          @source[@index, length].to_s
+          if @ascii
+            @source.byteslice(@index, length).to_s
+          else
+            @chars[@index, length].join
+          end
         end
 
         def peek_in?(*tokens)
@@ -1681,7 +1688,7 @@ module Nokogiri
 
         def starts_with?(token)
           unless @ascii
-            return @source[@index, token.length] == token
+            return @chars[@index, token.length].join == token
           end
 
           base = @index
@@ -1715,7 +1722,7 @@ module Nokogiri
             return !name_byte?(next_byte)
           end
 
-          next_char = @source[@index + word.length]
+          next_char = @chars[@index + word.length]
           !(next_char && next_char.match?(/[\p{L}\p{N}_.-]/))
         end
 
@@ -1775,7 +1782,11 @@ module Nokogiri
 
         def double_slash?
           skip_space
-          return false unless @source[@index, 2] == "//"
+          if @ascii
+            return false unless @source.getbyte(@index) == 47 && @source.getbyte(@index + 1) == 47
+          else
+            return false unless @chars[@index] == "/" && @chars[@index + 1] == "/"
+          end
 
           @index += 2
           @slash_consumed = true
@@ -1790,16 +1801,34 @@ module Nokogiri
 
         def string
           skip_space
-          quote = @source[@index]
-          return unless quote == "'" || quote == '"'
+          if @ascii
+            quote = @source.getbyte(@index)
+            return unless quote == 39 || quote == 34
 
-          @index += 1
-          start = @index
-          @index += 1 while @index < @source.length && @source[@index] != quote
-          syntax_error! if @index >= @source.length
+            start = @index + 1
+            index = start
+            byte_limit = @source.bytesize
+            while index < byte_limit && @source.getbyte(index) != quote
+              index += 1
+            end
+            syntax_error! if index >= byte_limit
 
-          value = @source[start...@index]
-          @index += 1
+            value = @source.byteslice(start, index - start)
+          else
+            quote = @chars[@index]
+            return unless quote == "'" || quote == '"'
+
+            start = @index + 1
+            index = start
+            char_limit = @chars.length
+            while index < char_limit && @chars[index] != quote
+              index += 1
+            end
+            syntax_error! if index >= char_limit
+
+            value = @chars[start...index].join
+          end
+          @index = index + 1
           value
         end
 
@@ -1830,23 +1859,45 @@ module Nokogiri
           start = @index
           depth = 1
           quote = nil
-          while depth.positive? && @index < @source.length
-            character = @source[@index]
-            if quote
-              quote = nil if character == quote
-            elsif character == "'" || character == '"'
-              quote = character
-            elsif character == "["
-              depth += 1
-            elsif character == "]"
-              depth -= 1
-              break if depth.zero?
+          if @ascii
+            byte_limit = @source.bytesize
+            while depth.positive? && @index < byte_limit
+              byte = @source.getbyte(@index)
+              if quote
+                quote = nil if byte == quote
+              elsif byte == 39 || byte == 34
+                quote = byte
+              elsif byte == 91
+                depth += 1
+              elsif byte == 93
+                depth -= 1
+                break if depth.zero?
+              end
+              @index += 1
             end
-            @index += 1
-          end
-          syntax_error! unless depth.zero?
+            syntax_error! unless depth.zero?
 
-          body = @source[start...@index]
+            body = @source.byteslice(start, @index - start)
+          else
+            char_limit = @chars.length
+            while depth.positive? && @index < char_limit
+              character = @chars[@index]
+              if quote
+                quote = nil if character == quote
+              elsif character == "'" || character == '"'
+                quote = character
+              elsif character == "["
+                depth += 1
+              elsif character == "]"
+                depth -= 1
+                break if depth.zero?
+              end
+              @index += 1
+            end
+            syntax_error! unless depth.zero?
+
+            body = @chars[start...@index].join
+          end
           @index += 1
           body
         end
@@ -1859,20 +1910,36 @@ module Nokogiri
         private
 
         def skip_space
-          source = @source
-          length = @ascii ? source.bytesize : source.length
           index = @index
-          while index < length
-            ord = @ascii ? source.getbyte(index) : source[index].ord
-            if ord == 32 || ord == 9 || ord == 10 || ord == 13 || ord == 12 || ord == 11
+          if @ascii
+            source = @source
+            length = source.bytesize
+            while index < length
+              ord = source.getbyte(index)
+              break unless ord == 32 || ord == 9 || ord == 10 || ord == 13 || ord == 12 || ord == 11
+
               index += 1
-            elsif !@ascii && ord > 127 && source[index].match?(/\s/)
-              index += 1
-            else
-              break
+            end
+          else
+            chars = @chars
+            length = chars.length
+            while index < length
+              char = chars[index]
+              ord = char.ord
+              if ord == 32 || ord == 9 || ord == 10 || ord == 13 || ord == 12 || ord == 11
+                index += 1
+              elsif ord > 127 && char.match?(/\s/)
+                index += 1
+              else
+                break
+              end
             end
           end
           @index = index
+        end
+
+        def limit
+          @ascii ? @source.bytesize : @chars.length
         end
       end
     end
