@@ -10,3 +10,4 @@ afb4fe49	1.347284	discard	packed XML records and a tighter tag loop; large about
 5c70ede8	1.178320	keep	repeated XML siblings share one learned shape; XML parse ratios 2.553 1.407 1.851; run geomeans 1.178 1.108 1.177
 a36d4998	1.113009	baseline	quiet rebaseline median of 1.102807 1.113009 1.215554; run 3 started at load 2.54; noise 0.1013; threshold 0.2026
 21e402d4	1.113009	discard	cached local names and element text; stacked geomean 1.146655 at load 1.44; text loop flat; short of 0.887
+e34b2e5d	1.113009	discard	flat unprefixed attribute read; pure CSS 0.119 s versus quiet band 0.151 to 0.184; geomean 1.171605; short of 0.887
