@@ -21,11 +21,11 @@ module Nokogiri
         limit = Thread.current[:nokogiri_pure_node_limit]
         Thread.current[:nokogiri_pure_node_limit] = nil if limit
         if handler.nil? && (variables.nil? || variables.empty?)
-          nodes = fast_nodes(context_node, path.to_s, namespaces || {}, limit)
+          nodes = fast_nodes(context_node, path.to_s, namespaces || EMPTY_HASH, limit)
           return XML::NodeSet.new(context_node.document, nodes) unless nodes.nil?
         end
 
-        value = Engine.new(path.to_s, namespaces || {}, variables || {}, handler, node_limit: limit).evaluate(context_node)
+        value = Engine.new(path.to_s, namespaces || EMPTY_HASH, variables || EMPTY_HASH, handler, node_limit: limit).evaluate(context_node)
         document = context_node.document
         case value.type
         when :nodeset
@@ -56,8 +56,23 @@ module Nokogiri
       FAST_QNAME = /\A\/\/(#{FAST_NAME}):(#{FAST_NAME})\z/
       FAST_ONE = /\A(\.\/\/|\/\/)(#{FAST_NAME})\z/
 
+      UNION_LOCAL = /\A\*\[local-name\(\)='([^']*)'\]\z/
+      UNION_BARE = /\A([A-Za-z_][\w.-]*)\z/
+      EMPTY_HASH = {}.freeze
+
       def self.fast_nodes(context, path, namespaces, limit)
+        # child::name and child::a/child::b. // and .// stay on the walks below.
+        if !path.start_with?("/", ".") || (path.start_with?("./") && !path.start_with?(".//"))
+          found = relative_nodes(context, path, limit)
+          return found unless found.nil?
+        end
+
         return nil unless path.start_with?("//", ".//")
+
+        if path.include?(" | ")
+          found = union_names(context, path, limit)
+          return found unless found.nil?
+        end
 
         if (match = FAST_ATTR_CHILD.match(path))
           expected = match[3] || match[4]
@@ -120,6 +135,190 @@ module Nokogiri
         return :missing unless namespaces.key?(prefix)
 
         namespaces[prefix]
+      end
+
+      # Direct children only. A relative "a/b" does not search descendants.
+      # One byte scan. Any other character returns nil so the engine runs.
+      def self.relative_nodes(context, path, limit)
+        bytes = path.bytesize
+        start = 0
+        if bytes >= 2 && path.getbyte(0) == 46 && path.getbyte(1) == 47
+          start = 2
+        end
+
+        slash = nil
+        index = start
+        while index < bytes
+          byte = path.getbyte(index)
+          if byte == 47
+            return nil if slash || index == start
+
+            slash = index
+          elsif !rel_name_byte?(byte)
+            return nil
+          end
+          index += 1
+        end
+
+        if slash
+          child_at = slash + 1
+          return nil if child_at >= bytes
+          return nil unless rel_name_start?(path.getbyte(start)) && rel_name_start?(path.getbyte(child_at))
+
+          return direct_pair(
+            context,
+            path.byteslice(start, slash - start),
+            path.byteslice(child_at, bytes - child_at),
+            limit
+          )
+        end
+
+        return nil if start >= bytes || !rel_name_start?(path.getbyte(start))
+
+        direct_children(context, path.byteslice(start, bytes - start), limit)
+      end
+
+      def self.rel_name_start?(byte)
+        byte.between?(65, 90) || byte.between?(97, 122) || byte == 95
+      end
+
+      def self.rel_name_byte?(byte)
+        rel_name_start?(byte) || byte.between?(48, 57) || byte == 45 || byte == 46
+      end
+
+      def self.direct_children(root, local, limit)
+        state = root.instance_variable_get(:@pure)
+        return [] unless state
+
+        children = state.children
+        return [] if children.empty?
+
+        out = []
+        index = 0
+        length = children.length
+        element = XML::Node::ELEMENT_NODE
+        while index < length
+          child = children[index]
+          index += 1
+          child_state = child.instance_variable_get(:@pure)
+          next unless child_state
+          next unless child_state.type == element
+          next unless child_state.name == local
+          next unless child_state.namespace.nil?
+
+          out << child
+          return out if limit && out.length >= limit
+        end
+        out
+      end
+
+      def self.direct_pair(root, parent_name, child_name, limit)
+        state = root.instance_variable_get(:@pure)
+        return [] unless state
+
+        children = state.children
+        return [] if children.empty?
+
+        out = []
+        index = 0
+        length = children.length
+        element = XML::Node::ELEMENT_NODE
+        while index < length
+          child = children[index]
+          index += 1
+          child_state = child.instance_variable_get(:@pure)
+          next unless child_state
+          next unless child_state.type == element
+          next unless child_state.name == parent_name
+          next unless child_state.namespace.nil?
+
+          kids = child_state.children
+          cursor = 0
+          kid_length = kids.length
+          while cursor < kid_length
+            kid = kids[cursor]
+            cursor += 1
+            kid_state = kid.instance_variable_get(:@pure)
+            next unless kid_state
+            next unless kid_state.type == element
+            next unless kid_state.name == child_name
+            next unless kid_state.namespace.nil?
+
+            out << kid
+            return out if limit && out.length >= limit
+          end
+        end
+        out
+      end
+
+      # "a, span" is a list of //name or //*[local-name()='name'] steps.
+      # One preorder walk keeps document order. nil means this is not that list.
+      def self.union_names(context, path, limit)
+        absolute = path.start_with?("//")
+        prefix = absolute ? "//" : ".//"
+        parts = path.split(" | ")
+        mode = nil
+        names = []
+        index = 0
+        while index < parts.length
+          part = parts[index]
+          index += 1
+          return nil unless part.start_with?(prefix)
+
+          body = part[prefix.length..]
+          if (match = UNION_LOCAL.match(body))
+            return nil if mode == :bare
+
+            mode = :local
+            names << match[1]
+          elsif (match = UNION_BARE.match(body))
+            return nil if mode == :local
+
+            mode = :bare
+            names << match[1]
+          else
+            return nil
+          end
+        end
+        return nil if names.empty?
+
+        union_walk(fast_origin(context, absolute), names, mode == :bare, limit)
+      end
+
+      def self.union_walk(root, names, require_no_ns, limit)
+        want = {}
+        names.each { |name| want[name] = true }
+        state = root.instance_variable_get(:@pure)
+        return [] unless state
+
+        children = state.children
+        return [] if children.empty?
+
+        out = []
+        stack = []
+        index = children.length
+        while index > 0
+          index -= 1
+          stack << children[index]
+        end
+        element = XML::Node::ELEMENT_NODE
+        while (node = stack.pop)
+          child_state = node.instance_variable_get(:@pure)
+          next unless child_state
+
+          named = want[child_state.name]
+          if child_state.type == element && named && (!require_no_ns || child_state.namespace.nil?)
+            out << node
+            return out if limit && out.length >= limit
+          end
+          kids = child_state.children
+          cursor = kids.length
+          while cursor > 0
+            cursor -= 1
+            stack << kids[cursor]
+          end
+        end
+        out
       end
 
       def self.fast_origin(context, absolute)
@@ -789,14 +988,32 @@ module Nokogiri
         # The child step keeps its own position() scope. One context is already in document order.
         CLASS_CONTAINS = /\Acontains\(concat\(' ',normalize-space\(@([^)]+)\),' '\),' ([^']*)'\)\z/
         ATTR_EQUALS = /\A@([A-Za-z_][\w.-]*)=(?:"([^"]*)"|'([^']*)')\z/
+        ATTR_PRESENT = /\A@([A-Za-z_][\w.-]*)\z/
+        # HTML5 CSS emits this so a search ignores namespaces (issue 2376).
+        LOCAL_NAME = /\Alocal-name\(\)\s*=\s*(?:'([^']*)'|"([^"]*)")\z/
+        LOCAL_NAME_BUILTIN = /\Anokogiri-builtin:local-name-is\(\s*(?:'([^']*)'|"([^"]*)")\s*\)\z/
 
         def apply_steps(nodes, steps)
           index = 0
           while index < steps.length
             step = steps[index]
             nxt = steps[index + 1]
-            final = false
-            if descendant_child_pair?(step, nxt)
+            if descendant_child_pair?(step, nxt) && (parent_name = bare_local_name(nxt))
+              grandchild = steps[index + 3]
+              if descendant_child_pair?(steps[index + 2], grandchild) && (child_name = bare_local_name(grandchild))
+                final = index + 4 == steps.length
+                nodes = apply_local_descendant(nodes, parent_name, child_name, limit: final ? @node_limit : nil)
+                index += 4
+              elsif (child_step = steps[index + 2]) && child_step[:axis] == :child && (child_name = bare_local_name(child_step))
+                final = index + 3 == steps.length
+                nodes = apply_local_children(nodes, parent_name, child_name, limit: final ? @node_limit : nil)
+                index += 3
+              else
+                final = index + 2 == steps.length
+                nodes = apply_descendant_child(nodes, nxt, limit: final ? @node_limit : nil)
+                index += 2
+              end
+            elsif descendant_child_pair?(step, nxt)
               final = index + 2 == steps.length
               nodes = apply_descendant_child(nodes, nxt, limit: final ? @node_limit : nil)
               index += 2
@@ -816,6 +1033,14 @@ module Nokogiri
             step[:test][:kind] == :node &&
             step[:predicates].empty? &&
             nxt[:axis] == :child
+        end
+
+        # A lone local-name() predicate. Extra class or attribute tests stay on the other walk.
+        def bare_local_name(step)
+          return unless step
+          return unless step[:predicates].length == 1
+
+          local_name_step(step)
         end
 
         def apply_descendant_child(nodes, step, limit: nil)
@@ -838,6 +1063,16 @@ module Nokogiri
           test = step[:test]
           if step[:predicates].empty? && test[:kind] == :name && test[:prefix].nil?
             gather_named_iter(node, test[:local], out, limit)
+            return
+          end
+
+          if (local = local_name_step(step))
+            gather_local_iter(node, local, step[:predicates], out, limit)
+            return
+          end
+
+          if (predicates = star_filter_step(step))
+            gather_filtered_iter(node, predicates, out, limit)
             return
           end
 
@@ -887,6 +1122,66 @@ module Nokogiri
           end
         end
 
+        # * [local-name()='div'] is the HTML5 CSS shape. The name test is a
+        # wildcard, so the normal name walk never runs.
+        def local_name_step(step)
+          predicates = step[:predicates]
+          return if predicates.empty?
+
+          first = predicates[0]
+          return unless first.is_a?(Hash) && first[:kind] == :local
+
+          test = step[:test]
+          starred = test[:kind] == :star || (test[:kind] == :name && test[:prefix].nil? && test[:local] == "*")
+          return unless starred
+
+          index = 1
+          while index < predicates.length
+            return unless simple_pred?(predicates[index])
+
+            index += 1
+          end
+          first[:name]
+        end
+
+        # *[@id='x'] and *.[class] have no local-name() test. One walk still applies.
+        def star_filter_step(step)
+          test = step[:test]
+          starred = test[:kind] == :star || (test[:kind] == :name && test[:prefix].nil? && test[:local] == "*")
+          return unless starred
+
+          predicates = step[:predicates]
+          return if predicates.empty?
+
+          index = 0
+          while index < predicates.length
+            return unless simple_pred?(predicates[index])
+
+            index += 1
+          end
+          predicates
+        end
+
+        def simple_pred?(item)
+          return false unless item.is_a?(Hash)
+
+          kind = item[:kind]
+          return true if kind == :class || kind == :attr || kind == :has_attr
+          return false unless kind == :all
+
+          parts = item[:parts]
+          index = 0
+          while index < parts.length
+            part = parts[index]
+            index += 1
+            return false unless part.is_a?(Hash)
+
+            part_kind = part[:kind]
+            return false unless part_kind == :class || part_kind == :attr || part_kind == :has_attr
+          end
+          true
+        end
+
         # Preorder walk. One context emits matches in document order.
         def gather_named_iter(root, local, out, limit)
           state = root.instance_variable_get(:@pure)
@@ -909,6 +1204,194 @@ module Nokogiri
             if child_state.type == element && child_state.name == local && child_state.namespace.nil?
               out << node
               return if limit && out.length >= limit
+            end
+            kids = child_state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor]
+            end
+          end
+        end
+
+        # Same walk as gather_named_iter, but a namespace does not reject the element.
+        def gather_local_iter(root, local, predicates, out, limit)
+          gather_matching(root, local, predicates, 1, out, limit)
+        end
+
+        def gather_filtered_iter(root, predicates, out, limit)
+          gather_matching(root, nil, predicates, 0, out, limit)
+        end
+
+        def gather_matching(root, local, predicates, pred_start, out, limit)
+          state = root.instance_variable_get(:@pure)
+          return unless state
+
+          children = state.children
+          return if children.empty?
+
+          check_preds = pred_start < predicates.length
+          stack = []
+          index = children.length
+          while index > 0
+            index -= 1
+            stack << children[index]
+          end
+          element = XML::Node::ELEMENT_NODE
+          while (node = stack.pop)
+            child_state = node.instance_variable_get(:@pure)
+            next unless child_state
+
+            if child_state.type == element && (local.nil? || child_state.name == local)
+              if !check_preds || hash_predicates_match?(node, predicates, pred_start)
+                out << node
+                return if limit && out.length >= limit
+              end
+            end
+            kids = child_state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor]
+            end
+          end
+        end
+
+        def hash_predicates_match?(node, predicates, start)
+          index = start
+          while index < predicates.length
+            return false unless one_predicate_match?(node, predicates[index])
+
+            index += 1
+          end
+          true
+        end
+
+        def one_predicate_match?(node, source)
+          case source[:kind]
+          when :class
+            attribute_class?(node, source[:name], source[:needle])
+          when :attr
+            attribute_equals?(node, source[:name], source[:expected])
+          when :has_attr
+            attribute_present?(node, source[:name])
+          when :local
+            state = node.instance_variable_get(:@pure)
+            state&.name == source[:name]
+          when :all
+            parts = source[:parts]
+            index = 0
+            while index < parts.length
+              return false unless one_predicate_match?(node, parts[index])
+
+              index += 1
+            end
+            true
+          else
+            false
+          end
+        end
+
+        # //div//p in one preorder walk. local-name() does not reject a namespace.
+        def apply_local_descendant(nodes, parent_name, child_name, limit: nil)
+          list = []
+          if nodes.length == 1
+            gather_local_descendant(nodes[0], parent_name, child_name, list, limit)
+            return list
+          end
+
+          nodes.each do |node|
+            gather_local_descendant(node, parent_name, child_name, list, limit)
+            break if limit && list.length >= limit
+          end
+          return list if list.length < 2
+
+          dedup(list)
+        end
+
+        def gather_local_descendant(root, parent_name, child_name, out, limit)
+          state = root.instance_variable_get(:@pure)
+          return unless state
+
+          children = state.children
+          return if children.empty?
+
+          stack = []
+          levels = []
+          index = children.length
+          while index > 0
+            index -= 1
+            stack << children[index]
+            levels << 0
+          end
+          element = XML::Node::ELEMENT_NODE
+          while (node = stack.pop)
+            under = levels.pop
+            child_state = node.instance_variable_get(:@pure)
+            next unless child_state
+
+            now = under
+            if child_state.type == element
+              if under > 0 && child_state.name == child_name
+                out << node
+                return if limit && out.length >= limit
+              end
+              now += 1 if child_state.name == parent_name
+            end
+            kids = child_state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor]
+              levels << now
+            end
+          end
+        end
+
+        # //div/p. The context node is not a parent. .//div/p must not use it.
+        def apply_local_children(nodes, parent_name, child_name, limit: nil)
+          list = []
+          if nodes.length == 1
+            gather_local_children(nodes[0], parent_name, child_name, list, limit)
+            return list
+          end
+
+          nodes.each do |node|
+            gather_local_children(node, parent_name, child_name, list, limit)
+            break if limit && list.length >= limit
+          end
+          return list if list.length < 2
+
+          dedup(list)
+        end
+
+        def gather_local_children(root, parent_name, child_name, out, limit)
+          state = root.instance_variable_get(:@pure)
+          return unless state
+
+          children = state.children
+          return if children.empty?
+
+          stack = []
+          index = children.length
+          while index > 0
+            index -= 1
+            stack << children[index]
+          end
+          element = XML::Node::ELEMENT_NODE
+          while (node = stack.pop)
+            child_state = node.instance_variable_get(:@pure)
+            next unless child_state
+
+            if child_state.type == element && child_state.name == child_name
+              parent = child_state.parent
+              if parent && !parent.equal?(root)
+                parent_state = parent.instance_variable_get(:@pure)
+                if parent_state&.type == element && parent_state.name == parent_name
+                  out << node
+                  return if limit && out.length >= limit
+                end
+              end
             end
             kids = child_state.children
             cursor = kids.length
@@ -946,49 +1429,97 @@ module Nokogiri
         # Compile a predicate once per step. The walk used to match these patterns
         # again for every parent node.
         def compile_predicate(source)
+          parts = and_parts(source)
+          if parts.length > 1
+            compiled = parts.map { |part| compile_simple(part) }
+            return {kind: :all, parts: compiled} if compiled.all? { |item| item.is_a?(Hash) }
+          end
+          compile_simple(source)
+        end
+
+        # Split on XPath "and" outside quotes. A failed split keeps the original text.
+        def and_parts(source)
+          return [source] unless source.include?(" and ")
+
+          parts = []
+          buffer = +""
+          quote = nil
+          index = 0
+          length = source.length
+          while index < length
+            char = source[index]
+            if quote
+              buffer << char
+              quote = nil if char == quote
+              index += 1
+              next
+            end
+            if char == "'" || char == '"'
+              quote = char
+              buffer << char
+              index += 1
+              next
+            end
+            if source[index, 5] == " and "
+              parts << buffer
+              buffer = +""
+              index += 5
+              next
+            end
+            buffer << char
+            index += 1
+          end
+          return [source] if quote
+
+          parts << buffer
+          parts
+        end
+
+        def compile_simple(source)
           if (match = CLASS_CONTAINS.match(source))
             name = match[1]
-            inner = match[2]
-            if !name.include?(":") && inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
-              needle = inner[1..-2]
-              return {kind: :class, name: name, needle: needle} unless needle.include?(" ")
+            # The pattern consumes the leading blank, so the capture keeps only the trailing one.
+            needle = match[2].to_s.strip
+            if !name.include?(":") && !needle.empty? && !needle.include?(" ")
+              return {kind: :class, name: name, needle: needle}
             end
           elsif (match = ATTR_EQUALS.match(source))
             name = match[1]
             unless name.include?(":")
               return {kind: :attr, name: name, expected: match[2] || match[3]}
             end
+          elsif (match = ATTR_PRESENT.match(source))
+            name = match[1]
+            unless name.include?(":")
+              return {kind: :has_attr, name: name}
+            end
+          elsif (match = LOCAL_NAME.match(source) || LOCAL_NAME_BUILTIN.match(source))
+            return {kind: :local, name: match[1] || match[2]}
           end
           source
         end
 
         def filter_predicate(nodes, source)
           if source.is_a?(Hash)
-            if source[:kind] == :class
-              name = source[:name]
-              needle = source[:needle]
-              return nodes.select { |node| attribute_class?(node, name, needle) }
-            end
-
-            name = source[:name]
-            expected = source[:expected]
-            return nodes.select { |node| attribute_equals?(node, name, expected) }
+            return nodes.select { |node| one_predicate_match?(node, source) }
           end
 
           if (match = CLASS_CONTAINS.match(source))
             name = match[1]
-            inner = match[2]
-            if !name.include?(":") && inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
-              needle = inner[1..-2]
-              unless needle.include?(" ")
-                return nodes.select { |node| attribute_class?(node, name, needle) }
-              end
+            needle = match[2].to_s.strip
+            if !name.include?(":") && !needle.empty? && !needle.include?(" ")
+              return nodes.select { |node| attribute_class?(node, name, needle) }
             end
           elsif (match = ATTR_EQUALS.match(source))
             name = match[1]
             unless name.include?(":")
               expected = match[2] || match[3]
               return nodes.select { |node| attribute_equals?(node, name, expected) }
+            end
+          elsif (match = ATTR_PRESENT.match(source))
+            name = match[1]
+            unless name.include?(":")
+              return nodes.select { |node| attribute_present?(node, name) }
             end
           end
 
@@ -1011,6 +1542,17 @@ module Nokogiri
         def attribute_equals?(node, name, expected)
           value = attribute_value(node, name) || ""
           value == expected
+        end
+
+        def attribute_present?(node, name)
+          state = node.instance_variable_get(:@pure)
+          return false unless state
+
+          state.attributes.each do |attr|
+            attr_state = attr.instance_variable_get(:@pure)
+            return true if attr_state&.name == name && attr_state.namespace.nil?
+          end
+          false
         end
 
         def attribute_value(node, name)
@@ -1593,19 +2135,24 @@ module Nokogiri
 
           index = {}
           counter = 0
-          walk = lambda do |node|
+          stack = [root]
+          while (node = stack.pop)
             counter += 1
             index[node.object_id] = counter
             state = node.instance_variable_get(:@pure)
-            return unless state
+            next unless state
 
             state.attributes.each do |attr|
               counter += 1
               index[attr.object_id] = counter
             end
-            state.children.each { |child| walk.call(child) }
+            children = state.children
+            cursor = children.length
+            while cursor > 0
+              cursor -= 1
+              stack << children[cursor]
+            end
           end
-          walk.call(root)
           @stamp_root = root
           @stamp_index = index
         end

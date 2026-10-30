@@ -1,4 +1,3 @@
-# coding: utf-8
 # frozen_string_literal: true
 
 module Nokogiri
@@ -21,9 +20,31 @@ module Nokogiri
       # Create a NodeSet with +document+ defaulting to +list+
       def initialize(document, list = [])
         @document = document
-        document.decorate(self)
-        list.each { |x| self << x }
-        yield self if block_given?
+        if document.instance_variable_get(:@decorators) || block_given?
+          document.decorate(self)
+          list.each { |node| self << node }
+          yield self if block_given?
+          return
+        end
+
+        unless list.is_a?(Array)
+          list.each { |node| self << node }
+          return
+        end
+
+        length = list.length
+        members = Array.new(length)
+        index = 0
+        while index < length
+          node = list[index]
+          if !node.is_a?(XML::Node) && !node.is_a?(XML::Namespace)
+            raise ArgumentError, "node must be a Nokogiri::XML::Node or Nokogiri::XML::Namespace"
+          end
+
+          members[index] = node
+          index += 1
+        end
+        @members = members
       end
 
       ###
@@ -99,7 +120,7 @@ module Nokogiri
       #
       # For more information see Nokogiri::XML::Searchable#xpath
       def xpath(*args)
-        paths, handler, ns, binds = extract_params(args)
+        paths, handler, ns, binds = extract_params(args, resolve_namespaces: false)
 
         inject(NodeSet.new(document)) do |set, node|
           set + xpath_internal(node, paths, handler, ns, binds)
@@ -207,7 +228,7 @@ module Nokogiri
           return first&.attribute(key)
         end
 
-        hash = key.is_a?(Hash) ? key : { key => value }
+        hash = key.is_a?(Hash) ? key : {key => value}
 
         hash.each do |k, v|
           each do |node|

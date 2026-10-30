@@ -15,6 +15,24 @@ module Nokogiri
         end
         string
       end
+
+      # xml/node.rb loads after pure/dom.rb. Build the hash from the attribute
+      # list. The NodeSet wrapper is only needed for #attribute_nodes.
+      def attributes
+        list = pure.attributes
+        hash = {}
+        doc = document
+        decorators = doc&.instance_variable_get(:@decorators)
+        index = 0
+        length = list.length
+        while index < length
+          attr = list[index]
+          doc.decorate(attr) if decorators
+          hash[attr.node_name] = attr
+          index += 1
+        end
+        hash
+      end
     end
   end
 end

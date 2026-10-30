@@ -664,7 +664,12 @@ module Nokogiri
         style script xmp iframe noembed noframes plaintext noscript
       ].freeze
       HTML5_NEWLINE_TAGS = %w[pre textarea listing].freeze
-      private_constant :HTML5_VOID_TAGS, :HTML5_RAW_TEXT_TAGS, :HTML5_NEWLINE_TAGS
+      HTML5_TEXT_ESCAPE = /[&<>\u00A0]/
+      HTML5_ATTR_ESCAPE = /[&"\u00A0]/
+      HTML5_TEXT_ESCAPE_MAP = {"&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\u00A0" => "&nbsp;"}.freeze
+      HTML5_ATTR_ESCAPE_MAP = {"&" => "&amp;", '"' => "&quot;", "\u00A0" => "&nbsp;"}.freeze
+      private_constant :HTML5_VOID_TAGS, :HTML5_RAW_TEXT_TAGS, :HTML5_NEWLINE_TAGS,
+        :HTML5_TEXT_ESCAPE, :HTML5_ATTR_ESCAPE, :HTML5_TEXT_ESCAPE_MAP, :HTML5_ATTR_ESCAPE_MAP
 
       def prepend_newline?
         return false unless element?
@@ -682,46 +687,127 @@ module Nokogiri
       end
 
       def append_html5(buffer, preserve_newline)
-        case node_type
-        when ELEMENT_NODE
-          buffer << "<"
-          append_html5_tag_name(buffer)
-          pure.attributes.each do |attr|
-            buffer << " "
-            attr.append_html5(buffer, preserve_newline)
-          end
-          buffer << ">"
-          return if html5_void_element?
+        stack = [self, false]
+        until stack.empty?
+          leaving = stack.pop
+          node = stack.pop
+          state = node.instance_variable_get(:@pure)
+          next unless state
 
-          buffer << "\n" if preserve_newline && prepend_newline?
-          pure.children.each { |child| child.append_html5(buffer, preserve_newline) }
-          buffer << "</"
-          append_html5_tag_name(buffer)
-          buffer << ">"
-        when ATTRIBUTE_NODE
-          append_html5_attr_name(buffer)
-          buffer << "=\""
-          append_html5_escaped(buffer, content.to_s, true)
-          buffer << "\""
-        when TEXT_NODE
-          if parent&.send(:html5_raw_text_element?)
-            buffer << content.to_s
-          else
-            append_html5_escaped(buffer, content.to_s, false)
+          if leaving
+            buffer << "</"
+            append_html5_state_name(buffer, node, state)
+            buffer << ">"
+            next
           end
-        when CDATA_SECTION_NODE
-          buffer << "<![CDATA[" << content.to_s << "]]>"
-        when COMMENT_NODE
-          buffer << "<!--" << content.to_s << "-->"
-        when PI_NODE
-          buffer << "<?" << content.to_s << ">"
-        when DTD_NODE
-          buffer << "<!DOCTYPE " << name.to_s << ">"
-        when DOCUMENT_NODE, DOCUMENT_FRAG_NODE, HTML_DOCUMENT_NODE
-          pure.children.each { |child| child.append_html5(buffer, preserve_newline) }
-        else
-          raise "Unsupported document node (#{node_type}); this is a bug in Nokogiri"
+
+          case state.type
+          when ELEMENT_NODE
+            buffer << "<"
+            append_html5_state_name(buffer, node, state)
+            append_html5_state_attrs(buffer, state)
+            buffer << ">"
+            next if html5_state_listed?(state, HTML5_VOID_TAGS)
+
+            buffer << "\n" if preserve_newline && html5_state_newline?(state)
+            stack << node << true
+            kids = state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor] << false
+            end
+          when ATTRIBUTE_NODE
+            append_html5_state_attr(buffer, node, state)
+          when TEXT_NODE
+            append_html5_state_text(buffer, node, state)
+          when CDATA_SECTION_NODE
+            node.instance_variable_set(:@xslt_observed, true)
+            buffer << "<![CDATA[" << state.content.to_s << "]]>"
+          when COMMENT_NODE
+            buffer << "<!--" << state.content.to_s << "-->"
+          when PI_NODE
+            buffer << "<?" << state.content.to_s << ">"
+          when DTD_NODE
+            buffer << "<!DOCTYPE " << state.name.to_s << ">"
+          when DOCUMENT_NODE, DOCUMENT_FRAG_NODE, HTML_DOCUMENT_NODE
+            kids = state.children
+            cursor = kids.length
+            while cursor > 0
+              cursor -= 1
+              stack << kids[cursor] << false
+            end
+          else
+            raise "Unsupported document node (#{state.type}); this is a bug in Nokogiri"
+          end
         end
+      end
+
+      def append_html5_state_name(buffer, node, state)
+        if state.namespace.nil?
+          buffer << state.name.to_s
+        else
+          node.send(:append_html5_tag_name, buffer)
+        end
+      end
+
+      def append_html5_state_attrs(buffer, state)
+        attrs = state.attributes
+        index = 0
+        while index < attrs.length
+          attr = attrs[index]
+          index += 1
+          buffer << " "
+          attr_state = attr.instance_variable_get(:@pure)
+          next unless attr_state
+
+          if attr_state.namespace.nil?
+            buffer << attr_state.name.to_s
+          else
+            attr.send(:append_html5_attr_name, buffer)
+          end
+          buffer << "=\""
+          append_html5_escaped(buffer, attr_state.content.to_s, true)
+          buffer << "\""
+        end
+      end
+
+      def append_html5_state_attr(buffer, node, state)
+        if state.namespace.nil?
+          buffer << state.name.to_s
+        else
+          node.send(:append_html5_attr_name, buffer)
+        end
+        buffer << "=\""
+        append_html5_escaped(buffer, state.content.to_s, true)
+        buffer << "\""
+      end
+
+      def append_html5_state_text(buffer, node, state)
+        node.instance_variable_set(:@xslt_observed, true)
+        text = state.content.to_s
+        parent = state.parent
+        parent_state = parent&.instance_variable_get(:@pure)
+        if parent_state && html5_state_listed?(parent_state, HTML5_RAW_TEXT_TAGS)
+          buffer << text
+        else
+          append_html5_escaped(buffer, text, false)
+        end
+      end
+
+      def html5_state_listed?(state, names)
+        state.type == ELEMENT_NODE && state.namespace.nil? && names.include?(state.name)
+      end
+
+      def html5_state_newline?(state)
+        return false unless html5_state_listed?(state, HTML5_NEWLINE_TAGS)
+
+        child = state.children.first
+        child_state = child&.instance_variable_get(:@pure)
+        return false unless child_state&.type == TEXT_NODE
+
+        child.instance_variable_set(:@xslt_observed, true)
+        child_state.content.to_s.start_with?("\n")
       end
 
       def append_html5_tag_name(buffer)
@@ -737,7 +823,8 @@ module Nokogiri
         end
         buffer << tag
       end
-      private :append_html5_tag_name
+      private :append_html5_tag_name, :append_html5_state_name, :append_html5_state_attrs,
+        :append_html5_state_attr, :append_html5_state_text, :html5_state_listed?, :html5_state_newline?
 
       def append_html5_attr_name(buffer)
         ns = namespace
@@ -766,21 +853,14 @@ module Nokogiri
       private :append_html5_attr_name
 
       def append_html5_escaped(buffer, text, attribute)
-        text.each_char do |char|
-          buffer << if char == "&"
-            "&amp;"
-          elsif char == "\u00A0"
-            "&nbsp;"
-          elsif attribute && char == '"'
-            "&quot;"
-          elsif !attribute && char == "<"
-            "&lt;"
-          elsif !attribute && char == ">"
-            "&gt;"
-          else
-            char
-          end
+        pattern = attribute ? HTML5_ATTR_ESCAPE : HTML5_TEXT_ESCAPE
+        unless text.match?(pattern)
+          buffer << text
+          return
         end
+
+        map = attribute ? HTML5_ATTR_ESCAPE_MAP : HTML5_TEXT_ESCAPE_MAP
+        buffer << text.gsub(pattern, map)
       end
       private :append_html5_escaped
 

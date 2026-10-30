@@ -1,4 +1,3 @@
-# coding: utf-8
 # frozen_string_literal: true
 
 module Nokogiri
@@ -186,7 +185,7 @@ module Nokogiri
       #   node.xpath('.//title[nokogiri:regex(., "\w+")]', handler)
       #
       def xpath(*args)
-        paths, handler, ns, binds = extract_params(args)
+        paths, handler, ns, binds = extract_params(args, resolve_namespaces: false)
 
         xpath_internal(self, paths, handler, ns, binds)
       end
@@ -220,7 +219,7 @@ module Nokogiri
 
       private
 
-      def extract_params(params) # :nodoc:
+      def extract_params(params, resolve_namespaces: true) # :nodoc:
         handler = params.find do |param|
           ![Hash, String, Symbol].include?(param.class)
         end
@@ -233,9 +232,15 @@ module Nokogiri
         end
         ns, binds = hashes.reverse
 
-        ns ||= document.root&.namespaces || {}
+        ns = default_namespaces if ns.nil? && resolve_namespaces
 
         [params, handler, ns, binds]
+      end
+
+      # Namespace hash xpath and css use when the caller did not pass one.
+      # A fragment can replace this. xpath skips it until the path needs it.
+      def default_namespaces
+        document.root&.namespaces || {}
       end
 
       def css_internal(node, rules, handler, ns)
@@ -252,7 +257,7 @@ module Nokogiri
             builtins: Nokogiri::CSS::XPathVisitor::BuiltinsConfig::OPTIMAL,
             doctype: document.xpath_doctype,
             prefix: implied_xpath_context,
-            namespaces: ns,
+            namespaces: ns
           )
           CSS.xpath_for(rule.to_s, visitor: visitor)
         end.join(" | ")
@@ -274,6 +279,16 @@ module Nokogiri
       end
 
       def xpath_impl(node, path, handler, ns, binds)
+        # Unprefixed paths do not use the namespace hash. Skip the context
+        # object and the root namespace walk on the pure backend.
+        if defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY && handler.nil? && (binds.nil? || binds.empty?)
+          query = path.is_a?(String) ? path : path.to_s
+          unless query.include?(":")
+            return Nokogiri::Pure::XPath.evaluate(node, query, Nokogiri::Pure::XPath::EMPTY_HASH, nil, nil)
+          end
+        end
+
+        ns = default_namespaces if ns.nil?
         context = XPathContext.new(node)
         context.register_namespaces(ns)
         context.register_variables(binds)

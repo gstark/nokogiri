@@ -1,4 +1,3 @@
-# coding: utf-8
 # frozen_string_literal: true
 
 #
@@ -172,27 +171,11 @@ module Nokogiri
         XML::Node.instance_method(:serialize).bind_call(self, options, &block)
       end
 
-      def extract_params(params) # :nodoc:
-        handler = params.find do |param|
-          ![Hash, String, Symbol].include?(param.class)
-        end
-        params -= [handler] if handler
-
-        hashes = []
-        while Hash === params.last || params.last.nil?
-          hashes << params.pop
-          break if params.empty?
-        end
-        ns, binds = hashes.reverse
-
-        ns ||=
-          begin
-            ns = {}
-            children.each { |child| ns.merge!(child.namespaces) }
-            ns
-          end
-
-        [params, handler, ns, binds]
+      # In-scope namespaces live on the fragment children, not on the root.
+      def default_namespaces
+        ns = {}
+        children.each { |child| ns.merge!(child.namespaces) }
+        ns
       end
     end
   end
