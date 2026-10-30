@@ -6,6 +6,7 @@
 use crate::fill::{self, Bytes, Doc, Prefix};
 use crate::html5::model::{NodeKind, NodeRef, Ns};
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::sync::OnceLock;
 
 type Value = usize;
@@ -13,21 +14,24 @@ type Value = usize;
 const QNIL: Value = 0x04;
 const QTRUE: Value = 0x14;
 
-struct GcGuard {
-    was_disabled: bool,
+struct RubyFrame {
+    restore_gc: bool,
+    jump: c_int,
 }
 
-impl GcGuard {
-    unsafe fn new() -> Self {
-        Self { was_disabled: rb_gc_disable() == QTRUE }
-    }
+struct Jump {
+    state: c_int,
+    clear: bool,
 }
 
-impl Drop for GcGuard {
-    fn drop(&mut self) {
-        if !self.was_disabled {
-            unsafe { rb_gc_enable() };
-        }
+/// Disable GC until `protect_ruby` returns.
+///
+/// A Ruby exception is a longjmp. `Drop` does not run. The enable call stays
+/// in the frame that survives `rb_protect`.
+unsafe fn pause_gc(frame: &mut RubyFrame) {
+    let was_disabled = rb_gc_disable() == QTRUE;
+    if !was_disabled {
+        frame.restore_gc = true;
     }
 }
 
@@ -55,6 +59,130 @@ extern "C" {
     fn rb_class_new_instance(argc: i32, argv: *const Value, klass: Value) -> Value;
     fn rb_str_plus(left: Value, right: Value) -> Value;
     fn rb_path2class(path: *const i8) -> Value;
+    fn rb_protect(func: extern "C" fn(Value) -> Value, arg: Value, state: *mut c_int) -> Value;
+    fn rb_jump_tag(state: c_int) -> !;
+}
+
+struct Protect<F> {
+    work: Option<F>,
+    frame: RubyFrame,
+}
+
+extern "C" fn protect_thunk<F>(arg: Value) -> Value
+where
+    F: FnOnce(&mut RubyFrame) -> Value,
+{
+    let pack = unsafe { &mut *(arg as *mut Protect<F>) };
+    let Some(work) = pack.work.take() else {
+        return QNIL;
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut pack.frame))) {
+        Ok(value) => value,
+        Err(_) => QNIL,
+    }
+}
+
+unsafe fn protect_ruby<F>(work: F) -> Value
+where
+    F: FnOnce(&mut RubyFrame) -> Value,
+{
+    let mut pack = Protect {
+        work: Some(work),
+        frame: RubyFrame { restore_gc: false, jump: 0 },
+    };
+    let mut state = 0;
+    let value = rb_protect(protect_thunk::<F>, &mut pack as *mut Protect<F> as Value, &mut state);
+    if pack.frame.restore_gc {
+        rb_gc_enable();
+    }
+    if state != 0 {
+        rb_jump_tag(state);
+    }
+    if pack.frame.jump != 0 {
+        rb_jump_tag(pack.frame.jump);
+    }
+    value
+}
+
+struct CallArg {
+    recv: Value,
+    mid: usize,
+    argc: i32,
+    argv: *const Value,
+}
+
+extern "C" fn call_body(arg: Value) -> Value {
+    let call = unsafe { &*(arg as *const CallArg) };
+    unsafe { rb_funcallv(call.recv, call.mid, call.argc, call.argv) }
+}
+
+unsafe fn funcall(recv: Value, mid: usize, argc: i32, argv: *const Value) -> Result<Value, c_int> {
+    let call = CallArg { recv, mid, argc, argv };
+    let mut state = 0;
+    let value = rb_protect(call_body, &call as *const CallArg as Value, &mut state);
+    if state != 0 { Err(state) } else { Ok(value) }
+}
+
+extern "C" fn path_body(arg: Value) -> Value {
+    unsafe { rb_path2class(arg as *const i8) }
+}
+
+unsafe fn path2class(path: *const i8) -> Result<Value, c_int> {
+    let mut state = 0;
+    let value = rb_protect(path_body, path as Value, &mut state);
+    if state != 0 { Err(state) } else { Ok(value) }
+}
+
+struct ConstArg {
+    klass: Value,
+    id: usize,
+}
+
+extern "C" fn const_body(arg: Value) -> Value {
+    let arg = unsafe { &*(arg as *const ConstArg) };
+    unsafe { rb_const_get(arg.klass, arg.id) }
+}
+
+unsafe fn const_get(klass: Value, id: usize) -> Result<Value, c_int> {
+    let arg = ConstArg { klass, id };
+    let mut state = 0;
+    let value = rb_protect(const_body, &arg as *const ConstArg as Value, &mut state);
+    if state != 0 { Err(state) } else { Ok(value) }
+}
+
+struct NewArg {
+    argc: i32,
+    argv: *const Value,
+    klass: Value,
+}
+
+extern "C" fn new_body(arg: Value) -> Value {
+    let arg = unsafe { &*(arg as *const NewArg) };
+    unsafe { rb_class_new_instance(arg.argc, arg.argv, arg.klass) }
+}
+
+unsafe fn class_new(argc: i32, argv: *const Value, klass: Value) -> Result<Value, c_int> {
+    let arg = NewArg { argc, argv, klass };
+    let mut state = 0;
+    let value = rb_protect(new_body, &arg as *const NewArg as Value, &mut state);
+    if state != 0 { Err(state) } else { Ok(value) }
+}
+
+struct StrArg {
+    slot: Value,
+    ptr: *mut i8,
+}
+
+extern "C" fn str_body(arg: Value) -> Value {
+    let arg = unsafe { &mut *(arg as *mut StrArg) };
+    arg.ptr = unsafe { rb_string_value_ptr(&mut arg.slot) };
+    QNIL
+}
+
+unsafe fn str_ptr(arg: &mut StrArg) -> Result<(), c_int> {
+    let mut state = 0;
+    rb_protect(str_body, arg as *mut StrArg as Value, &mut state);
+    if state != 0 { Err(state) } else { Ok(()) }
 }
 
 #[no_mangle]
@@ -71,41 +199,38 @@ pub extern "C" fn Init_nokogiri_rust_flat() {
 }
 
 extern "C" fn columns(_module: Value, string: Value, origin: Value) -> Value {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        columns_inner(string, origin)
-    }));
-    match result {
-        Ok(value) => value,
-        Err(_) => QNIL,
+    unsafe {
+        protect_ruby(|frame| {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                columns_inner(string, origin, frame)
+            }));
+            match caught {
+                Ok(Ok(value)) => value,
+                Ok(Err(state)) => {
+                    frame.jump = state;
+                    QNIL
+                }
+                Err(_) => QNIL,
+            }
+        })
     }
 }
 
-unsafe fn columns_inner(string: Value, origin: Value) -> Value {
+unsafe fn columns_inner(string: Value, origin: Value, frame: &mut RubyFrame) -> Result<Value, c_int> {
     let Some(origin) = fix_to_usize(origin) else {
-        return QNIL;
+        return Ok(QNIL);
     };
-    let len_val = rb_funcallv(string, rb_intern(c"bytesize".as_ptr()), 0, std::ptr::null());
-    let Some(len) = fix_to_usize(len_val) else {
-        return QNIL;
+    let Some(bytes) = ruby_bytes(string)? else {
+        return Ok(QNIL);
     };
-    if origin > len {
-        return QNIL;
+    if origin > bytes.len() {
+        return Ok(QNIL);
     }
-    let mut slot = string;
-    let ptr = rb_string_value_ptr(&mut slot);
-    if ptr.is_null() && len > 0 {
-        return QNIL;
-    }
-    let bytes = if len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
-    };
     let Some(doc) = fill::parse(&bytes, origin) else {
-        return QNIL;
+        return Ok(QNIL);
     };
-    let _gc = GcGuard::new();
-    materialize(string, &bytes, &doc)
+    pause_gc(frame);
+    Ok(materialize(string, &bytes, &doc))
 }
 
 unsafe fn materialize(string: Value, source: &[u8], doc: &Doc) -> Value {
@@ -279,37 +404,57 @@ fn fix_to_i64(value: Value) -> Option<i64> {
 const QFALSE: Value = 0;
 
 extern "C" fn html_tree(_module: Value, string: Value, options: Value, parent: Value) -> Value {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        html_tree_inner(string, options, parent)
-    }));
-    match result {
-        Ok(value) => value,
-        Err(_) => {
-            if parent != QNIL {
-                unsafe { clear_children(parent) };
+    unsafe {
+        protect_ruby(|frame| {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                html_tree_inner(string, options, parent, frame)
+            }));
+            match caught {
+                Ok(Ok(value)) => value,
+                Ok(Err(jump)) => {
+                    if jump.clear && parent != QNIL {
+                        clear_children(parent);
+                    }
+                    frame.jump = jump.state;
+                    QNIL
+                }
+                Err(_) => {
+                    if parent != QNIL {
+                        clear_children(parent);
+                    }
+                    QNIL
+                }
             }
-            QNIL
-        }
+        })
     }
 }
 
-unsafe fn html_tree_inner(string: Value, options: Value, parent: Value) -> Value {
-    let Some(packed) = read_html_options(options) else {
-        return QNIL;
+unsafe fn html_tree_inner(
+    string: Value,
+    options: Value,
+    parent: Value,
+    frame: &mut RubyFrame,
+) -> Result<Value, Jump> {
+    let Some(packed) = read_html_options(options).map_err(|state| Jump { state, clear: false })?
+    else {
+        return Ok(QNIL);
     };
-    let bytes = ruby_bytes(string);
+    let Some(bytes) = ruby_bytes(string).map_err(|state| Jump { state, clear: false })? else {
+        return Ok(QNIL);
+    };
     let text = String::from_utf8_lossy(&bytes);
     let output = crate::html5::parse(text.as_ref(), &packed);
-    let _guard = GcGuard::new();
+    pause_gc(frame);
     let keys = HtmlKeys::new();
     if parent != QNIL {
-        if output.status == crate::html5::Status::Ok
-            && attach_output(parent, &output, packed.fragment_context.is_some())
-        {
-            return summary_hash(&keys, &output, true);
-        }
-        if output.status != crate::html5::Status::Ok {
-            return summary_hash(&keys, &output, false);
+        if output.status == crate::html5::Status::Ok {
+            match attach_output(parent, &output, packed.fragment_context.is_some()) {
+                Ok(true) => return Ok(summary_hash(&keys, &output, true)),
+                Ok(false) => {}
+                Err(jump) => return Err(jump),
+            }
+        } else {
+            return Ok(summary_hash(&keys, &output, false));
         }
     }
     let hash = rb_hash_new();
@@ -322,7 +467,7 @@ unsafe fn html_tree_inner(string: Value, options: Value, parent: Value) -> Value
     rb_hash_aset(hash, keys.errors, error_list(&keys, &output.errors));
     rb_hash_aset(hash, keys.quirks_mode, long2fix(output.quirks_mode as i64));
     rb_hash_aset(hash, keys.status, utf8(status_name(output.status)));
-    hash
+    Ok(hash)
 }
 
 const ELEMENT_NODE: i64 = 1;
@@ -408,18 +553,18 @@ fn ruby_ids() -> RubyIds {
     }
 }
 
-unsafe fn ruby_classes(ids: &RubyIds) -> RubyTypes {
-    let state = rb_path2class(c"Nokogiri::Pure::State".as_ptr());
-    RubyTypes {
-        element: rb_path2class(c"Nokogiri::XML::Element".as_ptr()),
-        text: rb_path2class(c"Nokogiri::XML::Text".as_ptr()),
-        cdata: rb_path2class(c"Nokogiri::XML::CDATA".as_ptr()),
-        comment: rb_path2class(c"Nokogiri::XML::Comment".as_ptr()),
-        attr: rb_path2class(c"Nokogiri::XML::Attr".as_ptr()),
-        dtd: rb_path2class(c"Nokogiri::XML::DTD".as_ptr()),
-        namespace: rb_path2class(c"Nokogiri::XML::Namespace".as_ptr()),
+unsafe fn ruby_classes(ids: &RubyIds) -> Result<RubyTypes, c_int> {
+    let state = path2class(c"Nokogiri::Pure::State".as_ptr())?;
+    Ok(RubyTypes {
+        element: path2class(c"Nokogiri::XML::Element".as_ptr())?,
+        text: path2class(c"Nokogiri::XML::Text".as_ptr())?,
+        cdata: path2class(c"Nokogiri::XML::CDATA".as_ptr())?,
+        comment: path2class(c"Nokogiri::XML::Comment".as_ptr())?,
+        attr: path2class(c"Nokogiri::XML::Attr".as_ptr())?,
+        dtd: path2class(c"Nokogiri::XML::DTD".as_ptr())?,
+        namespace: path2class(c"Nokogiri::XML::Namespace".as_ptr())?,
         state,
-        empty_list: rb_const_get(state, ids.empty_list),
+        empty_list: const_get(state, ids.empty_list)?,
         pure: ids.pure,
         children: ids.children,
         attributes: ids.attributes,
@@ -434,7 +579,7 @@ unsafe fn ruby_classes(ids: &RubyIds) -> RubyTypes {
         external_id: ids.external_id,
         system_id: ids.system_id,
         xml_namespace: ids.xml_namespace,
-    }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -462,6 +607,7 @@ struct Attacher {
     output: Value,
     xml_ns: Option<Value>,
     decls: HashMap<(Value, DeclKind), Value>,
+    jump: c_int,
 }
 
 unsafe fn summary_hash(
@@ -551,11 +697,11 @@ unsafe fn attach_output(
     parent: Value,
     output: &crate::html5::model::Output,
     fragment: bool,
-) -> bool {
+) -> Result<bool, Jump> {
     let Some(ids) = RUBY_IDS.get() else {
-        return false;
+        return Ok(false);
     };
-    let types = ruby_classes(ids);
+    let types = ruby_classes(ids).map_err(|state| Jump { state, clear: false })?;
     let document = owner_document(&types, parent);
     if !fragment {
         install_doctype(&types, document, output);
@@ -567,9 +713,13 @@ unsafe fn attach_output(
         output: parent,
         xml_ns: None,
         decls: HashMap::new(),
+        jump: 0,
     };
     attacher.attach_list(parent, &children, None, None);
-    true
+    if attacher.jump != 0 {
+        return Err(Jump { state: attacher.jump, clear: true });
+    }
+    Ok(true)
 }
 
 fn element_decl(namespace: Ns) -> Option<(DeclKind, &'static [u8], &'static [u8])> {
@@ -598,6 +748,9 @@ impl Attacher {
         mut tail: Option<Tail>,
     ) {
         for node in nodes {
+            if self.jump != 0 {
+                return;
+            }
             let (next_anchor, next_tail) = self.attach_node(parent, node, anchor, tail);
             anchor = if parent == self.output { None } else { next_anchor };
             tail = next_tail;
@@ -649,6 +802,9 @@ impl Attacher {
         let anchor = anchor.unwrap_or(element);
         self.apply_element_ns(state, anchor, namespace);
         self.add_attrs(element, state, anchor, &attrs);
+        if self.jump != 0 {
+            return (Some(anchor), Some(Tail { node: element, is_text: false }));
+        }
         self.attach_list(element, &children, Some(anchor), None);
         (Some(anchor), Some(Tail { node: element, is_text: false }))
     }
@@ -721,6 +877,9 @@ impl Attacher {
             return;
         };
         let ns = self.declare(anchor, kind, prefix, href);
+        if self.jump != 0 {
+            return;
+        }
         rb_ivar_set(state, self.types.namespace_ivar, ns);
     }
 
@@ -733,6 +892,9 @@ impl Attacher {
     ) {
         let list = rb_ivar_get(element_state, self.types.attributes);
         for (name, value, namespace) in attrs {
+            if self.jump != 0 {
+                return;
+            }
             let attr = rb_obj_alloc(self.types.attr);
             let state = self.attr_state(name, value);
             rb_ivar_set(attr, self.types.pure, state);
@@ -740,9 +902,14 @@ impl Attacher {
             if let Some(namespace) = namespace {
                 let ns = match attr_decl(*namespace) {
                     Some(AttrNs::Xml) => self.xml_namespace(),
-                    Some(AttrNs::Declare(kind, prefix, href)) => self.declare(anchor, kind, prefix, href),
+                    Some(AttrNs::Declare(kind, prefix, href)) => {
+                        self.declare(anchor, kind, prefix, href)
+                    }
                     None => QNIL,
                 };
+                if self.jump != 0 {
+                    return;
+                }
                 if ns != QNIL {
                     rb_ivar_set(state, self.types.namespace_ivar, ns);
                 }
@@ -768,7 +935,13 @@ impl Attacher {
             return found;
         }
         let argv = [self.document, utf8(prefix), utf8(href)];
-        let created = rb_class_new_instance(3, argv.as_ptr(), self.types.namespace);
+        let created = match class_new(3, argv.as_ptr(), self.types.namespace) {
+            Ok(value) => value,
+            Err(state) => {
+                self.jump = state;
+                return QNIL;
+            }
+        };
         let anchor_state = rb_ivar_get(anchor, self.types.pure);
         let defs = rb_ivar_get(anchor_state, self.types.namespace_definitions);
         rb_ary_push(defs, created);
@@ -780,7 +953,13 @@ impl Attacher {
         if let Some(ns) = self.xml_ns {
             return ns;
         }
-        let ns = rb_funcallv(self.document, self.types.xml_namespace, 0, std::ptr::null());
+        let ns = match funcall(self.document, self.types.xml_namespace, 0, std::ptr::null()) {
+            Ok(value) => value,
+            Err(state) => {
+                self.jump = state;
+                return QNIL;
+            }
+        };
         self.xml_ns = Some(ns);
         ns
     }
@@ -935,18 +1114,43 @@ unsafe fn error_list(keys: &HtmlKeys, errors: &[crate::html5::model::ParseError]
     values_column(&values)
 }
 
-unsafe fn read_html_options(options: Value) -> Option<crate::html5::Options> {
+fn is_array(value: Value) -> bool {
+    // Heap objects are aligned. Qfalse is 0. Other immediates set low bits.
+    // RUBY_T_ARRAY is 0x07 and RUBY_T_MASK is 0x1f.
+    if value == 0 || value & 0x07 != 0 {
+        return false;
+    }
+    let flags = unsafe { *(value as *const Value) };
+    flags & 0x1f == 0x07
+}
+
+unsafe fn read_html_options(options: Value) -> Result<Option<crate::html5::Options>, c_int> {
     use crate::html5::model::Ns;
-    let max_attributes = fix_to_i64(rb_ary_entry(options, 0))?;
-    let max_errors = fix_to_i64(rb_ary_entry(options, 1))?;
-    let max_tree_depth = fix_to_i64(rb_ary_entry(options, 2))?;
-    let noscript = fix_to_i64(rb_ary_entry(options, 3))?;
-    let fragment_context = ruby_text(rb_ary_entry(options, 4));
-    let namespace = ruby_text(rb_ary_entry(options, 5));
-    let fragment_encoding = ruby_text(rb_ary_entry(options, 6));
-    let quirks_mode = fix_to_i64(rb_ary_entry(options, 7))? as i32;
-    let form_ancestor = fix_to_i64(rb_ary_entry(options, 8))?;
-    Some(crate::html5::Options {
+    if !is_array(options) {
+        return Ok(None);
+    }
+    let Some(max_attributes) = fix_to_i64(rb_ary_entry(options, 0)) else {
+        return Ok(None);
+    };
+    let Some(max_errors) = fix_to_i64(rb_ary_entry(options, 1)) else {
+        return Ok(None);
+    };
+    let Some(max_tree_depth) = fix_to_i64(rb_ary_entry(options, 2)) else {
+        return Ok(None);
+    };
+    let Some(noscript) = fix_to_i64(rb_ary_entry(options, 3)) else {
+        return Ok(None);
+    };
+    let fragment_context = ruby_text(rb_ary_entry(options, 4))?;
+    let namespace = ruby_text(rb_ary_entry(options, 5))?;
+    let fragment_encoding = ruby_text(rb_ary_entry(options, 6))?;
+    let Some(quirks_mode) = fix_to_i64(rb_ary_entry(options, 7)) else {
+        return Ok(None);
+    };
+    let Some(form_ancestor) = fix_to_i64(rb_ary_entry(options, 8)) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::html5::Options {
         max_attributes,
         max_errors,
         max_tree_depth,
@@ -954,26 +1158,31 @@ unsafe fn read_html_options(options: Value) -> Option<crate::html5::Options> {
         fragment_context,
         fragment_namespace: Ns::from_name(namespace.as_deref().unwrap_or("html")),
         fragment_encoding,
-        quirks_mode,
+        quirks_mode: quirks_mode as i32,
         form_ancestor: form_ancestor != 0,
-    })
+    }))
 }
 
-unsafe fn ruby_text(value: Value) -> Option<String> {
+unsafe fn ruby_text(value: Value) -> Result<Option<String>, c_int> {
     if value == QNIL {
-        return None;
+        return Ok(None);
     }
-    let bytes = ruby_bytes(value);
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    let Some(bytes) = ruby_bytes(value)? else {
+        return Ok(None);
+    };
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-unsafe fn ruby_bytes(string: Value) -> Vec<u8> {
-    let len_val = rb_funcallv(string, rb_intern(c"bytesize".as_ptr()), 0, std::ptr::null());
+unsafe fn ruby_bytes(string: Value) -> Result<Option<Vec<u8>>, c_int> {
+    let len_val = funcall(string, rb_intern(c"bytesize".as_ptr()), 0, std::ptr::null())?;
     let len = fix_to_usize(len_val).unwrap_or(0);
     if len == 0 {
-        return Vec::new();
+        return Ok(Some(Vec::new()));
     }
-    let mut slot = string;
-    let ptr = rb_string_value_ptr(&mut slot);
-    std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    let mut arg = StrArg { slot: string, ptr: std::ptr::null_mut() };
+    str_ptr(&mut arg)?;
+    if arg.ptr.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(std::slice::from_raw_parts(arg.ptr as *const u8, len).to_vec()))
 }

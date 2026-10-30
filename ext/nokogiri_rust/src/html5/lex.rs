@@ -2319,7 +2319,9 @@ impl Tokenizer {
     }
 
     fn named_reference(&mut self, _cp: i32) -> Option<Token> {
-        let suffix = self.slice(self.index, self.chars.len());
+        // The longest name in entities.rs is 32 characters.
+        let end = self.index.saturating_add(32).min(self.chars.len());
+        let suffix = self.slice(self.index, end);
         if let Some((length, first, second)) = match_named(&suffix) {
             let end = self.index + length;
             let semicolon = length > 0 && self.chars.get(end - 1).is_some_and(|ch| ch.cp == 59);
