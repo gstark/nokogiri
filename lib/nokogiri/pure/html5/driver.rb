@@ -29,11 +29,13 @@ module Nokogiri
         module_function
 
         def parse(string, url, klass, **options)
-          result = build(string, options)
           document = klass.new
-          source = slot(result, :document)
-          install_doctype(document, source)
-          add_nodes(document, children_of(source), document, nil)
+          result = build(string, options, document)
+          unless slot(result, :attached)
+            source = slot(result, :document)
+            install_doctype(document, source)
+            add_nodes(document, children_of(source), document, nil)
+          end
           finish(document, result, url)
           document
         end
@@ -52,10 +54,13 @@ module Nokogiri
               fragment_encoding: encoding,
               quirks_mode: fragment_quirks(owner, context),
               fragment_context_has_form_ancestor: form
-            )
+            ),
+            owner
           )
-          root = slot(result, :root) || slot(result, :document)
-          add_nodes(owner, children_of(root), owner, nil)
+          unless slot(result, :attached)
+            root = slot(result, :root) || slot(result, :document)
+            add_nodes(owner, children_of(root), owner, nil)
+          end
           finish(owner, result, "#fragment")
           nil
         end
@@ -66,11 +71,11 @@ module Nokogiri
           fragment_context_has_form_ancestor
         ].freeze
 
-        def build(string, options)
+        def build(string, options, parent = nil)
           unknown = options.keys.map(&:to_sym) - PARSE_KEYS
           raise ArgumentError, "unknown keyword: :#{unknown.first}" unless unknown.empty?
 
-          native = rust_html5(string, options)
+          native = rust_html5(string, options, parent)
           result = native || TreeBuilder.parse(
             string.to_s,
             max_attributes: integer_option(options, :max_attributes, Gumbo::DEFAULT_MAX_ATTRIBUTES),
@@ -88,8 +93,8 @@ module Nokogiri
           result
         end
 
-        # One native call builds the Gumbo-shaped tree. Nil keeps the Ruby builder.
-        def rust_html5(string, options)
+        # One native call builds the tree and links the nodes. Nil keeps the Ruby builder.
+        def rust_html5(string, options, parent = nil)
           return nil if ENV["NOKOGIRI_RUST_HTML5"] == "0"
           return nil unless defined?(Nokogiri::Pure::RustHtml5) && Nokogiri::Pure::RustHtml5.respond_to?(:tree)
 
@@ -107,7 +112,7 @@ module Nokogiri
             options[:quirks_mode].nil? ? 0 : Integer(options[:quirks_mode]),
             options[:fragment_context_has_form_ancestor] ? 1 : 0
           ]
-          result = Nokogiri::Pure::RustHtml5.tree(string.to_s, packed)
+          result = Nokogiri::Pure::RustHtml5.tree(string.to_s, packed, parent)
           result if result.is_a?(Hash)
         end
 

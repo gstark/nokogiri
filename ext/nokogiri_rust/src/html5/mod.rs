@@ -1,4 +1,4 @@
-//! One-call HTML5 parser. The Ruby driver attaches the finished nodes.
+//! One-call HTML5 parser. The native call can link the finished nodes.
 
 mod entities;
 mod lex;
