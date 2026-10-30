@@ -9,6 +9,8 @@
 /gems/
 /lib/nokogiri/**/nokogiri.bundle
 /lib/nokogiri/**/nokogiri.so
+/lib/nokogiri/pure/nokogiri_rust_flat.so
+/ext/nokogiri_rust/target/
 /lib/nokogiri/nokogiri.jar
 /pkg/
 /ports/

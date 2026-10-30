@@ -31,8 +31,9 @@ module Nokogiri
         def parse(string, url, klass, **options)
           result = build(string, options)
           document = klass.new
-          install_doctype(document, result[:document])
-          add_nodes(document, children_of(result[:document]), document, nil)
+          source = slot(result, :document)
+          install_doctype(document, source)
+          add_nodes(document, children_of(source), document, nil)
           finish(document, result, url)
           document
         end
@@ -53,7 +54,7 @@ module Nokogiri
               fragment_context_has_form_ancestor: form
             )
           )
-          root = result[:root] || result[:document]
+          root = slot(result, :root) || slot(result, :document)
           add_nodes(owner, children_of(root), owner, nil)
           finish(owner, result, "#fragment")
           nil
@@ -69,7 +70,8 @@ module Nokogiri
           unknown = options.keys.map(&:to_sym) - PARSE_KEYS
           raise ArgumentError, "unknown keyword: :#{unknown.first}" unless unknown.empty?
 
-          result = TreeBuilder.parse(
+          native = rust_html5(string, options)
+          result = native || TreeBuilder.parse(
             string.to_s,
             max_attributes: integer_option(options, :max_attributes, Gumbo::DEFAULT_MAX_ATTRIBUTES),
             max_errors: integer_option(options, :max_errors, Gumbo::DEFAULT_MAX_ERRORS),
@@ -84,6 +86,29 @@ module Nokogiri
           raise_limit!(result)
           result[:input] = string.to_s if result[:input].nil?
           result
+        end
+
+        # One native call builds the Gumbo-shaped tree. Nil keeps the Ruby builder.
+        def rust_html5(string, options)
+          return nil if ENV["NOKOGIRI_RUST_HTML5"] == "0"
+          return nil unless defined?(Nokogiri::Pure::RustHtml5) && Nokogiri::Pure::RustHtml5.respond_to?(:tree)
+
+          context = options[:fragment_context]
+          namespace = options[:fragment_namespace]
+          encoding = options[:fragment_encoding]
+          packed = [
+            integer_option(options, :max_attributes, Gumbo::DEFAULT_MAX_ATTRIBUTES),
+            integer_option(options, :max_errors, Gumbo::DEFAULT_MAX_ERRORS),
+            integer_option(options, :max_tree_depth, Gumbo::DEFAULT_MAX_TREE_DEPTH),
+            options[:parse_noscript_content_as_text] ? 1 : 0,
+            context&.to_s,
+            namespace&.to_s,
+            encoding&.to_s,
+            options[:quirks_mode].nil? ? 0 : Integer(options[:quirks_mode]),
+            options[:fragment_context_has_form_ancestor] ? 1 : 0
+          ]
+          result = Nokogiri::Pure::RustHtml5.tree(string.to_s, packed)
+          result if result.is_a?(Hash)
         end
 
         def integer_option(options, key, default)
@@ -110,11 +135,11 @@ module Nokogiri
         def install_doctype(document, source)
           return unless source
 
-          if source.respond_to?(:has_doctype) && source.has_doctype
+          if field(source, :has_doctype)
             document.create_internal_subset(
-              source.doctype_name.to_s,
-              blank_to_nil(source.public_id),
-              blank_to_nil(source.system_id)
+              field(source, :doctype_name).to_s,
+              blank_to_nil(field(source, :public_id)),
+              blank_to_nil(field(source, :system_id))
             )
             return
           end
@@ -136,11 +161,22 @@ module Nokogiri
         end
 
         def finish(node, result, file)
-          quirks = result[:quirks_mode]
-          quirks = field(result[:document], :quirks_mode) if quirks.nil? && result[:document]
+          document = slot(result, :document)
+          quirks = slot(result, :quirks_mode)
+          quirks = field(document, :quirks_mode) if quirks.nil? && document
           node.instance_variable_set(:@quirks_mode, quirks || Quirks::NO_QUIRKS)
           node.instance_variable_set(:@url, file) if node.respond_to?(:url) && !file.nil? && file != "#fragment"
-          node.instance_variable_set(:@errors, syntax_errors(result[:errors], result[:input] || "", file))
+          node.instance_variable_set(:@errors, syntax_errors(slot(result, :errors), slot(result, :input) || "", file))
+        end
+
+        # The Ruby builder uses symbol keys. The native builder uses string keys.
+        def slot(result, key)
+          return if result.nil?
+          return result.public_send(key) if result.respond_to?(key) && !result.is_a?(Hash)
+          return unless result.is_a?(Hash)
+          return result[key] if result.key?(key)
+
+          result[key.to_s] if result.key?(key.to_s)
         end
 
         def syntax_errors(errors, source, file)

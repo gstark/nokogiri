@@ -49,6 +49,39 @@ module Nokogiri
         @retired = false
       end
 
+      # Install columns written by the native filler. Nil means the columns
+      # are the wrong shape and the Ruby reader must run.
+      def load_native!(cols)
+        lists = cols[0, 12]
+        return nil unless lists&.all?(Array)
+        return nil unless lists.all? { |col| col.length == lists[0].length }
+
+        width = lists[0].length
+        prefixes = cols[14]
+        hrefs = cols[15]
+        attrs = cols[16]
+        defs = cols[17]
+        langs = cols[18]
+        return nil unless prefixes.is_a?(Array) && hrefs.is_a?(Array) && prefixes.length == hrefs.length
+        return nil unless attrs.is_a?(Array) && defs.is_a?(Array) && langs.is_a?(Array)
+        return nil unless attrs.length == width && defs.length == width && langs.length == width
+
+        @type, @parent, @nex, @child, @off, @len, @local, @ns, @line, @text_off, @text_len, @tail = lists
+        @top_head = cols[12]
+        @top_tail = cols[13]
+        @prefixes = prefixes
+        @hrefs = hrefs
+        @attrs = attrs
+        @defs = defs
+        @lang = langs
+        xml_id = cols[19]
+        unless xml_id.nil?
+          @xml_ns_id = xml_id
+          @ns_obj[xml_id] = @document.xml_namespace
+        end
+        self
+      end
+
       def add_element(parent, name_off, name_len, local_delta, ns_id, line, defs)
         index = @type.length
         @type << ELEMENT
@@ -192,7 +225,7 @@ module Nokogiri
         state = State.leaf_new
         state.fast_fill(COMMENT, "comment", @document, content, nil)
         parent = @parent[index]
-        state.parent = parent < 0 ? @document : wrapper(parent)
+        state.parent = (parent < 0) ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
       end
@@ -203,7 +236,7 @@ module Nokogiri
         state = State.new
         state.fast_fill(ENTITY_REF, name, @document, nil, nil)
         parent = @parent[index]
-        state.parent = parent < 0 ? @document : wrapper(parent)
+        state.parent = (parent < 0) ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
       end
@@ -218,7 +251,7 @@ module Nokogiri
           state.system_id = ids[1]
         end
         parent = @parent[index]
-        state.parent = parent < 0 ? @document : wrapper(parent)
+        state.parent = (parent < 0) ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
       end
@@ -501,7 +534,7 @@ module Nokogiri
         node.instance_variable_set(:@pure, state)
         @cache[index] = node
         parent = @parent[index]
-        state.parent = parent < 0 ? @document : wrapper(parent)
+        state.parent = (parent < 0) ? @document : wrapper(parent)
         node
       end
 
@@ -622,7 +655,7 @@ module Nokogiri
         state = State.leaf_new
         state.fast_fill(TEXT, "text", @document, content, @line[index])
         parent = @parent[index]
-        state.parent = parent < 0 ? @document : wrapper(parent)
+        state.parent = (parent < 0) ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
       end

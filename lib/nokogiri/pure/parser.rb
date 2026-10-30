@@ -142,6 +142,9 @@ module Nokogiri
         origin = @scanner.pos
         return nil if string.byteindex("<!", origin) || string.byteindex("<?", origin)
 
+        native = try_rust_flat_tree(string, origin)
+        return native if native
+
         repeated = try_repeated_flat(string, origin)
         return repeated if repeated
 
@@ -299,6 +302,18 @@ module Nokogiri
         return nil unless stack.empty?
 
         tree
+      end
+
+      # One native call fills the flat columns. Nil keeps the Ruby reader.
+      def try_rust_flat_tree(string, origin)
+        return nil if ENV["NOKOGIRI_RUST_FLAT"] == "0"
+        return nil unless defined?(RustFlat) && RustFlat.respond_to?(:columns)
+
+        cols = RustFlat.columns(string, origin)
+        return nil unless cols.is_a?(Array) && cols.length == 20
+
+        tree = FlatTree.new(@document, string)
+        tree.load_native!(cols)
       end
 
       # Many copies of one child become one match each. The shape is the
