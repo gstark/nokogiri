@@ -106,10 +106,11 @@ module Nokogiri
       private
 
       def parse_loop
-        # A "<!" starts a comment, a doctype, or CDATA. Those stay on the
-        # general loop for XML. Plain XML is elements, text, and end tags.
         # A document with only elements and text is stored as flat records.
         # HTML can use the same table when every construct has a record.
+        # XML that the flat table rejects still uses the byte tag reader.
+        # A comment, a doctype, CDATA, or a processing instruction goes to
+        # the markup parser. Start tags and end tags stay on the byte scan.
         saved_pos = @scanner.pos
         saved_line = @line
         saved_column = @column
@@ -125,10 +126,10 @@ module Nokogiri
         @scanner.pos = saved_pos
         @line = saved_line
         @column = saved_column
-        if !@html && !@scanner.string.include?("<!")
-          parse_loop_xml
-        else
+        if @html
           parse_loop_general
+        else
+          parse_loop_xml
         end
       end
 
@@ -1891,9 +1892,9 @@ module Nokogiri
         end
       end
 
-      # One pass over a document that has no "<!" markup. Start tags are
-      # scanned in place. A tag with an entity or a non-ASCII byte uses the
-      # general reader from the "<".
+      # One pass over an XML document. Start tags are scanned in place.
+      # A tag with an entity or a non-ASCII byte uses the general reader
+      # from the "<". A "<!" or "<?" mark uses that reader too.
       def parse_loop_xml
         string = @scanner.string
         limit = string.bytesize

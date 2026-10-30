@@ -666,10 +666,13 @@ module Nokogiri
       HTML5_NEWLINE_TAGS = %w[pre textarea listing].freeze
       HTML5_TEXT_ESCAPE = /[&<>\u00A0]/
       HTML5_ATTR_ESCAPE = /[&"\u00A0]/
+      HTML5_TEXT_COUNT = "&<>\u00A0"
+      HTML5_ATTR_COUNT = "&\"\u00A0"
       HTML5_TEXT_ESCAPE_MAP = {"&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\u00A0" => "&nbsp;"}.freeze
       HTML5_ATTR_ESCAPE_MAP = {"&" => "&amp;", '"' => "&quot;", "\u00A0" => "&nbsp;"}.freeze
       private_constant :HTML5_VOID_TAGS, :HTML5_RAW_TEXT_TAGS, :HTML5_NEWLINE_TAGS,
-        :HTML5_TEXT_ESCAPE, :HTML5_ATTR_ESCAPE, :HTML5_TEXT_ESCAPE_MAP, :HTML5_ATTR_ESCAPE_MAP
+        :HTML5_TEXT_ESCAPE, :HTML5_ATTR_ESCAPE, :HTML5_TEXT_COUNT, :HTML5_ATTR_COUNT,
+        :HTML5_TEXT_ESCAPE_MAP, :HTML5_ATTR_ESCAPE_MAP
 
       def prepend_newline?
         return false unless element?
@@ -853,12 +856,13 @@ module Nokogiri
       private :append_html5_attr_name
 
       def append_html5_escaped(buffer, text, attribute)
-        pattern = attribute ? HTML5_ATTR_ESCAPE : HTML5_TEXT_ESCAPE
-        unless text.match?(pattern)
+        set = attribute ? HTML5_ATTR_COUNT : HTML5_TEXT_COUNT
+        if text.count(set).zero?
           buffer << text
           return
         end
 
+        pattern = attribute ? HTML5_ATTR_ESCAPE : HTML5_TEXT_ESCAPE
         map = attribute ? HTML5_ATTR_ESCAPE_MAP : HTML5_TEXT_ESCAPE_MAP
         buffer << text.gsub(pattern, map)
       end

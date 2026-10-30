@@ -31,9 +31,27 @@ module Nokogiri
         return text if target == Encoding::UTF_8
 
         text.encode(target)
+      rescue Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError
+        encode_with_entities(text, target)
+      rescue ArgumentError, Encoding::ConverterNotFoundError
+        text
+      end
+
+      # One pass replaces characters the target encoding cannot store.
+      # A successful document encode does not call this method.
+      def self.encode_with_entities(text, target)
+        replaced = +""
+        text.each_char do |char|
+          char.encode(target)
+          replaced << char
+        rescue Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError
+          replaced << "&##{char.ord};"
+        end
+        replaced.encode(target)
       rescue ArgumentError, Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError, Encoding::ConverterNotFoundError
         text
       end
+      private_class_method :encode_with_entities
 
       def initialize(indentation, options, encoding = nil)
         @output = +""
@@ -125,20 +143,9 @@ module Nokogiri
       end
 
       def emit(string)
-        prepared = prepare(string.to_s)
-        @output << prepared
-        @pieces << prepared if @pieces
-      end
-
-      def prepare(string)
-        return string if @target.nil?
-
-        string.each_char.map do |char|
-          char.encode(@target)
-          char
-        rescue Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError
-          "&##{char.ord};"
-        end.join
+        text = string.to_s
+        @output << text
+        @pieces << text if @pieces
       end
 
       def write_document(document)
