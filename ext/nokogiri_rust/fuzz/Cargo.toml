@@ -1,0 +1,33 @@
+[package]
+name = "nokogiri_rust_flat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.nokogiri_rust_flat]
+path = ".."
+
+[[bin]]
+name = "html5"
+path = "fuzz_targets/html5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml"
+path = "fuzz_targets/xml.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

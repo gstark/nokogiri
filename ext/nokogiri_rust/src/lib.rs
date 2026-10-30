@@ -1,5 +1,5 @@
-mod fill;
-mod html5;
+pub mod fill;
+pub mod html5;
 
 #[cfg(not(test))]
 mod ffi;
