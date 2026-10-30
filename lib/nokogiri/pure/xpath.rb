@@ -43,7 +43,7 @@ module Nokogiri
 
       # Direct walks for the location paths CSS and the common calls emit.
       # Any other expression returns nil and uses the full evaluator.
-      FAST_NAME = /[A-Za-z_][\w.\-]*/
+      FAST_NAME = /[A-Za-z_][\w.-]*/
       FAST_ATTR_CHILD = /\A\/\/(#{FAST_NAME})\[@(#{FAST_NAME})=(?:"([^"]*)"|'([^']*)')\]\/(#{FAST_NAME})\z/
       FAST_CLASS = /\A(\.\/\/|\/\/)(#{FAST_NAME})\[contains\(concat\(' ',normalize-space\(@class\),' '\),' ([^']*)'\)\]\z/
       FAST_CHILD = /\A(\.\/\/|\/\/)(#{FAST_NAME})\/(#{FAST_NAME})\z/
@@ -447,7 +447,7 @@ module Nokogiri
           return "-Infinity" if number.infinite? == -1
 
           integer = number.to_i
-          integer == number ? integer.to_s : number.to_s
+          (integer == number) ? integer.to_s : number.to_s
         end
       end
 
@@ -538,7 +538,7 @@ module Nokogiri
           left = parse_multiplicative
           while (operator = @scanner.operator?("+", "-"))
             right = parse_multiplicative
-            number = operator == "+" ? left.to_number + right.to_number : left.to_number - right.to_number
+            number = (operator == "+") ? left.to_number + right.to_number : left.to_number - right.to_number
             left = Value.number(number)
           end
           left
@@ -586,7 +586,7 @@ module Nokogiri
             Value.nodes(eval_location_path)
           else
             value = apply_value_predicates(parse_primary)
-            @scanner.peek == "/" ? continue_from_filter(value) : value
+            (@scanner.peek == "/") ? continue_from_filter(value) : value
           end
         end
 
@@ -689,10 +689,10 @@ module Nokogiri
             test = parse_node_test
           elsif @scanner.operator?("..")
             axis = :parent
-            test = { kind: :node }
+            test = {kind: :node}
           elsif @scanner.operator?(".")
             axis = :self
-            test = { kind: :node }
+            test = {kind: :node}
           else
             saved = @scanner.mark
             name = @scanner.ncname
@@ -707,16 +707,23 @@ module Nokogiri
           end
           predicates = []
           predicates << compile_predicate(@scanner.predicate) while @scanner.peek == "["
-          { axis: axis, test: test, predicates: predicates }
+          {axis: axis, test: test, predicates: predicates}
         end
 
         def parse_node_test
           if @scanner.peek == ":" && @scanner.peek(2) != "::"
             @scanner.operator?(":")
-            return { kind: :name, prefix: "", local: @scanner.ncname }
+            return {kind: :name, prefix: "", local: @scanner.ncname}
           end
           if @scanner.operator?("*")
-            return { kind: :star }
+            if @scanner.peek == ":" && @scanner.peek(2) != "::"
+              @scanner.operator?(":")
+              local = @scanner.ncname
+              raise_syntax unless local
+
+              return {kind: :name, prefix: "*", local: local}
+            end
+            return {kind: :star}
           end
 
           name = @scanner.ncname
@@ -727,18 +734,18 @@ module Nokogiri
             argument = nil
             argument = @scanner.string || @scanner.ncname unless @scanner.peek == ")"
             expect(")")
-            return { kind: name.tr("-", "_").to_sym, argument: argument }
+            return {kind: name.tr("-", "_").to_sym, argument: argument}
           end
           if @scanner.peek == ":" && @scanner.peek(2) != "::"
             @scanner.operator?(":")
             local = @scanner.operator?("*") ? "*" : @scanner.ncname
-            return { kind: :name, prefix: name, local: local }
+            return {kind: :name, prefix: name, local: local}
           end
-          { kind: :name, prefix: nil, local: name }
+          {kind: :name, prefix: nil, local: name}
         end
 
         def node_step(axis)
-          { axis: axis, test: { kind: :node }, predicates: [] }
+          {axis: axis, test: {kind: :node}, predicates: []}
         end
 
         # A single context node already yields these axes in document order.
@@ -748,20 +755,20 @@ module Nokogiri
           self: true,
           attribute: true,
           descendant: true,
-          :"descendant-or-self" => true,
-          :"following-sibling" => true,
+          "descendant-or-self": true,
+          "following-sibling": true
         }.freeze
         REVERSE_AXES = {
           parent: true,
           ancestor: true,
-          :"ancestor-or-self" => true,
-          :"preceding-sibling" => true,
+          "ancestor-or-self": true,
+          "preceding-sibling": true
         }.freeze
 
         # CSS compiles //div[class] to descendant-or-self::node()/child::div[class].
         # The child step keeps its own position() scope. One context is already in document order.
         CLASS_CONTAINS = /\Acontains\(concat\(' ',normalize-space\(@([^)]+)\),' '\),' ([^']*)'\)\z/
-        ATTR_EQUALS = /\A@([A-Za-z_][\w.\-]*)=(?:"([^"]*)"|'([^']*)')\z/
+        ATTR_EQUALS = /\A@([A-Za-z_][\w.-]*)=(?:"([^"]*)"|'([^']*)')\z/
 
         def apply_steps(nodes, steps)
           index = 0
@@ -924,12 +931,12 @@ module Nokogiri
             inner = match[2]
             if !name.include?(":") && inner.length >= 2 && inner.start_with?(" ") && inner.end_with?(" ")
               needle = inner[1..-2]
-              return { kind: :class, name: name, needle: needle } unless needle.include?(" ")
+              return {kind: :class, name: name, needle: needle} unless needle.include?(" ")
             end
           elsif (match = ATTR_EQUALS.match(source))
             name = match[1]
             unless name.include?(":")
-              return { kind: :attr, name: name, expected: match[2] || match[3] }
+              return {kind: :attr, name: name, expected: match[2] || match[3]}
             end
           end
           source
@@ -1025,7 +1032,7 @@ module Nokogiri
             parent ? [parent] : []
           when :attribute
             state = node.instance_variable_get(:@pure)
-            state&.type == XML::Node::ELEMENT_NODE ? state.attributes : []
+            (state&.type == XML::Node::ELEMENT_NODE) ? state.attributes : []
           when :namespace
             namespace_axis(node)
           when :descendant
@@ -1118,7 +1125,7 @@ module Nokogiri
           when :node
             !node.is_a?(XML::Namespace)
           when :text
-            state&.type == XML::Node::TEXT_NODE
+            state&.type == XML::Node::TEXT_NODE || state&.type == XML::Node::CDATA_SECTION_NODE
           when :comment
             state&.type == XML::Node::COMMENT_NODE
           when :processing_instruction
@@ -1151,14 +1158,14 @@ module Nokogiri
 
             return node.prefix.to_s == test[:local].to_s
           end
-          href_for(test[:prefix]) unless test[:prefix].nil?
+          href_for(test[:prefix]) unless test[:prefix].nil? || test[:prefix] == "*"
           if axis == :attribute
             return false unless state&.type == XML::Node::ATTRIBUTE_NODE
           elsif state&.type != XML::Node::ELEMENT_NODE
             return false
           end
-          return false unless state.name == test[:local]
-          return test[:prefix] == "*" if test[:local] == "*"
+          return false unless test[:local] == "*" || state.name == test[:local]
+          return true if test[:prefix] == "*"
 
           href = href_for(test[:prefix])
           if test[:prefix].nil?
@@ -1195,7 +1202,12 @@ module Nokogiri
           prefix, local = split_qname(name)
           return call_builtin_extension(local, args) if prefix == "nokogiri-builtin"
           return call_builtin(local, args) if prefix.nil? && BUILTIN_FUNCTIONS.include?(local)
-          return handler_value(local, args) if @handler&.respond_to?(local)
+          if @handler&.respond_to?(local)
+            if prefix.nil?
+              warn("Invoking custom handler functions without a namespace is deprecated")
+            end
+            return handler_value(local, args)
+          end
 
           call_builtin(local, args)
         end
@@ -1319,7 +1331,7 @@ module Nokogiri
           when Array
             Value.nodes(result.flatten.grep(XML::Node))
           else
-            raise RuntimeError, "Invalid return type"
+            raise "Invalid return type"
           end
         end
 
@@ -1704,7 +1716,7 @@ module Nokogiri
           end
 
           next_char = @source[@index + word.length]
-          !(next_char && next_char.match?(/[\p{L}\p{N}_.\-]/))
+          !(next_char && next_char.match?(/[\p{L}\p{N}_.-]/))
         end
 
         def name_byte?(byte)
@@ -1792,7 +1804,7 @@ module Nokogiri
         end
 
         NUMBER = /\G\d+(?:\.\d+)?/
-        NCNAME = /\G[\p{L}_][\p{L}\p{N}_.\-]*/
+        NCNAME = /\G[\p{L}_][\p{L}\p{N}_.-]*/
 
         def number
           skip_space
@@ -1871,7 +1883,7 @@ module Nokogiri
       def self.new(node)
         context = allocate
         context.instance_variable_set(:@node, node)
-        context.instance_variable_set(:@namespaces, { "xml" => Pure::XML_NS_HREF })
+        context.instance_variable_set(:@namespaces, {"xml" => Pure::XML_NS_HREF})
         context.instance_variable_set(:@variables, {})
         context
       end
@@ -1894,9 +1906,7 @@ module Nokogiri
         end
       end
 
-      def node=(node)
-        @node = node
-      end
+      attr_writer :node
 
       def evaluate(path, handler = nil)
         Pure::XPath.evaluate(@node, path, @namespaces, @variables, handler)

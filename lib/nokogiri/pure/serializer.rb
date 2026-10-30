@@ -12,7 +12,7 @@ module Nokogiri
       AS_HTML = 64
       # Document#to_html passes FORMAT | NO_DECLARATION | NO_EMPTY_TAGS | AS_HTML.
       HTML_DEFAULT = FORMAT | NO_DECLARATION | NO_EMPTY_TAGS | AS_HTML
-      RAW_TEXT = { "script" => true, "style" => true }.freeze
+      RAW_TEXT = {"script" => true, "style" => true}.freeze
       HTML_BOOLEAN = %w[
         checked compact declare defer disabled ismap multiple nohref noresize noshade nowrap
         readonly selected
@@ -40,7 +40,7 @@ module Nokogiri
         @unit = indentation
         @options = options
         @encoding_name = encoding&.to_s
-        @encoding_name = nil if @encoding_name&.empty?
+        @encoding_name = nil if @encoding_name && @encoding_name.empty?
         @target = resolve_target(encoding)
       end
 
@@ -48,7 +48,7 @@ module Nokogiri
         return if encoding.nil? || encoding.to_s.empty?
 
         target = Encoding.find(encoding.to_s)
-        target == Encoding::UTF_8 ? nil : target
+        (target == Encoding::UTF_8) ? nil : target
       rescue ArgumentError, Encoding::ConverterNotFoundError
         nil
       end
@@ -162,7 +162,8 @@ module Nokogiri
           write_element(node, depth, state)
         when XML::Node::TEXT_NODE
           text = state.content.to_s
-          emit(raw_text?(state) ? text : Entities.escape_text(text))
+          raw = node.instance_variable_get(:@xslt_disable_output_escaping) || raw_text?(state)
+          emit(raw ? text : Entities.escape_text(text))
         when XML::Node::CDATA_SECTION_NODE
           emit("<![CDATA[#{state.content}]]>")
         when XML::Node::COMMENT_NODE
@@ -194,7 +195,7 @@ module Nokogiri
         children = state.children
         if children.empty?
           if html_void?(state) && @options & AS_XML == 0
-            emit(@options & AS_XHTML != 0 ? " />" : ">")
+            emit((@options & AS_XHTML != 0) ? " />" : ">")
           elsif @options & NO_EMPTY_TAGS != 0 || @options & AS_HTML != 0 || @options & AS_XHTML != 0
             emit("></#{name}>")
           else

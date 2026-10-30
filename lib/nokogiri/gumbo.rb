@@ -11,5 +11,17 @@ module Nokogiri
     # The default maximum depth of the DOM tree produced by parsing a document
     # or fragment.
     DEFAULT_MAX_TREE_DEPTH = 400
+
+    class << self
+      def parse(string, url, klass, **options)
+        require_relative "pure/html5/driver"
+        Pure::Html5::Driver.parse(string, url, klass, **options)
+      end
+
+      def fragment(owner, string, context, **options)
+        require_relative "pure/html5/driver"
+        Pure::Html5::Driver.fragment(owner, string, context, **options)
+      end
+    end
   end
 end

@@ -6,8 +6,11 @@ module Nokogiri
   class TestCase
     describe Nokogiri do
       def test_libxml_iconv
-        skip_unless_libxml2("this constant is only set in the C extension when libxml2 is used")
-        assert(Nokogiri.const_defined?(:LIBXML_ICONV_ENABLED))
+        if Nokogiri.uses_libxml?
+          assert(Nokogiri.const_defined?(:LIBXML_ICONV_ENABLED))
+        else
+          refute(Nokogiri.const_defined?(:LIBXML_ICONV_ENABLED))
+        end
       end
 
       def test_parse_with_io

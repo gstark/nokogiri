@@ -200,8 +200,6 @@ module Nokogiri
 
       # issue #741 (xpath() around 10x slower in JRuby)
       def test_slow_jruby_xpath
-        skip("testing against an absolute time is brittle. help make this better! see https://github.com/sparklemotion/nokogiri/issues/741")
-
         doc = Nokogiri::XML(File.open(XPATH_FILE))
         start = Time.now
 
@@ -215,7 +213,7 @@ module Nokogiri
         stop = Time.now
         elapsed_time = stop - start
         time_limit = 20
-        assert_send([elapsed_time, :<, time_limit], "XPath is taking too long")
+        assert_operator(elapsed_time, :<, time_limit, "XPath is taking too long")
       end
 
       # issue #1109 (jruby impl's xpath() cache not being cleared on attr removal)
@@ -276,7 +274,8 @@ module Nokogiri
 
       def test_custom_xpath_handler_is_passed_a_decorated_node_set
         x = Module.new do
-          def awesome!; end
+          def awesome!
+          end
         end
         util_decorate(@xml, x)
 
@@ -345,7 +344,7 @@ module Nokogiri
             def bool_function(value)
               true
             end
-          end.new,
+          end.new
         )
         assert_equal(foo, doc.xpath("//foo"))
       end
@@ -359,7 +358,7 @@ module Nokogiri
           </test>
         END
         doc = Nokogiri::XML.parse(process_output)
-        node = doc.xpath(%{//track[@type='Video']})
+        node = doc.xpath(%(//track[@type='Video']))
         assert_equal("[]", node.xpath("Format").inspect)
       end
 
@@ -393,7 +392,7 @@ module Nokogiri
           </mods>
         EOF
         xml_doc = Nokogiri::XML(xml_string)
-        ns_hash = { "mods" => "http://www.loc.gov/mods/v3" }
+        ns_hash = {"mods" => "http://www.loc.gov/mods/v3"}
         node = xml_doc.at_xpath("//mods:titleInfo[1]", ns_hash)
         node["lang"] = "english"
         assert_equal(1, xml_doc.xpath("//mods:titleInfo[1]/@lang", ns_hash).length)
@@ -415,7 +414,7 @@ module Nokogiri
           </mods>
         EOF
         xml_doc = Nokogiri::XML(xml_string)
-        ns_hash = { "mods" => "http://www.loc.gov/mods/v3" }
+        ns_hash = {"mods" => "http://www.loc.gov/mods/v3"}
         node = xml_doc.at_xpath("//mods:titleInfo[1]", ns_hash)
         node.remove
         assert_equal(1, xml_doc.xpath("//mods:titleInfo", ns_hash).length)
@@ -463,7 +462,7 @@ module Nokogiri
             42
           end
         end
-        result = doc.xpath(query, { "ct" => "https://test.nokogiri.org/ct", "date" => "https://test.nokogiri.org/date" }, handler.new)
+        result = doc.xpath(query, {"ct" => "https://test.nokogiri.org/ct", "date" => "https://test.nokogiri.org/date"}, handler.new)
         assert(result)
       end
 
@@ -574,22 +573,22 @@ module Nokogiri
         it "Nokogiri::XML::Document" do
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::XML,
-            Nokogiri::XML::Document.parse("<root></root>").xpath_doctype,
+            Nokogiri::XML::Document.parse("<root></root>").xpath_doctype
           )
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::XML,
-            Nokogiri::XML::DocumentFragment.parse("<root></root>").document.xpath_doctype,
+            Nokogiri::XML::DocumentFragment.parse("<root></root>").document.xpath_doctype
           )
         end
 
         it "Nokogiri::HTML4::Document" do
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::HTML4,
-            Nokogiri::HTML4::Document.parse("<root></root>").xpath_doctype,
+            Nokogiri::HTML4::Document.parse("<root></root>").xpath_doctype
           )
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::HTML4,
-            Nokogiri::HTML4::DocumentFragment.parse("<root></root>").document.xpath_doctype,
+            Nokogiri::HTML4::DocumentFragment.parse("<root></root>").document.xpath_doctype
           )
         end
 
@@ -597,11 +596,11 @@ module Nokogiri
           skip("HTML5 is not supported") unless defined?(Nokogiri::HTML5)
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::HTML5,
-            Nokogiri::HTML5::Document.parse("<root></root>").xpath_doctype,
+            Nokogiri::HTML5::Document.parse("<root></root>").xpath_doctype
           )
           assert_equal(
             Nokogiri::CSS::XPathVisitor::DoctypeConfig::HTML5,
-            Nokogiri::HTML5::DocumentFragment.parse("<root></root>").document.xpath_doctype,
+            Nokogiri::HTML5::DocumentFragment.parse("<root></root>").document.xpath_doctype
           )
         end
       end
@@ -623,7 +622,7 @@ module Nokogiri
           </html>
         HTML
 
-        let(:ns) { { "nsfoo" => "http://www.w3.org/2000/svg" } }
+        let(:ns) { {"nsfoo" => "http://www.w3.org/2000/svg"} }
 
         describe "in an XML doc" do
           let(:doc) { Nokogiri::XML::Document.parse(html) }
@@ -666,7 +665,7 @@ module Nokogiri
             skip("HTML5 is not supported") unless defined?(Nokogiri::HTML5)
             refute_empty(doc.css("svg"))
             refute_empty(doc.css("nsfoo|svg", ns)) # if they specify the valid ns, use it
-            assert_empty(doc.css("nsbar|svg", { "nsbar" => "http://example.com/nsbar" }))
+            assert_empty(doc.css("nsbar|svg", {"nsbar" => "http://example.com/nsbar"}))
           end
         end
       end
@@ -685,9 +684,9 @@ module Nokogiri
         it "allows namespace wildcards" do
           skip_unless_libxml2_patch("0009-allow-wildcard-namespaces.patch")
 
-          assert_equal(1, doc.xpath("//n:child", { "n" => "http://nokogiri.org/ns1" }).length)
+          assert_equal(1, doc.xpath("//n:child", {"n" => "http://nokogiri.org/ns1"}).length)
           assert_equal(3, doc.xpath("//*:child").length)
-          assert_equal(1, doc.xpath("//self::n:child", { "n" => "http://nokogiri.org/ns1" }).length)
+          assert_equal(1, doc.xpath("//self::n:child", {"n" => "http://nokogiri.org/ns1"}).length)
           assert_equal(3, doc.xpath("//self::*:child").length)
         end
       end

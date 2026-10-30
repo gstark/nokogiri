@@ -54,31 +54,34 @@ end
 
 module Nokogiri
   module TestBase
-    ASSETS_DIR           = File.expand_path(File.join(File.dirname(__FILE__), "files"))
-    ADDRESS_SCHEMA_FILE  = File.join(ASSETS_DIR, "address_book.rlx")
-    ADDRESS_XML_FILE     = File.join(ASSETS_DIR, "address_book.xml")
-    ENCODING_HTML_FILE   = File.join(ASSETS_DIR, "encoding.html")
-    ENCODING_XHTML_FILE  = File.join(ASSETS_DIR, "encoding.xhtml")
-    EXML_FILE            = File.join(ASSETS_DIR, "exslt.xml")
-    EXSLT_FILE           = File.join(ASSETS_DIR, "exslt.xslt")
-    HTML_FILE            = File.join(ASSETS_DIR, "tlm.html")
-    METACHARSET_FILE     = File.join(ASSETS_DIR, "metacharset.html")
-    NICH_FILE            = File.join(ASSETS_DIR, "2ch.html")
-    NOENCODING_FILE      = File.join(ASSETS_DIR, "noencoding.html")
-    PO_SCHEMA_FILE       = File.join(ASSETS_DIR, "po.xsd")
-    PO_XML_FILE          = File.join(ASSETS_DIR, "po.xml")
-    SHIFT_JIS_HTML       = File.join(ASSETS_DIR, "shift_jis.html")
+    ASSETS_DIR = File.expand_path(File.join(File.dirname(__FILE__), "files"))
+    ADDRESS_SCHEMA_FILE = File.join(ASSETS_DIR, "address_book.rlx")
+    ADDRESS_XML_FILE = File.join(ASSETS_DIR, "address_book.xml")
+    ENCODING_HTML_FILE = File.join(ASSETS_DIR, "encoding.html")
+    ENCODING_XHTML_FILE = File.join(ASSETS_DIR, "encoding.xhtml")
+    EXML_FILE = File.join(ASSETS_DIR, "exslt.xml")
+    EXSLT_FILE = File.join(ASSETS_DIR, "exslt.xslt")
+    HTML_FILE = File.join(ASSETS_DIR, "tlm.html")
+    METACHARSET_FILE = File.join(ASSETS_DIR, "metacharset.html")
+    NICH_FILE = File.join(ASSETS_DIR, "2ch.html")
+    NOENCODING_FILE = File.join(ASSETS_DIR, "noencoding.html")
+    PO_SCHEMA_FILE = File.join(ASSETS_DIR, "po.xsd")
+    PO_XML_FILE = File.join(ASSETS_DIR, "po.xml")
+    SHIFT_JIS_HTML = File.join(ASSETS_DIR, "shift_jis.html")
     SHIFT_JIS_NO_CHARSET = File.join(ASSETS_DIR, "shift_jis_no_charset.html")
-    SHIFT_JIS_XML        = File.join(ASSETS_DIR, "shift_jis.xml")
-    SNUGGLES_FILE        = File.join(ASSETS_DIR, "snuggles.xml")
-    XML_FILE             = File.join(ASSETS_DIR, "staff.xml")
-    XML_XINCLUDE_FILE    = File.join(ASSETS_DIR, "xinclude.xml")
-    XML_ATOM_FILE        = File.join(ASSETS_DIR, "atom.xml")
-    XSLT_FILE            = File.join(ASSETS_DIR, "staff.xslt")
-    XPATH_FILE           = File.join(ASSETS_DIR, "slow-xpath.xml")
+    SHIFT_JIS_XML = File.join(ASSETS_DIR, "shift_jis.xml")
+    SNUGGLES_FILE = File.join(ASSETS_DIR, "snuggles.xml")
+    XML_FILE = File.join(ASSETS_DIR, "staff.xml")
+    XML_XINCLUDE_FILE = File.join(ASSETS_DIR, "xinclude.xml")
+    XML_ATOM_FILE = File.join(ASSETS_DIR, "atom.xml")
+    XSLT_FILE = File.join(ASSETS_DIR, "staff.xslt")
+    XPATH_FILE = File.join(ASSETS_DIR, "slow-xpath.xml")
 
     def skip_unless_libxml2(msg = "this test should only run with libxml2")
-      skip(msg) unless Nokogiri.uses_libxml?
+      return if Nokogiri.uses_libxml?
+      return if defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY
+
+      skip(msg)
     end
 
     def skip_unless_libxml2_patch(patch_name)
@@ -87,9 +90,10 @@ module Nokogiri
         raise("checking for nonexistent patch file #{patch_name.inspect}")
       end
 
-      unless Nokogiri.libxml2_patches.include?(patch_name)
-        skip("this test needs libxml2 patched with #{patch_name}")
-      end
+      return if Nokogiri.libxml2_patches.include?(patch_name)
+      return if defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY
+
+      skip("this test needs libxml2 patched with #{patch_name}")
     end
 
     def skip_unless_jruby(msg = "this test should only run with jruby")
@@ -335,7 +339,7 @@ module Nokogiri
     # returns the page size in bytes
     # will only work on linux
     def meminfo_page_size
-      @page_size ||= %x(getconf PAGESIZE).chomp.to_i
+      @page_size ||= `getconf PAGESIZE`.chomp.to_i
     end
 
     # returns the vmsize in bytes
@@ -421,14 +425,14 @@ module Nokogiri
         "memwatch: %s: slope = %.5f (r^2 = %.3f)\n",
         method,
         b_coeff,
-        r_squared,
+        r_squared
       )
 
       begin
         # we use `< 1` because losing more than 1 byte per iteration is a leak
         refute(
           b_coeff >= 1 && r_squared >= 0.7,
-          "best-fit slope #{b_coeff} (r^2=#{r_squared}) should be close to zero",
+          "best-fit slope #{b_coeff} (r^2=#{r_squared}) should be close to zero"
         )
       rescue Minitest::Assertion => e
         if retry_once
@@ -569,7 +573,7 @@ module Nokogiri
           :cdata_block,
           :processing_instruction,
           :error,
-          :warning,
+          :warning
         ].each do |name|
           define_method name do |*arguments|
             @items << [name, *arguments]
@@ -579,11 +583,11 @@ module Nokogiri
 
         class Items < Array
           def get_root_content(root_name)
-            items          = clone
+            items = clone
             is_inside_root = false
 
             items.select! do |item|
-              method_name  = item[0]
+              method_name = item[0]
               element_name = item[1]
 
               case method_name
@@ -617,7 +621,7 @@ module Nokogiri
           def strip_text!(method_names)
             each do |item|
               method_name = item[0]
-              text        = item[1]
+              text = item[1]
 
               text.strip! if method_names.include?(method_name)
             end

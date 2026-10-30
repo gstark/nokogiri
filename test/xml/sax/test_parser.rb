@@ -71,12 +71,11 @@ module Nokogiri
               parser.parse_file("")
             end
             assert_raises(Errno::EISDIR) do
-              parser.parse_file(File.expand_path(File.dirname(__FILE__)))
+              parser.parse_file(__dir__)
             end
           end
 
           it "parses a compressed file" do
-            skip("libxml2 legacy support") unless Nokogiri.uses_libxml? && Nokogiri::LIBXML_ZLIB_ENABLED
             skip("libxml2 >= 2.15 requires callers to pass XML_PARSE_UNZIP to enable decompression") if Nokogiri.uses_libxml?(">= 2.15.0")
 
             filename = XML_FILE + ".gz"
@@ -102,7 +101,7 @@ module Nokogiri
           ['<?xml version="1.0" standalone="yes"?>', ["1.0", "yes"]],
           ['<?xml version="1.0" standalone="no"?>', ["1.0", "no"]],
           ['<?xml version="1.0" encoding="UTF-8" standalone="no"?>', ["1.0", "UTF-8", "no"]],
-          ['<?xml version="1.0" encoding="ISO-8859-1" standalone="yes"?>', ["1.0", "ISO-8859-1", "yes"]],
+          ['<?xml version="1.0" encoding="ISO-8859-1" standalone="yes"?>', ["1.0", "ISO-8859-1", "yes"]]
         ].each do |decl, value|
           it "parses xml decl '#{decl}'" do
             parser = Nokogiri::XML::SAX::Parser.new(Doc.new)
@@ -475,7 +474,7 @@ module Nokogiri
 
           assert_equal(
             [["p", [["xmlns:foo", "http://foo.example.com/"]]]],
-            parser.document.start_elements,
+            parser.document.start_elements
           )
         end
 
@@ -487,7 +486,7 @@ module Nokogiri
 
           assert_equal(
             [["xml-stylesheet", 'href="a.xsl" type="text/xsl"']],
-            parser.document.processing_instructions,
+            parser.document.processing_instructions
           )
         end
 
@@ -523,7 +522,7 @@ module Nokogiri
 
             assert_equal(
               [["Root", []], ["Data", []]],
-              parser.document.start_elements,
+              parser.document.start_elements
             )
           end
 
@@ -534,7 +533,7 @@ module Nokogiri
 
             assert_equal(
               [["Root", []], ["Data", []], ["Item", []], ["Data", []], ["Item", []]],
-              parser.document.start_elements,
+              parser.document.start_elements
             )
           end
         end

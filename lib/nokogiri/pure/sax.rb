@@ -7,7 +7,7 @@ module Nokogiri
     # SAX driver. It walks the same XML the DOM parser accepts and sends
     # events to a SAX::Document. XML recovery is off unless the context asks.
     class SaxParser
-      NAME = /[\p{L}_:][\p{L}\p{N}_:.\-]*/.freeze
+      NAME = /[\p{L}_:][\p{L}\p{N}_:.-]*/
       XML_NS = "http://www.w3.org/XML/1998/namespace"
 
       def initialize(context, handler)
@@ -78,6 +78,7 @@ module Nokogiri
         if text.valid_encoding?
           text.encode(Encoding::UTF_8)
         else
+          error("Input is not proper UTF-8, indicate encoding !") if @push
           text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
         end
       end
@@ -288,7 +289,7 @@ module Nokogiri
         [
           attributes.assoc("version")&.last,
           attributes.assoc("encoding")&.last,
-          attributes.assoc("standalone")&.last,
+          attributes.assoc("standalone")&.last
         ]
       end
 
@@ -335,7 +336,7 @@ module Nokogiri
           attributes,
           prefix,
           uri,
-          namespaces,
+          namespaces
         )
         return if @stopped
 
@@ -344,7 +345,7 @@ module Nokogiri
           return
         end
 
-        @stack << { qname: qname, local: local, prefix: prefix, uri: uri, line: tag_line }
+        @stack << {qname: qname, local: local, prefix: prefix, uri: uri, line: tag_line}
         @scopes << namespaces
       end
 
@@ -462,16 +463,16 @@ module Nokogiri
           skip_space
           system_id = read_quoted
           ndata = read_ndata
-          store_entity(name, { kind: :external, system_id: system_id, ndata: ndata }) unless parameter
+          store_entity(name, {kind: :external, system_id: system_id, ndata: ndata}) unless parameter
         elsif @scanner.check(/SYSTEM/)
           consume("SYSTEM")
           skip_space
           system_id = read_quoted
           ndata = read_ndata
-          store_entity(name, { kind: :external, system_id: system_id, ndata: ndata }) unless parameter
+          store_entity(name, {kind: :external, system_id: system_id, ndata: ndata}) unless parameter
         else
           value = read_quoted
-          store_entity(name, { kind: :internal, value: value }) unless parameter
+          store_entity(name, {kind: :internal, value: value}) unless parameter
         end
         skip_space
         consume(">")
@@ -519,8 +520,10 @@ module Nokogiri
           return [[], []] if @stopped && !@recovery
 
           if name == "xmlns"
+            warn_namespace(value)
             namespaces << [nil, value]
           elsif name.start_with?("xmlns:")
+            warn_namespace(value)
             namespaces << [name.split(":", 2).last, value]
           else
             prefix, local = split_name(name)
@@ -671,6 +674,13 @@ module Nokogiri
         return if text.empty?
 
         callback(:characters, text.dup)
+      end
+
+      def warn_namespace(value)
+        return if value.nil? || value.empty?
+        return if value.match?(/\A[A-Za-z][A-Za-z0-9+.-]*:/)
+
+        callback(:warning, "URI #{value} is not absolute\n")
       end
 
       def lookup_prefix(prefix, local_namespaces)
@@ -870,7 +880,7 @@ module Nokogiri
             unless input.is_a?(String)
               raise TypeError, "wrong argument type #{type_name(input)} (expected String)"
             end
-            raise RuntimeError, "input string cannot be empty" if input.empty?
+            raise "input string cannot be empty" if input.empty?
 
             build_context(input, encoding)
           end
@@ -888,7 +898,19 @@ module Nokogiri
               raise TypeError, "no implicit conversion of #{type_name(path)} into String"
             end
 
-            build_context(File.binread(path.to_str), encoding)
+            bytes = File.binread(path.to_str)
+            bytes = gunzip(bytes) if gzip?(bytes)
+            build_context(bytes, encoding)
+          end
+
+          def gzip?(bytes)
+            bytes.bytesize >= 2 && bytes.getbyte(0) == 0x1F && bytes.getbyte(1) == 0x8B
+          end
+
+          def gunzip(bytes)
+            require "zlib"
+            require "stringio"
+            Zlib::GzipReader.new(StringIO.new(bytes)).read
           end
 
           def build_context(input, encoding)
@@ -920,18 +942,14 @@ module Nokogiri
           nil
         end
 
-        def replace_entities
-          @replace_entities
-        end
+        attr_reader :replace_entities
 
         def replace_entities=(value)
           @replace_entities = !value.nil? && value != false
           value
         end
 
-        def recovery
-          @recovery
-        end
+        attr_reader :recovery
 
         def recovery=(value)
           @recovery = !value.nil? && value != false
@@ -953,27 +971,24 @@ module Nokogiri
       class PushParser
         def initialize_native(_sax_parser, _filename = nil, encoding = nil)
           @options = 0
+          @replace_entities = false
           @syntax_error = nil
           @push_session = nil
           @forced_encoding = encoding
         end
 
-        def options
-          @options
-        end
+        attr_reader :options
 
         def options=(value)
           @options = Integer(value)
           value
         end
 
-        # Non-libxml push parsers always replace entities.
-        def replace_entities
-          true
-        end
+        attr_reader :replace_entities
 
-        def replace_entities=(_value)
-          true
+        def replace_entities=(value)
+          @replace_entities = !value.nil? && value != false
+          value
         end
 
         private
@@ -992,7 +1007,7 @@ module Nokogiri
               text,
               finishing: last_chunk == true,
               recovery: html_push? || (@options & XML::ParseOptions::RECOVER) != 0,
-              replace_entities: true,
+              replace_entities: @replace_entities
             )
           rescue XML::SyntaxError => error
             @syntax_error = error

@@ -209,7 +209,9 @@ module Nokogiri
 
   # :nodoc:
   def self.uses_gumbo?
-    uses_libxml? # TODO: replace with Gumbo functionality
+    return true if defined?(PURE_RUBY) && PURE_RUBY
+
+    uses_libxml?
   end
 
   # :nodoc:

@@ -6,7 +6,7 @@ require "helper"
 # matrix loops below run at class-definition time, before `let` methods exist.
 xi_2001 = "http://www.w3.org/2001/XInclude"
 xi_2003 = "http://www.w3.org/2003/XInclude"
-namespaces = { "2001" => xi_2001, "2003" => xi_2003 }
+namespaces = {"2001" => xi_2001, "2003" => xi_2003}
 
 describe "xinclude processing" do
   let(:namespace) { xi_2001 }
@@ -23,7 +23,8 @@ describe "xinclude processing" do
   end
 
   before do
-    skip_unless_libxml2("XInclude behavior and use-after-free protection are specific to the libxml2 C extension")
+    xinclude_ready = Nokogiri.uses_libxml? || (defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY)
+    skip("XInclude behavior and use-after-free protection are specific to the libxml2 C extension") unless xinclude_ready
   end
 
   def run_xinclude(target, noxincnode: false, safe_copy: true, nowarning: false)

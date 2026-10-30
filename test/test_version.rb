@@ -30,7 +30,11 @@ module TestVersionInfoTests
   end
 
   def test_version_info_for_xerces_and_nekohtml
-    skip_unless_jruby("xerces/nekohtml is only used for JRuby")
+    unless jruby?
+      refute(version_info.key?("other_libraries"))
+      return
+    end
+
     assert_equal(Nokogiri::XERCES_VERSION, version_info["other_libraries"]["xerces:xercesImpl"])
     assert_equal(Nokogiri::NEKO_VERSION, version_info["other_libraries"]["net.sourceforge.htmlunit:neko-htmlunit"])
     refute_nil(version_info["other_libraries"]["isorelax:isorelax"])
@@ -43,7 +47,12 @@ module TestVersionInfoTests
   end
 
   def test_version_info_for_libxml
-    skip_unless_libxml2("libxml2 is only used for CRuby")
+    unless Nokogiri.uses_libxml?
+      refute(version_info.key?("libxml"))
+      refute(Nokogiri.const_defined?(:LIBXML_COMPILED_VERSION))
+      refute(Nokogiri.const_defined?(:LIBXML_LOADED_VERSION))
+      return
+    end
 
     if Nokogiri::VersionInfo.instance.libxml2_using_packaged?
       assert_equal("packaged", version_info["libxml"]["source"])
@@ -75,7 +84,12 @@ module TestVersionInfoTests
   end
 
   def test_version_info_for_libxslt
-    skip_unless_libxml2("libxslt is only used for CRuby")
+    unless Nokogiri.uses_libxml?
+      refute(version_info.key?("libxslt"))
+      refute(Nokogiri.const_defined?(:LIBXSLT_COMPILED_VERSION))
+      refute(Nokogiri.const_defined?(:LIBXSLT_LOADED_VERSION))
+      return
+    end
 
     if Nokogiri::VersionInfo.instance.libxml2_using_packaged?
       assert_equal("packaged", version_info["libxslt"]["source"])
@@ -107,7 +121,7 @@ class TestVersionInfo
   class Base < Nokogiri::TestCase
     let(:version_info) do
       version_info = Dir.chdir(ROOTDIR) do
-        %x(#{RUBYEXEC} -Ilib -e 'require "json"; require "#{require_name}"; puts Nokogiri::VERSION_INFO.to_json')
+        `#{RUBYEXEC} -Ilib -e 'require "json"; require "#{require_name}"; puts Nokogiri::VERSION_INFO.to_json'`
       end
       JSON.parse(version_info)
     end
