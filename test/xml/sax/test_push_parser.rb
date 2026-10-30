@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # frozen_string_literal: true
 
 require "helper"
@@ -225,7 +224,14 @@ describe Nokogiri::XML::SAX::PushParser do
   end
 
   it :test_replace_entities_attribute_behavior do
-    if Nokogiri.uses_libxml?
+    if Nokogiri.jruby?
+      # initially true
+      assert parser.replace_entities
+
+      # ignore attempts to set to false
+      parser.replace_entities = false # TODO: should we raise an exception here?
+      assert parser.replace_entities
+    else
       # initially false
       refute parser.replace_entities
 
@@ -236,13 +242,6 @@ describe Nokogiri::XML::SAX::PushParser do
       # can be set to false
       parser.replace_entities = false
       refute parser.replace_entities
-    else
-      # initially true
-      assert parser.replace_entities
-
-      # ignore attempts to set to false
-      parser.replace_entities = false # TODO: should we raise an exception here?
-      assert parser.replace_entities
     end
   end
 

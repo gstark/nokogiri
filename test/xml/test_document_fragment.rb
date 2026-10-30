@@ -16,10 +16,10 @@ module Nokogiri
         end
 
         def test_fragment_is_relative
-          doc      = Nokogiri::XML('<root><a xmlns="blah" /></root>')
-          ctx      = doc.root.child
+          doc = Nokogiri::XML('<root><a xmlns="blah" /></root>')
+          ctx = doc.root.child
           fragment = Nokogiri::XML::DocumentFragment.new(doc, "<hello />", ctx)
-          hello    = fragment.child
+          hello = fragment.child
 
           assert_equal("hello", hello.name)
           assert_equal(doc.root.child.namespace, hello.namespace)
@@ -29,7 +29,7 @@ module Nokogiri
           doc = Nokogiri::XML('<root><a xmlns="blah" /></root>')
           assert(doc.root.child)
           fragment = doc.root.child.fragment("<hello />")
-          hello    = fragment.child
+          hello = fragment.child
 
           assert_equal("hello", hello.name)
           assert_equal(doc.root.child.namespace, hello.namespace)
@@ -110,13 +110,13 @@ module Nokogiri
 
         def test_fragment_children_search
           fragment = Nokogiri::XML::Document.new.fragment(
-            '<div><p id="content">hi</p></div>',
+            '<div><p id="content">hi</p></div>'
           )
           expected = fragment.children.xpath(".//p")
           assert_equal(1, expected.length)
 
-          css          = fragment.children.css("p")
-          search_css   = fragment.children.search("p")
+          css = fragment.children.css("p")
+          search_css = fragment.children.search("p")
           search_xpath = fragment.children.search(".//p")
           assert_equal(expected, css)
           assert_equal(expected, search_css)
@@ -148,13 +148,13 @@ module Nokogiri
           [
             [:css, "#content"],
             [:search, "#content"],
-            [:search, "./*[@id = 'content']"],
+            [:search, "./*[@id = 'content']"]
           ].each do |method, query|
             result = frag.send(method, query)
             assert_equal(
               expected,
               result,
-              "fragment search with :#{method} using '#{query}' expected '#{expected}' got '#{result}'",
+              "fragment search with :#{method} using '#{query}' expected '#{expected}' got '#{result}'"
             )
           end
         end
@@ -324,7 +324,9 @@ module Nokogiri
         end
 
         def test_in_context_fragment_parsing_recovery
-          skip("This tests behavior in libxml 2.13") unless Nokogiri.uses_libxml?(">= 2.13.0")
+          libxml_213 = Nokogiri.uses_libxml?(">= 2.13.0")
+          pure_ruby = defined?(Nokogiri::PURE_RUBY) && Nokogiri::PURE_RUBY
+          skip("This tests behavior in libxml 2.13") unless libxml_213 || pure_ruby
 
           # https://github.com/sparklemotion/nokogiri/issues/2092
           context_xml = "<root xmlns:n='https://example.com/foo'></root>"
@@ -567,8 +569,8 @@ module Nokogiri
             it "passes args to #initialize" do
               fragment = klass.new(xml, "<div>a</div>", options: ParseOptions::DEFAULT_XML)
               assert_equal(
-                [[xml, "<div>a</div>"], { options: ParseOptions::DEFAULT_XML }],
-                fragment.initialized_with,
+                [[xml, "<div>a</div>"], {options: ParseOptions::DEFAULT_XML}],
+                fragment.initialized_with
               )
             end
           end

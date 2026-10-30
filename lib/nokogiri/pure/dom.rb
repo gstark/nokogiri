@@ -75,6 +75,12 @@ module Nokogiri
         state
       end
 
+      def mutable_children
+        return @children unless @children.frozen?
+
+        @children = []
+      end
+
       def fast_fill(type, name, document, content, line)
         @type = type
         @name = name
@@ -128,7 +134,7 @@ module Nokogiri
       def initialize(document, prefix, href)
         @document = document
         @prefix = prefix&.to_s
-        @prefix = nil if @prefix&.empty?
+        @prefix = nil if @prefix && @prefix.empty?
         @href = href&.to_s
       end
 
@@ -143,7 +149,7 @@ module Nokogiri
           unless klass_name == "Comment" || klass_name == "EntityReference" || klass_name == "ProcessingInstruction"
             warn(
               "Passing a Node as the #{position} parameter to #{klass_name}.new is deprecated. Please pass a Document instead. This will become an error in Nokogiri v1.17.0.",
-              category: :deprecated,
+              category: :deprecated
             )
           end
           document.document
@@ -173,17 +179,17 @@ module Nokogiri
         unless document.is_a?(Document)
           warn(
             "Passing a Node as the second parameter to Node.new is deprecated. Please pass a Document instead, or prefer an alternative constructor like Node#add_child. This will become an error in Nokogiri v1.17.0.",
-            category: :deprecated,
+            category: :deprecated
           )
         end
 
         owner = document.is_a?(Document) ? document : document.document
-        node = (self == Node ? Element : self).allocate
+        node = ((self == Node) ? Element : self).allocate
         Pure::State.attach(
           node,
           type: ELEMENT_NODE,
           name: name.to_s,
-          document: owner,
+          document: owner
         )
         node.send(:initialize, name, document, *rest, &block)
         yield node if block_given?
@@ -244,7 +250,11 @@ module Nokogiri
 
       def content
         case node_type
-        when TEXT_NODE, CDATA_SECTION_NODE, COMMENT_NODE, PI_NODE, ATTRIBUTE_NODE
+        when TEXT_NODE, CDATA_SECTION_NODE
+          # xsl:strip-space must not clear a text node Ruby has already read.
+          @xslt_observed = true
+          pure.content.to_s
+        when COMMENT_NODE, PI_NODE, ATTRIBUTE_NODE
           pure.content.to_s
         else
           collect_text(pure)
@@ -367,7 +377,20 @@ module Nokogiri
 
       def add_child_node(node)
         retire_flat_tree!
-        if text? || cdata? || comment? || processing_instruction? || node_type == ATTRIBUTE_NODE || node_type == ENTITY_REF_NODE
+        if node_type == ATTRIBUTE_NODE
+          unless node.text? || node.cdata? || node.node_type == ENTITY_REF_NODE
+            raise ArgumentError, "cannot add a child to a #{name} node"
+          end
+
+          raise_if_cycle!(self, node)
+          node.unlink
+          Pure::Support.rehome(node, document)
+          node.pure.parent = self
+          pure.mutable_children << node
+          node.decorate! if node.respond_to?(:decorate!)
+          return node
+        end
+        if text? || cdata? || comment? || processing_instruction? || node_type == ENTITY_REF_NODE
           raise ArgumentError, "cannot add a child to a #{name} node"
         end
         raise_if_cycle!(self, node)
@@ -570,6 +593,8 @@ module Nokogiri
 
         dtd = build_dtd(name, external_id, system_id)
         add_child_node(dtd)
+        children = pure.children
+        children.insert(0, children.pop) unless children.first.equal?(dtd)
         dtd
       end
 
@@ -618,10 +643,10 @@ module Nokogiri
           node,
           type: ENTITY_DECL,
           name: name.to_s,
-          document: document? ? self : self.document,
+          document: document? ? self : document,
           content: content&.to_s,
           external_id: external_id&.to_s,
-          system_id: system_id&.to_s,
+          system_id: system_id&.to_s
         )
         node.instance_variable_set(:@entity_type, type || XML::EntityDecl::INTERNAL_GENERAL)
         node
@@ -631,20 +656,160 @@ module Nokogiri
         to_html
       end
 
+      HTML5_VOID_TAGS = %w[
+        area base basefont bgsound br col embed frame hr img input keygen
+        link meta param source track wbr
+      ].freeze
+      HTML5_RAW_TEXT_TAGS = %w[
+        style script xmp iframe noembed noframes plaintext noscript
+      ].freeze
+      HTML5_NEWLINE_TAGS = %w[pre textarea listing].freeze
+      private_constant :HTML5_VOID_TAGS, :HTML5_RAW_TEXT_TAGS, :HTML5_NEWLINE_TAGS
+
       def prepend_newline?
-        false
+        return false unless element?
+        return false if namespace
+        return false unless HTML5_NEWLINE_TAGS.include?(name)
+
+        child = pure.children.first
+        child&.text? && child.content.start_with?("\n")
       end
 
-      def html_standard_serialize(*)
-        to_html
+      def html_standard_serialize(preserve_newline = false)
+        buffer = +""
+        append_html5(buffer, preserve_newline)
+        buffer
       end
 
-      def process_xincludes(_options)
+      def append_html5(buffer, preserve_newline)
+        case node_type
+        when ELEMENT_NODE
+          buffer << "<"
+          append_html5_tag_name(buffer)
+          pure.attributes.each do |attr|
+            buffer << " "
+            attr.append_html5(buffer, preserve_newline)
+          end
+          buffer << ">"
+          return if html5_void_element?
+
+          buffer << "\n" if preserve_newline && prepend_newline?
+          pure.children.each { |child| child.append_html5(buffer, preserve_newline) }
+          buffer << "</"
+          append_html5_tag_name(buffer)
+          buffer << ">"
+        when ATTRIBUTE_NODE
+          append_html5_attr_name(buffer)
+          buffer << "=\""
+          append_html5_escaped(buffer, content.to_s, true)
+          buffer << "\""
+        when TEXT_NODE
+          if parent&.send(:html5_raw_text_element?)
+            buffer << content.to_s
+          else
+            append_html5_escaped(buffer, content.to_s, false)
+          end
+        when CDATA_SECTION_NODE
+          buffer << "<![CDATA[" << content.to_s << "]]>"
+        when COMMENT_NODE
+          buffer << "<!--" << content.to_s << "-->"
+        when PI_NODE
+          buffer << "<?" << content.to_s << ">"
+        when DTD_NODE
+          buffer << "<!DOCTYPE " << name.to_s << ">"
+        when DOCUMENT_NODE, DOCUMENT_FRAG_NODE, HTML_DOCUMENT_NODE
+          pure.children.each { |child| child.append_html5(buffer, preserve_newline) }
+        else
+          raise "Unsupported document node (#{node_type}); this is a bug in Nokogiri"
+        end
+      end
+
+      def append_html5_tag_name(buffer)
+        ns = namespace
+        tag = name.to_s
+        if ns&.href && ns.prefix &&
+            ns.href != Pure::Html5::HTML_NS &&
+            ns.href != Pure::Html5::MATHML_NS &&
+            ns.href != Pure::Html5::SVG_NS
+          buffer << ns.prefix << ":"
+          colon = tag.index(":")
+          tag = tag[(colon + 1)..] if colon
+        end
+        buffer << tag
+      end
+      private :append_html5_tag_name
+
+      def append_html5_attr_name(buffer)
+        ns = namespace
+        tag = name.to_s
+        if ns&.href
+          local = tag.index(":") ? tag[(tag.index(":") + 1)..] : tag
+          case ns.href
+          when Pure::Html5::XML_NS
+            buffer << "xml:"
+            tag = local
+          when Pure::Html5::XMLNS_NS
+            buffer << "xmlns:" unless local == "xmlns"
+            tag = local
+          when Pure::Html5::XLINK_NS
+            buffer << "xlink:"
+            tag = local
+          else
+            if ns.prefix
+              buffer << ns.prefix << ":"
+              tag = local
+            end
+          end
+        end
+        buffer << tag
+      end
+      private :append_html5_attr_name
+
+      def append_html5_escaped(buffer, text, attribute)
+        text.each_char do |char|
+          buffer << if char == "&"
+            "&amp;"
+          elsif char == "\u00A0"
+            "&nbsp;"
+          elsif attribute && char == '"'
+            "&quot;"
+          elsif !attribute && char == "<"
+            "&lt;"
+          elsif !attribute && char == ">"
+            "&gt;"
+          else
+            char
+          end
+        end
+      end
+      private :append_html5_escaped
+
+      def html5_void_element?
+        html5_one_of?(HTML5_VOID_TAGS)
+      end
+      private :html5_void_element?
+
+      def html5_raw_text_element?
+        html5_one_of?(HTML5_RAW_TEXT_TAGS)
+      end
+      private :html5_raw_text_element?
+
+      def html5_one_of?(names)
+        return false unless element?
+        return false if namespace
+
+        names.include?(name)
+      end
+      private :html5_one_of?
+
+      def process_xincludes(options)
+        require_relative "xinclude"
+        Pure::XInclude.apply(self, Integer(options))
         self
       end
 
-      def safe_process_xinclude(_options)
-        self
+      def safe_process_xinclude(options)
+        process_xincludes(options)
       end
 
       protected
@@ -669,7 +834,7 @@ module Nokogiri
         if (colon = name.index(":"))
           prefix = name[0...colon]
           local = name[(colon + 1)..]
-          href = prefix == "xml" ? Pure::XML_NS_HREF : namespace_scopes.find { |ns| ns.prefix == prefix }&.href
+          href = (prefix == "xml") ? Pure::XML_NS_HREF : namespace_scopes.find { |ns| ns.prefix == prefix }&.href
           attr = if href
             pure.attributes.find { |item| item.name == local && item.namespace&.href == href }
           else
@@ -846,6 +1011,7 @@ module Nokogiri
       end
 
       def adopt_attribute_name(node)
+        return if defined?(HTML5::Document) && node.document.is_a?(HTML5::Document)
         return unless node.namespace.nil? || node.namespace.prefix.nil?
         return unless node.name.include?(":")
 
@@ -1030,7 +1196,7 @@ module Nokogiri
           name: name.to_s,
           document: document? ? self : document,
           external_id: external_id&.to_s,
-          system_id: system_id&.to_s,
+          system_id: system_id&.to_s
         )
         dtd
       end
@@ -1058,7 +1224,7 @@ module Nokogiri
           document,
           type: type,
           name: "document",
-          version: version,
+          version: version
         )
         document.pure.document = document
         document.send(:initialize, *args, &block)
@@ -1198,7 +1364,7 @@ module Nokogiri
           fragment,
           type: DOCUMENT_FRAG_NODE,
           name: "#document-fragment",
-          document: doc,
+          document: doc
         )
         fragment
       end
@@ -1213,7 +1379,7 @@ module Nokogiri
           type: TEXT_NODE,
           name: "text",
           document: owner,
-          content: content.to_s,
+          content: content.to_s
         )
         node.send(:initialize, content, document, *rest, &block)
         yield node if block_given?
@@ -1230,7 +1396,7 @@ module Nokogiri
           type: COMMENT_NODE,
           name: "comment",
           document: owner,
-          content: content.to_s,
+          content: content.to_s
         )
         node.send(:initialize, document, content, *rest, &block)
         yield node if block_given?
@@ -1248,7 +1414,7 @@ module Nokogiri
           type: CDATA_SECTION_NODE,
           name: "#cdata-section",
           document: owner,
-          content: text,
+          content: text
         )
         node.send(:initialize, document, content, *rest, &block)
         yield node if block_given?
@@ -1265,7 +1431,7 @@ module Nokogiri
           type: PI_NODE,
           name: name.to_s,
           document: owner,
-          content: content.to_s,
+          content: content.to_s
         )
         node.send(:initialize, document, name, content, *rest, &block)
         yield node if block_given?
@@ -1284,7 +1450,7 @@ module Nokogiri
           node,
           type: ATTRIBUTE_NODE,
           name: name.to_s,
-          document: document,
+          document: document
         )
         node.send(:initialize, document, name, *rest, &block)
         yield node if block_given?
@@ -1293,8 +1459,34 @@ module Nokogiri
 
       def value=(content)
         retire_html_cache!
-        pure.content = content.nil? ? nil : content.to_s
+        pure.children.dup.each(&:unlink)
+        pure.content = content&.to_s
         content
+      end
+
+      def child
+        materialize_text_child
+        pure.children.first
+      end
+
+      def children
+        materialize_text_child
+        NodeSet.new(document, pure.children.dup)
+      end
+
+      private
+
+      def materialize_text_child
+        return unless pure.children.empty?
+        return if pure.content.to_s.empty?
+
+        text = XML::Text.allocate
+        state = Pure::State.leaf_new
+        state.fast_fill(TEXT_NODE, "text", document, pure.content.to_s, nil)
+        state.parent = self
+        text.instance_variable_set(:@pure, state)
+        pure.mutable_children << text
+        text
       end
     end
 
@@ -1306,7 +1498,7 @@ module Nokogiri
           node,
           type: ENTITY_REF_NODE,
           name: name.to_s,
-          document: owner,
+          document: owner
         )
         node.send(:initialize, document, name, *rest, &block)
         yield node if block_given?

@@ -25,10 +25,11 @@ module Nokogiri
       SIGNIFICANT_WHITESPACE = 14
       END_ELEMENT = 15
 
-      def initialize(source:, url:, encoding:, errors:, io:, options: 0)
+      def initialize(source:, url:, encoding:, errors:, io:, options: 0, error_owner: nil)
         @url = url&.to_s
         @constructor_encoding = encoding&.to_s
         @errors = errors
+        @error_owner = error_owner
         @options = options.to_i
         @io = io ? source : nil
         @buffer = io ? "".b : source.to_s.b
@@ -49,7 +50,7 @@ module Nokogiri
         @expansion_depth = 0
         @expansion_limits = []
         @stack = []
-        @scopes = [{ "xml" => XML_NS }]
+        @scopes = [{"xml" => XML_NS}]
         @default_ns = [nil]
         @lang_stack = [nil]
         @base_stack = [@url]
@@ -294,7 +295,8 @@ module Nokogiri
         error.instance_variable_set(:@level, 3)
         error.instance_variable_set(:@line, @line)
         error.instance_variable_set(:@column, @column)
-        @errors << error
+        # Call the public method. An override that does not return an Array raises TypeError.
+        (@error_owner ? @error_owner.errors : @errors) << error
         @failed = error
         @state = 2
         raise XML::SyntaxError, error.to_s
@@ -490,7 +492,7 @@ module Nokogiri
           record_external_entity(name)
         else
           value = read_quoted
-          @entities[name] ||= { external: false, value: value, base: @entity_base }
+          @entities[name] ||= {external: false, value: value, base: @entity_base}
           skip_space
           explode("Extra content at the end of the document") unless peek_byte == 62
           advance
@@ -521,7 +523,7 @@ module Nokogiri
           value: nil,
           system_id: system_id,
           unparsed: unparsed,
-          base: @entity_base,
+          base: @entity_base
         }
         skip_space
         explode("Extra content at the end of the document") unless peek_byte == 62
@@ -646,7 +648,7 @@ module Nokogiri
           lang: frame[:lang],
           base: frame[:base],
           empty: empty,
-          frame: frame,
+          frame: frame
         )
         unless empty
           push_context(frame)
@@ -688,7 +690,7 @@ module Nokogiri
           lang: frame[:lang],
           base: frame[:base],
           empty: false,
-          frame: frame,
+          frame: frame
         )
       end
 
@@ -741,7 +743,7 @@ module Nokogiri
           close_offset: empty ? @pos : nil,
           open_line: open_line,
           lang: lang_value,
-          base: base_value,
+          base: base_value
         }
       end
 
@@ -790,7 +792,7 @@ module Nokogiri
             local: local,
             raw: raw,
             href: href,
-            key: ns_prefix ? "xmlns:#{ns_prefix}" : "xmlns",
+            key: ns_prefix ? "xmlns:#{ns_prefix}" : "xmlns"
           }
         else
           {
@@ -799,7 +801,7 @@ module Nokogiri
             prefix: prefix,
             local: local,
             raw: raw,
-            value: expand_value(raw),
+            value: expand_value(raw)
           }
         end
       end
@@ -839,7 +841,7 @@ module Nokogiri
           local_name: "#text",
           value: decoded,
           raw: utf8(raw_bytes),
-          depth: @stack.length,
+          depth: @stack.length
         )
       end
 
@@ -864,7 +866,7 @@ module Nokogiri
           local_name: name,
           value: "",
           raw: "&#{name};",
-          depth: @stack.length,
+          depth: @stack.length
         )
       end
 
@@ -880,7 +882,7 @@ module Nokogiri
 
       def splice_bytes(bytes)
         text = bytes.to_s.b
-        @expansion_limits.map! { |limit| limit >= @pos ? limit + text.bytesize : limit }
+        @expansion_limits.map! { |limit| (limit >= @pos) ? limit + text.bytesize : limit }
         head = @buffer.byteslice(0, @pos) || "".b
         tail = @buffer.byteslice(@pos..) || "".b
         @buffer = head + text + tail
@@ -890,28 +892,28 @@ module Nokogiri
         return unless peek_byte == 38
 
         fill_until(@pos + 2)
-        return { kind: :broken } if @pos + 1 >= @buffer.bytesize
+        return {kind: :broken} if @pos + 1 >= @buffer.bytesize
 
         if @buffer.getbyte(@pos + 1) == 35
           return character_reference
         end
 
         index = @pos + 1
-        return { kind: :broken } unless name_start?(@buffer.getbyte(index))
+        return {kind: :broken} unless name_start?(@buffer.getbyte(index))
 
         index += 1
         index += 1 while name_char?(@buffer.getbyte(index))
         fill_until(index + 1)
-        return { kind: :broken } if index >= @buffer.bytesize || @buffer.getbyte(index) != 59
+        return {kind: :broken} if index >= @buffer.bytesize || @buffer.getbyte(index) != 59
 
         name = utf8(@buffer.byteslice(@pos + 1, index - @pos - 1))
         length = index + 1 - @pos
         if Entities::PREDEFINED.key?(name)
-          { kind: :predefined, name: name, length: length }
+          {kind: :predefined, name: name, length: length}
         elsif @entities.key?(name)
-          { kind: :general, name: name, length: length }
+          {kind: :general, name: name, length: length}
         else
-          { kind: :undefined, name: name, length: length }
+          {kind: :undefined, name: name, length: length}
         end
       end
 
@@ -924,9 +926,9 @@ module Nokogiri
           index += 1
           fill_until(index + 1)
         end
-        return { kind: :broken } if index >= @buffer.bytesize || @buffer.getbyte(index) != 59 || index == start
+        return {kind: :broken} if index >= @buffer.bytesize || @buffer.getbyte(index) != 59 || index == start
 
-        { kind: :char, length: index + 1 - @pos }
+        {kind: :char, length: index + 1 - @pos}
       end
 
       def hex_or_digit?(byte, hex)
@@ -1006,7 +1008,7 @@ module Nokogiri
           lang: lang || @lang_stack.last,
           base: base || @base_stack.last,
           empty: empty,
-          frame: frame,
+          frame: frame
         }
       end
 
@@ -1283,8 +1285,9 @@ module Nokogiri
           url: url,
           encoding: encoding,
           errors: @errors,
+          error_owner: self,
           io: io,
-          options: options,
+          options: options
         )
       end
 

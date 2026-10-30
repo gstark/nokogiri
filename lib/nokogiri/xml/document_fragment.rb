@@ -1,4 +1,3 @@
-# coding: utf-8
 # frozen_string_literal: true
 
 module Nokogiri
@@ -109,7 +108,7 @@ module Nokogiri
         children.each { |child| child.parent = self }
       end
 
-      if Nokogiri.uses_libxml?
+      unless Nokogiri.jruby?
         def dup
           new_document = document.dup
           new_fragment = self.class.new(new_document)
@@ -268,7 +267,7 @@ module Nokogiri
       def namespace_declarations(ctx)
         ctx.namespace_scopes.map do |namespace|
           prefix = namespace.prefix.nil? ? "" : ":#{namespace.prefix}"
-          %{xmlns#{prefix}="#{namespace.href}"}
+          %(xmlns#{prefix}="#{namespace.href}")
         end.join(" ")
       end
     end

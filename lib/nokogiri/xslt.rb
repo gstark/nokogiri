@@ -1,4 +1,3 @@
-# coding: utf-8
 # frozen_string_literal: true
 
 module Nokogiri
@@ -104,7 +103,7 @@ module Nokogiri
         params.flatten.each_slice(2).with_object([]) do |kv, quoted_params|
           key, value = kv.map(&:to_s)
           value = if value.include?("'")
-            "concat('#{value.gsub("'", %q{', "'", '})}')"
+            "concat('#{value.gsub("'", %q(', "'", '))}')"
           else
             "'#{value}'"
           end
@@ -127,10 +126,23 @@ module Nokogiri
       #
       #  See Nokogiri::XSLT.parse for usage.
       #
-      def register(uri, custom_handler_class)
-        # NOTE: this is implemented in the C extension, see ext/nokogiri/xslt_stylesheet.c
-        raise NotImplementedError, "Nokogiri::XSLT.register is not implemented on JRuby"
-      end if Nokogiri.jruby?
+      if Nokogiri.jruby?
+        def register(uri, custom_handler_class)
+          # NOTE: this is implemented in the C extension, see ext/nokogiri/xslt_stylesheet.c
+          raise NotImplementedError, "Nokogiri::XSLT.register is not implemented on JRuby"
+        end
+      end
+
+      # Pure Ruby keeps the same global URI-to-class table the C extension uses.
+      def handlers
+        @handlers ||= {}
+      end
+
+      unless Nokogiri.jruby?
+        def register(uri, custom_handler_class)
+          handlers[uri.to_s] = custom_handler_class
+        end
+      end
     end
   end
 end

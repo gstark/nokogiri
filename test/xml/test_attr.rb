@@ -41,7 +41,7 @@ module Nokogiri
         street.value = "Y&ent1;"
 
         assert_equal("Y&ent1;", street.value)
-        assert_equal(%{street="Y&amp;ent1;"}, street.to_xml.strip)
+        assert_equal(%(street="Y&amp;ent1;"), street.to_xml.strip)
       end
 
       def test_set_value_returns_assigned_value
@@ -57,7 +57,7 @@ module Nokogiri
         foo.value = "Y&ent1;"
 
         assert_equal("Y&ent1;", foo.value)
-        assert_equal(%{foo="Y&amp;ent1;"}, foo.to_html.strip)
+        assert_equal(%(foo="Y&amp;ent1;"), foo.to_html.strip)
       end
 
       def test_set_value_with_blank_string_in_html_file
@@ -66,7 +66,7 @@ module Nokogiri
         foo.value = ""
 
         assert_equal("", foo.value)
-        assert_equal(%{foo=""}, foo.to_html.strip)
+        assert_equal(%(foo=""), foo.to_html.strip)
       end
 
       def test_set_value_with_nil_in_html_file
@@ -78,10 +78,10 @@ module Nokogiri
         assert_equal("", foo.value)
         if Nokogiri.uses_libxml?
           # libxml2 still emits a boolean attribute at serialize-time
-          assert_equal(%{foo}, foo.to_html.strip)
+          assert_equal(%(foo), foo.to_html.strip)
         else
           # jruby does not
-          assert_equal(%{foo=""}, foo.to_html.strip)
+          assert_equal(%(foo=""), foo.to_html.strip)
         end
       end
 
@@ -92,7 +92,7 @@ module Nokogiri
 
         assert_equal("", disabled.value)
         # we still emit a boolean attribute at serialize-time!
-        assert_equal(%{disabled}, disabled.to_html.strip)
+        assert_equal(%(disabled), disabled.to_html.strip)
       end
 
       def test_set_value_of_boolean_attr_with_nil_in_html_file
@@ -103,28 +103,24 @@ module Nokogiri
         # this may be surprising to people, see xmlGetPropNodeValueInternal
         assert_equal("", disabled.value)
         # but we emit a boolean attribute at serialize-time
-        assert_equal(%{disabled}, disabled.to_html.strip)
+        assert_equal(%(disabled), disabled.to_html.strip)
       end
 
       def test_set_value_does_not_pin_unwrapped_children
-        skip("memory-safety test specific to libxml2") unless Nokogiri.uses_libxml?
-
         doc = Nokogiri::XML.parse("<root foo='bar'/>")
         attr = doc.root.attribute("foo")
         node_cache = doc.instance_variable_get(:@node_cache)
-        node_cache_size = node_cache.length
+        node_cache_size = node_cache.length if node_cache
 
         10.times do |i|
           attr.value = i.to_s
         end
 
-        assert_equal(node_cache_size, node_cache.length)
+        assert_equal(node_cache_size, node_cache.length) if node_cache
         assert_equal("9", attr.value)
       end
 
       def test_set_value_does_not_free_wrapped_children
-        skip("memory-safety test specific to libxml2") unless Nokogiri.uses_libxml?
-
         attr = Nokogiri::XML.parse("<root foo='bar'/>").root.attribute("foo")
         child = attr.child # wrap the XML::Text node
 
@@ -136,8 +132,6 @@ module Nokogiri
       end
 
       def test_set_value_preserves_all_wrapped_children
-        skip("memory-safety test specific to libxml2") unless Nokogiri.uses_libxml?
-
         doc = Nokogiri::XML.parse(<<~XML)
           <!DOCTYPE root [<!ENTITY e "E">]>
           <root foo="a&e;b"/>

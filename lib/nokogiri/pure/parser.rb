@@ -7,7 +7,7 @@ module Nokogiri
     # XML parser for the pure Ruby backend.
     class Parser
       RECOVER = 1
-      NAME = /[\p{L}_:][\p{L}\p{N}_:.\-]*/.freeze
+      NAME = /[\p{L}_:][\p{L}\p{N}_:.-]*/
       UNQUOTED = /[^\s>\/]*/
       QUOTED_DQ = /[^"&]+/
       QUOTED_SQ = /[^'&]+/
@@ -15,14 +15,14 @@ module Nokogiri
       EMPTY_SCOPE = [].freeze
       # Quote-aware tag. The match stops at the tag's ">", including one
       # that sits inside a quoted attribute value.
-      FLAT_TAG = /<(?:[^>"']|"[^"]*"|'[^']*')*>/.freeze
+      FLAT_TAG = /<(?:[^>"']|"[^"]*"|'[^']*')*>/
       # One repeated sibling is learned from the first copy. A longer unit
       # stays on the general flat scan. Holes are attribute values and text.
       REPEAT_UNIT_MAX = 8192
-      REPEAT_TEXT = %q{((?:[^<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
-      REPEAT_DQ = %q{((?:[^"<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
-      REPEAT_SQ = %q{((?:[^'<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}.freeze
-      P_END_MESSAGE = 'The element type "p" must be terminated by the matching end-tag "</p>".'.freeze
+      REPEAT_TEXT = %q{((?:[^<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
+      REPEAT_DQ = %q{((?:[^"<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
+      REPEAT_SQ = %q{((?:[^'<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
+      P_END_MESSAGE = 'The element type "p" must be terminated by the matching end-tag "</p>".'
       P_END_ERROR = [P_END_MESSAGE, 0, 0, nil, false].freeze
 
       def self.parse(document, string, options)
@@ -37,7 +37,7 @@ module Nokogiri
           holder,
           type: XML::Node::DOCUMENT_FRAG_NODE,
           name: "#document-fragment",
-          document: document,
+          document: document
         )
         new(document, string, options, root: holder, context: context).parse_document
         holder.pure.children.dup.each(&:unlink)
@@ -97,7 +97,7 @@ module Nokogiri
         dtd = build_dtd(
           "html",
           "-//W3C//DTD HTML 4.0 Transitional//EN",
-          "http://www.w3.org/TR/REC-html40/loose.dtd",
+          "http://www.w3.org/TR/REC-html40/loose.dtd"
         )
         dtd.pure.parent = @document
         @document.pure.children.unshift(dtd)
@@ -156,7 +156,13 @@ module Nokogiri
         newlines = @flat_nl
         newline_at = 0
         newline_count = newlines.length
-        sc = StringScanner.new(string)
+        sc = nil
+        # One record reused for every plain tag. A fresh array per tag
+        # shows up in the allocation profile.
+        plain_info = []
+        # The next "&" stays cached. A fresh search from each text node
+        # reads through to the end of the document when that node has none.
+        next_amp = -1
         while pos < limit
           unless string.getbyte(pos) == 60
             nxt = string.byteindex("<", pos) || limit
@@ -171,9 +177,9 @@ module Nokogiri
                   index += 1
                 end
               else
-                amp = string.byteindex("&", pos)
+                next_amp = string.byteindex("&", pos) || limit if next_amp < pos
                 newline_at += 1 while newline_at < newline_count && newlines[newline_at] < nxt
-                if amp && amp < nxt && !plain_entities?(string, pos, length)
+                if next_amp < nxt && !plain_entities?(string, pos, length)
                   return nil
                 end
 
@@ -184,57 +190,80 @@ module Nokogiri
             next
           end
 
-          # The tag end is found in C. A search for the next quote from here
-          # would read the rest of the document on every bare tag.
-          sc.pos = pos
-          return nil unless sc.skip(FLAT_TAG)
+          # Plain tags are ASCII names and quoted values with no entities.
+          # A namespace declaration or a prefixed attribute keeps the
+          # quote-aware scan. That scan is in C. A search for the next
+          # quote from here would read the rest of the document on every
+          # bare tag.
+          if flat_plain_tag(string, pos, limit, plain_info)
+            gt = plain_info[0]
+            ending = plain_info[1]
+            name_off = plain_info[2]
+            name_len = plain_info[3]
+            local_delta = plain_info[4]
+            self_closing = plain_info[5]
+            attrs = plain_info[6]
+            if attrs
+              newline_at += 1 while newline_at < newline_count && newlines[newline_at] < pos
+              return nil unless flat_add_plain(
+                tree, string, name_off, name_len, local_delta, self_closing, attrs, newline_at + 1, stack
+              )
 
-          gt = sc.pos - 1
-          byte = string.getbyte(pos + 1)
-          if byte == 47
-            name_off = pos + 2
-            ending = true
+              pos = gt + 1
+              next
+            end
           else
-            return nil unless byte && byte < 128 && name_start_byte?(byte)
+            sc ||= StringScanner.new(string)
+            sc.pos = pos
+            return nil unless sc.skip(FLAT_TAG)
 
-            name_off = pos + 1
-            ending = false
-          end
-          index = name_off
-          local_delta = 0
-          while index < gt
-            byte = string.getbyte(index)
-            unless byte && (
-              (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 58 ||
-              (byte >= 48 && byte <= 57) || byte == 45 || byte == 46
-            )
-              break
-            end
-
-            local_delta = index - name_off + 1 if byte == 58 && local_delta.zero?
-            index += 1
-          end
-          return nil if index == name_off
-
-          name_len = index - name_off
-          self_closing = false
-          attributed = false
-          while index < gt
-            byte = string.getbyte(index)
+            gt = sc.pos - 1
+            byte = string.getbyte(pos + 1)
             if byte == 47
-              self_closing = true
-            elsif byte != 32 && byte != 9 && byte != 10 && byte != 13
-              attributed = true
-              break
-            end
-            index += 1
-          end
-          if attributed
-            return nil if ending
-            return nil unless flat_add_tag(tree, string, pos, gt, stack)
+              name_off = pos + 2
+              ending = true
+            else
+              return nil unless byte && byte < 128 && name_start_byte?(byte)
 
-            pos = gt + 1
-            next
+              name_off = pos + 1
+              ending = false
+            end
+            index = name_off
+            local_delta = 0
+            while index < gt
+              byte = string.getbyte(index)
+              unless byte && (
+                (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 58 ||
+                (byte >= 48 && byte <= 57) || byte == 45 || byte == 46
+              )
+                break
+              end
+
+              local_delta = index - name_off + 1 if byte == 58 && local_delta.zero?
+              index += 1
+            end
+            return nil if index == name_off
+
+            name_len = index - name_off
+            self_closing = false
+            attributed = false
+            while index < gt
+              byte = string.getbyte(index)
+              if byte == 47
+                self_closing = true
+              elsif byte != 32 && byte != 9 && byte != 10 && byte != 13
+                attributed = true
+                break
+              end
+              index += 1
+            end
+            if attributed
+              return nil if ending
+              return nil unless flat_add_tag(tree, string, pos, gt, stack)
+
+              pos = gt + 1
+              next
+            end
           end
 
           if ending
@@ -333,7 +362,7 @@ module Nokogiri
 
         return nil unless stamp_repeated(
           tree, string, nodes, hot_groups, re, sep, root_index,
-          body, child, limit, name_off, name_len, md,
+          body, child, limit, name_off, name_len, md
         )
 
         tree
@@ -354,7 +383,7 @@ module Nokogiri
 
           count += 1
           pos = md.byteend(0)
-          md = nil
+          nil
           if sep_len.positive? && repeat_eq?(string, pos, sep)
             after = pos + sep_len
             nxt = re.match(string, after)
@@ -398,7 +427,7 @@ module Nokogiri
         last = nodes.length
         while i < last
           spec = nodes[i]
-          parent = spec[1] < 0 ? root_index : slots[spec[1]]
+          parent = (spec[1] < 0) ? root_index : slots[spec[1]]
           if spec[0] == 3
             cap = spec[2]
             b = md.bytebegin(cap)
@@ -406,7 +435,7 @@ module Nokogiri
             slots[i] = tree.add_text_range(parent, b, e - b, flat_line(e))
           else
             anchor = spec[2]
-            base = anchor < 0 ? md.bytebegin(0) : md.byteend(anchor)
+            base = (anchor < 0) ? md.bytebegin(0) : md.byteend(anchor)
             name_off = base + spec[3]
             index = tree.add_element(parent, name_off, spec[4], spec[5], spec[6], flat_line(name_off), EMPTY_SCOPE)
             group_at = spec[7]
@@ -520,7 +549,7 @@ module Nokogiri
           end
 
           return nil unless repeat_emit_start(
-            string, pos, tag_end, src, hole_ends, groups, nodes, stack, from,
+            string, pos, tag_end, src, hole_ends, groups, nodes, stack, from
           )
 
           pos = tag_end
@@ -570,12 +599,12 @@ module Nokogiri
           byte = string.getbyte(cursor)
           if byte == 34 || byte == 39
             src << Regexp.escape(string.byteslice(lit, cursor - lit))
-            quote = byte == 34 ? "\"" : "'"
+            quote = (byte == 34) ? "\"" : "'"
             src << quote
             close = string.byteindex(quote, cursor + 1)
             return nil unless close && close < tag_end
 
-            src << (byte == 34 ? REPEAT_DQ : REPEAT_SQ)
+            src << ((byte == 34) ? REPEAT_DQ : REPEAT_SQ)
             src << quote
             caps << (hole_ends.length + 1)
             hole_ends << close
@@ -660,7 +689,7 @@ module Nokogiri
           return nil unless quote == 34 || quote == 39
 
           index += 1
-          close = string.byteindex(quote == 34 ? "\"" : "'", index)
+          close = string.byteindex((quote == 34) ? "\"" : "'", index)
           return nil unless close && close < stop
 
           attrs << [local, attr_prefix]
@@ -1017,7 +1046,7 @@ module Nokogiri
         quote = string.getbyte(index)
         return [nil, nil] unless quote == 34 || quote == 39
 
-        close = string.byteindex(quote == 34 ? "\"" : "'", index + 1)
+        close = string.byteindex((quote == 34) ? "\"" : "'", index + 1)
         return [nil, nil] unless close && close < limit
         return [nil, nil] if string.byteindex("&", index + 1)&.between?(index + 1, close - 1)
 
@@ -1152,7 +1181,7 @@ module Nokogiri
 
             quote = string.getbyte(index)
             if quote == 34 || quote == 39
-              close = string.byteindex(quote == 34 ? "\"" : "'", index + 1)
+              close = string.byteindex((quote == 34) ? "\"" : "'", index + 1)
               return nil unless close && close < limit
 
               value_off = index + 1
@@ -1419,7 +1448,7 @@ module Nokogiri
         while index < limit
           byte = string.getbyte(index)
           if byte == 34 || byte == 39
-            close = string.byteindex(byte == 34 ? "\"" : "'", index + 1)
+            close = string.byteindex((byte == 34) ? "\"" : "'", index + 1)
             return nil unless close
 
             index = close + 1
@@ -1455,6 +1484,158 @@ module Nokogiri
           tree.add_text(stack.last, decoded, flat_line(nxt))
         else
           tree.add_text_range(stack.last, pos, length, flat_line(nxt))
+        end
+        true
+      end
+
+      # Fills info and returns true when the tag is plain.
+      # info is [gt, ending, name_off, name_len, local_delta, self_closing, attrs].
+      # attrs is nil when the tag has none. A prefixed attribute, an
+      # entity, or xmlns makes this return nil so the general tag scan runs.
+      def flat_plain_tag(string, pos, limit, info)
+        index = pos + 1
+        return nil if index >= limit
+
+        byte = string.getbyte(index)
+        if byte == 47
+          ending = true
+          index += 1
+          return nil if index >= limit
+
+          byte = string.getbyte(index)
+        else
+          ending = false
+        end
+        return nil if byte.nil? || byte >= 128 || !name_start_byte?(byte)
+
+        name_off = index
+        local_delta = 0
+        index += 1
+        while index < limit
+          byte = string.getbyte(index)
+          name_byte = byte && (
+            (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 58 ||
+            (byte >= 48 && byte <= 57) || byte == 45 || byte == 46
+          )
+          break unless name_byte
+
+          local_delta = index - name_off + 1 if byte == 58 && local_delta.zero?
+          index += 1
+        end
+        name_len = index - name_off
+
+        self_closing = false
+        attrs = nil
+        while index < limit
+          byte = string.getbyte(index)
+          if byte == 62
+            info[0] = index
+            info[1] = ending
+            info[2] = name_off
+            info[3] = name_len
+            info[4] = local_delta
+            info[5] = self_closing
+            info[6] = attrs
+            return true
+          elsif byte == 47
+            return nil if ending || self_closing
+
+            self_closing = true
+            index += 1
+          elsif byte == 32 || byte == 9 || byte == 10 || byte == 13
+            index += 1
+          else
+            return nil if ending || self_closing
+
+            attr = flat_plain_attr(string, index, limit)
+            return nil unless attr
+
+            attrs ||= []
+            attrs << [attr[0], attr[1]]
+            index = attr[2]
+          end
+        end
+        nil
+      end
+
+      # One unprefixed attribute with no entity. The third value is the
+      # index after the closing quote. Nil means the general tag scan must run.
+      def flat_plain_attr(string, index, limit)
+        byte = string.getbyte(index)
+        return nil if byte.nil? || byte == 58 || byte >= 128 || !name_start_byte?(byte)
+
+        start = index
+        index += 1
+        while index < limit
+          byte = string.getbyte(index)
+          return nil if byte == 58
+
+          name_byte = byte && (
+            (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 ||
+            (byte >= 48 && byte <= 57) || byte == 45 || byte == 46
+          )
+          break unless name_byte
+
+          index += 1
+        end
+        name_len = index - start
+        return nil if name_len == 5 && string.getbyte(start) == 120 && string.byteslice(start, 5) == "xmlns"
+
+        while index < limit
+          byte = string.getbyte(index)
+          break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          index += 1
+        end
+        return nil unless byte == 61
+
+        index += 1
+        while index < limit
+          byte = string.getbyte(index)
+          break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          index += 1
+        end
+        return nil unless byte == 34 || byte == 39
+
+        quote = byte
+        index += 1
+        value_at = index
+        while index < limit
+          byte = string.getbyte(index)
+          return nil if byte.nil? || byte == 38
+          break if byte == quote
+
+          index += 1
+        end
+        return nil unless byte == quote
+
+        [string.byteslice(start, name_len), string.byteslice(value_at, index - value_at), index + 1]
+      end
+
+      # Add a start tag whose attributes are already plain strings.
+      def flat_add_plain(tree, string, name_off, name_len, local_delta, self_closing, attrs, line, stack)
+        ns_id = -1
+        if local_delta.zero?
+          found = @fn_map[nil]
+          ns_id = found if found
+        else
+          found = flat_lookup(tree, string.byteslice(name_off, local_delta - 1))
+          if found.nil?
+            local_delta = 0
+          else
+            ns_id = found
+          end
+        end
+
+        parent = stack.empty? ? -1 : stack.last
+        element = tree.add_element(parent, name_off, name_len, local_delta, ns_id, line, EMPTY_SCOPE)
+        attrs.each do |attr_name, value|
+          tree.add_attr(element, attr_name, -1, value)
+        end
+        unless self_closing
+          stack << element
+          @fn_stack << nil
         end
         true
       end
@@ -1643,7 +1824,7 @@ module Nokogiri
 
           index += 1
           value_at = index
-          close = string.byteindex(quote == 34 ? "\"" : "'", index)
+          close = string.byteindex((quote == 34) ? "\"" : "'", index)
           return nil unless close && close < stop
 
           raw = string.byteslice(value_at, close - value_at)
@@ -1659,21 +1840,22 @@ module Nokogiri
       # True when every "&" in the range is a predefined entity or a
       # character reference. A custom entity makes the flat path give up.
       def plain_entities?(string, from, length)
-        limit = from + length
-        amp = string.byteindex("&", from)
-        while amp && amp < limit
-          semi = string.byteindex(";", amp + 1)
-          return false unless semi && semi < limit
+        chunk = string.byteslice(from, length)
+        offset = 0
+        loop do
+          amp = chunk.byteindex("&", offset)
+          break if amp.nil?
 
-          name = string.byteslice(amp + 1, semi - amp - 1)
+          semi = chunk.byteindex(";", amp + 1)
+          return false unless semi
+
+          name = chunk.byteslice(amp + 1, semi - amp - 1)
           if name.getbyte(0) == 35
             return false unless decode_char_ref(name)
           else
             return false unless Entities::PREDEFINED.key?(name)
           end
-          break if semi + 1 >= limit
-
-          amp = string.byteindex("&", semi + 1)
+          offset = semi + 1
         end
         true
       end
@@ -2011,7 +2193,7 @@ module Nokogiri
               error(
                 %(The element type "#{open.name}" must be terminated by the matching end-tag "</#{open.name}>".),
                 level: nil,
-                location: false,
+                location: false
               )
             else
               error("Opening and ending tag mismatch: #{name}")
@@ -2029,7 +2211,7 @@ module Nokogiri
             error(
               %(The element type "#{open.name}" must be terminated by the matching end-tag "</#{open.name}>".),
               level: nil,
-              location: false,
+              location: false
             )
           else
             error("Opening and ending tag mismatch: #{name}")
@@ -2043,7 +2225,7 @@ module Nokogiri
 
       def read_end_tag_fast(string, pos, limit, saved_line, saved_column)
         index = pass_ascii_space(string, pos + 2, limit)
-        byte = index < limit ? string.getbyte(index) : nil
+        byte = (index < limit) ? string.getbyte(index) : nil
         return read_end_tag_slow(pos, saved_line, saved_column) unless byte && byte < 128 && name_start_byte?(byte)
 
         start = index
@@ -2159,7 +2341,7 @@ module Nokogiri
           name: name,
           document: @document,
           external_id: external_id,
-          system_id: system_id,
+          system_id: system_id
         )
         dtd
       end
@@ -2267,7 +2449,7 @@ module Nokogiri
           document: @document,
           content: value,
           external_id: external_id,
-          system_id: system_id,
+          system_id: system_id
         )
         node.instance_variable_set(:@entity_type, type)
         node.instance_variable_set(:@entity_base, base)
@@ -2285,7 +2467,7 @@ module Nokogiri
           node,
           type: XML::Node::ELEMENT_DECL,
           name: name,
-          document: @document,
+          document: @document
         )
         node.instance_variable_set(:@element_type, element_type_code(model))
         node.instance_variable_set(:@content_model, model)
@@ -2398,7 +2580,7 @@ module Nokogiri
           type: XML::Node::ATTRIBUTE_DECL,
           name: name,
           document: @document,
-          content: default,
+          content: default
         )
         node.instance_variable_set(:@attribute_type, attr_type)
         node.instance_variable_set(:@default_value, default)
@@ -2509,10 +2691,11 @@ module Nokogiri
       def apply_namespaces(element, qname, attributes)
         unless html_document?
           attributes.each do |attr_name, value|
+            expanded, = attribute_parts(value)
             if attr_name == "xmlns"
-              element.add_namespace_definition(nil, value)
+              element.add_namespace_definition(nil, expanded)
             elsif attr_name.start_with?("xmlns:")
-              element.add_namespace_definition(attr_name.split(":", 2).last, value)
+              element.add_namespace_definition(attr_name.split(":", 2).last, expanded)
             end
           end
 
@@ -2532,9 +2715,11 @@ module Nokogiri
         attributes.each do |attr_name, value|
           next if !html_document? && (attr_name == "xmlns" || attr_name.start_with?("xmlns:"))
 
+          expanded, pieces = attribute_parts(value)
           if html_document?
-            attr = make_node(XML::Attr, XML::Node::ATTRIBUTE_NODE, attr_name.downcase, value&.to_s)
+            attr = make_node(XML::Attr, XML::Node::ATTRIBUTE_NODE, attr_name.downcase, expanded)
             attr.pure.parent = element
+            attach_attribute_pieces(attr, pieces)
             element.pure.attributes << attr
             next
           end
@@ -2544,13 +2729,14 @@ module Nokogiri
             XML::Attr,
             XML::Node::ATTRIBUTE_NODE,
             attr_prefix ? attr_local : attr_name,
-            value&.to_s,
+            expanded
           )
           attr.pure.parent = element
+          attach_attribute_pieces(attr, pieces)
           if attr_prefix
             ns = find_namespace(attr_prefix, element)
             attr.pure.namespace = ns if ns
-            element.pure.lang = value if attr_prefix == "xml" && attr_local == "lang"
+            element.pure.lang = expanded if attr_prefix == "xml" && attr_local == "lang"
           end
           element.pure.attributes << attr
         end
@@ -2743,10 +2929,10 @@ module Nokogiri
       end
 
       def read_attribute_value
-        return read_quoted if @scanner.check(/['"]/)
+        return read_quoted(keep_pieces: true) if @scanner.check(/['"]/)
         return read_unquoted if html_document?
 
-        read_quoted
+        read_quoted(keep_pieces: true)
       end
 
       def read_unquoted
@@ -2755,18 +2941,21 @@ module Nokogiri
         value
       end
 
-      def read_quoted
+      def read_quoted(keep_pieces: false)
         quote = take_char
         unless quote == '"' || quote == "'"
           error("AttValue: \" or ' expected")
           return ""
         end
-        pattern = quote == '"' ? QUOTED_DQ : QUOTED_SQ
+        pattern = (quote == '"') ? QUOTED_DQ : QUOTED_SQ
         value = +""
+        literal = +""
+        piece_nodes = nil
         until @scanner.eos?
           run = @scanner.scan(pattern)
           if run
             value << run
+            literal << run
             account_text(run)
             next
           end
@@ -2781,26 +2970,60 @@ module Nokogiri
               ref << next_char
               break if next_char == ";"
             end
-            value << decode_attribute_entity(ref)
+            decoded, nodes = decode_attribute_reference(ref)
+            value << decoded
+            if nodes && keep_pieces
+              piece_nodes ||= []
+              piece_nodes << attribute_text_piece(literal) unless literal.empty?
+              literal = +""
+              piece_nodes.concat(nodes)
+            else
+              literal << decoded
+            end
           else
             value << char
+            literal << char
           end
         end
-        value
+        return value unless piece_nodes
+
+        piece_nodes << attribute_text_piece(literal) unless literal.empty?
+        [value, piece_nodes]
+      end
+
+      def attribute_parts(value)
+        value.is_a?(Array) ? value : [value&.to_s, nil]
+      end
+
+      def attach_attribute_pieces(attr, pieces)
+        return if pieces.nil?
+
+        pieces.each do |piece|
+          piece.pure.parent = attr
+          attr.pure.mutable_children << piece
+        end
+      end
+
+      def attribute_text_piece(text)
+        make_node(XML::Text, XML::Node::TEXT_NODE, "text", text)
+      end
+
+      def decode_attribute_reference(ref)
+        name = ref[1..-2]
+        if name.nil?
+          [ref, nil]
+        elsif name.start_with?("#") || Entities::PREDEFINED.key?(name)
+          [Entities.decode_predefined(ref), nil]
+        elsif (entity = lookup_entity(name))
+          [entity_text(entity), entity_reference_nodes(name, entity)]
+        else
+          error("Entity '#{name}' not defined")
+          [ref, [XML::EntityReference.new(@document, name)]]
+        end
       end
 
       def decode_attribute_entity(ref)
-        name = ref[1..-2]
-        if name.nil?
-          ref
-        elsif name.start_with?("#") || Entities::PREDEFINED.key?(name)
-          Entities.decode_predefined(ref)
-        elsif (entity = lookup_entity(name))
-          entity_text(entity)
-        else
-          error("Entity '#{name}' not defined")
-          ref
-        end
+        decode_attribute_reference(ref).first
       end
 
       def noent?
@@ -3094,13 +3317,13 @@ module Nokogiri
 
       def parse_particle
         skip_space
-        if @scanner.scan(/\(/)
+        if @scanner.scan("(")
           node = parse_group
           skip_space
-          @scanner.scan(/\)/)
+          @scanner.scan(")")
           node.instance_variable_set(:@occur, occurrence)
           node
-        elsif @scanner.scan(/#PCDATA/)
+        elsif @scanner.scan("#PCDATA")
           content_node(XML::ElementContent::PCDATA, "#PCDATA", nil, occurrence)
         else
           token = @scanner.scan(/[A-Za-z_:][\w:.-]*/)

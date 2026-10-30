@@ -55,10 +55,13 @@ module Nokogiri
         end
 
         it "encodes the library versions as UTF-8" do
-          skip_unless_libxml2
-
-          assert_equal(Encoding::UTF_8, Nokogiri::LIBXML_COMPILED_VERSION.encoding)
-          assert_equal(Encoding::UTF_8, Nokogiri::LIBXSLT_COMPILED_VERSION.encoding)
+          if Nokogiri.uses_libxml?
+            assert_equal(Encoding::UTF_8, Nokogiri::LIBXML_COMPILED_VERSION.encoding)
+            assert_equal(Encoding::UTF_8, Nokogiri::LIBXSLT_COMPILED_VERSION.encoding)
+          else
+            refute(Nokogiri.const_defined?(:LIBXML_COMPILED_VERSION))
+            refute(Nokogiri.const_defined?(:LIBXSLT_COMPILED_VERSION))
+          end
         end
 
         it "parses and serializes UTF-16 correctly" do
