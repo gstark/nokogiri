@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# The Ruby binding needs Ruby and libclang at build time.
+# The fuzz targets and unit tests build without it.
+[features]
+default = ["ruby"]
+ruby = ["dep:magnus", "dep:rb-sys"]
+
+[dependencies]
+magnus = { version = "0.9", features = ["rb-sys"], optional = true }
+rb-sys = { version = "0.9", default-features = false, optional = true }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

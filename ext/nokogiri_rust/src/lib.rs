@@ -1,5 +1,5 @@
 pub mod fill;
 pub mod html5;
 
-#[cfg(not(test))]
+#[cfg(all(feature = "ruby", not(test)))]
 mod ffi;

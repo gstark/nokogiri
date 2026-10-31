@@ -2,370 +2,178 @@
 //!
 //! One call copies the source and builds the result.
 //! The Ruby reader runs when the native call returns nil.
+//! A panic also returns nil. Magnus would raise `fatal` for it.
 
 use crate::fill::{self, Bytes, Doc, Prefix};
-use crate::html5::model::{NodeKind, NodeRef, Ns};
+use crate::html5::model::{NodeKind, NodeRef, Ns, Output, ParseError};
+use crate::html5::{Options, Status};
+use magnus::prelude::*;
+use magnus::rb_sys::{AsRawValue, FromRawValue};
+use magnus::value::LazyId;
+use magnus::{function, Error, Fixnum, RArray, RClass, RHash, RObject, RString, Ruby, Value};
 use std::collections::HashMap;
-use std::os::raw::c_int;
-use std::sync::OnceLock;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
-type Value = usize;
-
-const QNIL: Value = 0x04;
-const QTRUE: Value = 0x14;
-
-struct RubyFrame {
-    restore_gc: bool,
-    jump: c_int,
-}
-
-struct Jump {
-    state: c_int,
-    clear: bool,
-}
-
-/// Disable GC until `protect_ruby` returns.
+/// Disable GC until the result is built.
 ///
-/// A Ruby exception is a longjmp. `Drop` does not run. The enable call stays
-/// in the frame that survives `rb_protect`.
-unsafe fn pause_gc(frame: &mut RubyFrame) {
-    let was_disabled = rb_gc_disable() == QTRUE;
-    if !was_disabled {
-        frame.restore_gc = true;
+/// Values in Rust heap buffers are not visible to the GC.
+struct GcPause<'a> {
+    ruby: &'a Ruby,
+    restore: bool,
+}
+
+impl<'a> GcPause<'a> {
+    fn new(ruby: &'a Ruby) -> Self {
+        Self { ruby, restore: !ruby.gc_disable() }
     }
 }
 
-extern "C" {
-    fn rb_define_module(name: *const i8) -> Value;
-    fn rb_define_module_under(outer: Value, name: *const i8) -> Value;
-    fn rb_define_module_function(module: Value, name: *const i8, func: *const (), argc: i32);
-    fn rb_intern(name: *const i8) -> usize;
-    fn rb_funcallv(recv: Value, mid: usize, argc: i32, argv: *const Value) -> Value;
-    fn rb_ary_new_capa(capa: i64) -> Value;
-    fn rb_ary_new_from_values(n: i64, elts: *const Value) -> Value;
-    fn rb_ary_push(ary: Value, item: Value) -> Value;
-    fn rb_str_subseq(string: Value, beg: i64, len: i64) -> Value;
-    fn rb_utf8_str_new(ptr: *const i8, len: i64) -> Value;
-    fn rb_string_value_ptr(string: *mut Value) -> *mut i8;
-    fn rb_gc_disable() -> Value;
-    fn rb_gc_enable() -> Value;
-    fn rb_hash_new() -> Value;
-    fn rb_hash_aset(hash: Value, key: Value, value: Value) -> Value;
-    fn rb_ary_entry(ary: Value, offset: i64) -> Value;
-    fn rb_const_get(klass: Value, id: usize) -> Value;
-    fn rb_ivar_get(obj: Value, id: usize) -> Value;
-    fn rb_ivar_set(obj: Value, id: usize, value: Value) -> Value;
-    fn rb_obj_alloc(klass: Value) -> Value;
-    fn rb_class_new_instance(argc: i32, argv: *const Value, klass: Value) -> Value;
-    fn rb_str_plus(left: Value, right: Value) -> Value;
-    fn rb_path2class(path: *const i8) -> Value;
-    fn rb_protect(func: extern "C" fn(Value) -> Value, arg: Value, state: *mut c_int) -> Value;
-    fn rb_jump_tag(state: c_int) -> !;
-}
-
-struct Protect<F> {
-    work: Option<F>,
-    frame: RubyFrame,
-}
-
-extern "C" fn protect_thunk<F>(arg: Value) -> Value
-where
-    F: FnOnce(&mut RubyFrame) -> Value,
-{
-    let pack = unsafe { &mut *(arg as *mut Protect<F>) };
-    let Some(work) = pack.work.take() else {
-        return QNIL;
-    };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut pack.frame))) {
-        Ok(value) => value,
-        Err(_) => QNIL,
-    }
-}
-
-unsafe fn protect_ruby<F>(work: F) -> Value
-where
-    F: FnOnce(&mut RubyFrame) -> Value,
-{
-    let mut pack = Protect {
-        work: Some(work),
-        frame: RubyFrame { restore_gc: false, jump: 0 },
-    };
-    let mut state = 0;
-    let value = rb_protect(protect_thunk::<F>, &mut pack as *mut Protect<F> as Value, &mut state);
-    if pack.frame.restore_gc {
-        rb_gc_enable();
-    }
-    if state != 0 {
-        rb_jump_tag(state);
-    }
-    if pack.frame.jump != 0 {
-        rb_jump_tag(pack.frame.jump);
-    }
-    value
-}
-
-struct CallArg {
-    recv: Value,
-    mid: usize,
-    argc: i32,
-    argv: *const Value,
-}
-
-extern "C" fn call_body(arg: Value) -> Value {
-    let call = unsafe { &*(arg as *const CallArg) };
-    unsafe { rb_funcallv(call.recv, call.mid, call.argc, call.argv) }
-}
-
-unsafe fn funcall(recv: Value, mid: usize, argc: i32, argv: *const Value) -> Result<Value, c_int> {
-    let call = CallArg { recv, mid, argc, argv };
-    let mut state = 0;
-    let value = rb_protect(call_body, &call as *const CallArg as Value, &mut state);
-    if state != 0 { Err(state) } else { Ok(value) }
-}
-
-extern "C" fn path_body(arg: Value) -> Value {
-    unsafe { rb_path2class(arg as *const i8) }
-}
-
-unsafe fn path2class(path: *const i8) -> Result<Value, c_int> {
-    let mut state = 0;
-    let value = rb_protect(path_body, path as Value, &mut state);
-    if state != 0 { Err(state) } else { Ok(value) }
-}
-
-struct ConstArg {
-    klass: Value,
-    id: usize,
-}
-
-extern "C" fn const_body(arg: Value) -> Value {
-    let arg = unsafe { &*(arg as *const ConstArg) };
-    unsafe { rb_const_get(arg.klass, arg.id) }
-}
-
-unsafe fn const_get(klass: Value, id: usize) -> Result<Value, c_int> {
-    let arg = ConstArg { klass, id };
-    let mut state = 0;
-    let value = rb_protect(const_body, &arg as *const ConstArg as Value, &mut state);
-    if state != 0 { Err(state) } else { Ok(value) }
-}
-
-struct NewArg {
-    argc: i32,
-    argv: *const Value,
-    klass: Value,
-}
-
-extern "C" fn new_body(arg: Value) -> Value {
-    let arg = unsafe { &*(arg as *const NewArg) };
-    unsafe { rb_class_new_instance(arg.argc, arg.argv, arg.klass) }
-}
-
-unsafe fn class_new(argc: i32, argv: *const Value, klass: Value) -> Result<Value, c_int> {
-    let arg = NewArg { argc, argv, klass };
-    let mut state = 0;
-    let value = rb_protect(new_body, &arg as *const NewArg as Value, &mut state);
-    if state != 0 { Err(state) } else { Ok(value) }
-}
-
-struct StrArg {
-    slot: Value,
-    ptr: *mut i8,
-}
-
-extern "C" fn str_body(arg: Value) -> Value {
-    let arg = unsafe { &mut *(arg as *mut StrArg) };
-    arg.ptr = unsafe { rb_string_value_ptr(&mut arg.slot) };
-    QNIL
-}
-
-unsafe fn str_ptr(arg: &mut StrArg) -> Result<(), c_int> {
-    let mut state = 0;
-    rb_protect(str_body, arg as *mut StrArg as Value, &mut state);
-    if state != 0 { Err(state) } else { Ok(()) }
-}
-
-#[no_mangle]
-pub extern "C" fn Init_nokogiri_rust_flat() {
-    unsafe {
-        let nokogiri = rb_define_module(c"Nokogiri".as_ptr());
-        let pure = rb_define_module_under(nokogiri, c"Pure".as_ptr());
-        let flat = rb_define_module_under(pure, c"RustFlat".as_ptr());
-        rb_define_module_function(flat, c"columns".as_ptr(), columns as *const (), 2);
-        let html5 = rb_define_module_under(pure, c"RustHtml5".as_ptr());
-        rb_define_module_function(html5, c"tree".as_ptr(), html_tree as *const (), 3);
-        let _ = RUBY_IDS.set(ruby_ids());
-    }
-}
-
-extern "C" fn columns(_module: Value, string: Value, origin: Value) -> Value {
-    unsafe {
-        protect_ruby(|frame| {
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                columns_inner(string, origin, frame)
-            }));
-            match caught {
-                Ok(Ok(value)) => value,
-                Ok(Err(state)) => {
-                    frame.jump = state;
-                    QNIL
-                }
-                Err(_) => QNIL,
-            }
-        })
-    }
-}
-
-unsafe fn columns_inner(string: Value, origin: Value, frame: &mut RubyFrame) -> Result<Value, c_int> {
-    let Some(origin) = fix_to_usize(origin) else {
-        return Ok(QNIL);
-    };
-    let Some(bytes) = ruby_bytes(string)? else {
-        return Ok(QNIL);
-    };
-    if origin > bytes.len() {
-        return Ok(QNIL);
-    }
-    let Some(doc) = fill::parse(&bytes, origin) else {
-        return Ok(QNIL);
-    };
-    pause_gc(frame);
-    Ok(materialize(string, &bytes, &doc))
-}
-
-unsafe fn materialize(string: Value, source: &[u8], doc: &Doc) -> Value {
-    let mut names: HashMap<Vec<u8>, Value> = HashMap::new();
-    let result = rb_ary_new_capa(20);
-    rb_ary_push(result, i32_column(&doc.typ));
-    rb_ary_push(result, i32_column(&doc.parent));
-    rb_ary_push(result, i32_column(&doc.nex));
-    rb_ary_push(result, i32_column(&doc.child));
-    rb_ary_push(result, i32_column(&doc.off));
-    rb_ary_push(result, i32_column(&doc.len));
-    rb_ary_push(result, i32_column(&doc.local));
-    rb_ary_push(result, i32_column(&doc.ns));
-    rb_ary_push(result, i32_column(&doc.line));
-    rb_ary_push(result, i32_column(&doc.text_off));
-    rb_ary_push(result, i32_column(&doc.text_len));
-    rb_ary_push(result, i32_column(&doc.tail));
-    rb_ary_push(result, long2fix(doc.top_head as i64));
-    rb_ary_push(result, long2fix(doc.top_tail as i64));
-    rb_ary_push(result, prefix_column(string, source, doc));
-    rb_ary_push(result, href_column(string, source, doc));
-    let (attrs, langs) = attr_columns(string, source, doc, &mut names);
-    rb_ary_push(result, attrs);
-    rb_ary_push(result, def_column(doc));
-    rb_ary_push(result, langs);
-    let xml_id = match doc.xml_builtin {
-        Some(id) => long2fix(id as i64),
-        None => QNIL,
-    };
-    rb_ary_push(result, xml_id);
-    result
-}
-
-unsafe fn i32_column(col: &[i32]) -> Value {
-    if col.is_empty() {
-        return rb_ary_new_capa(0);
-    }
-    let mut buf = Vec::with_capacity(col.len());
-    for &number in col {
-        buf.push(long2fix(number as i64));
-    }
-    rb_ary_new_from_values(buf.len() as i64, buf.as_ptr())
-}
-
-unsafe fn values_column(values: &[Value]) -> Value {
-    if values.is_empty() {
-        return rb_ary_new_capa(0);
-    }
-    rb_ary_new_from_values(values.len() as i64, values.as_ptr())
-}
-
-unsafe fn prefix_column(string: Value, source: &[u8], doc: &Doc) -> Value {
-    let mut values = Vec::with_capacity(doc.prefixes.len());
-    for prefix in &doc.prefixes {
-        values.push(match prefix {
-            Prefix::None => QNIL,
-            Prefix::Slice { off, len } => rb_str_subseq(string, *off as i64, *len as i64),
-            Prefix::Xml => utf8(b"xml"),
-        });
-    }
-    let _ = source;
-    values_column(&values)
-}
-
-unsafe fn href_column(string: Value, source: &[u8], doc: &Doc) -> Value {
-    let mut values = Vec::with_capacity(doc.hrefs.len());
-    for href in &doc.hrefs {
-        values.push(byte_value(string, source, href, false, &mut HashMap::new()));
-    }
-    values_column(&values)
-}
-
-unsafe fn def_column(doc: &Doc) -> Value {
-    let mut values = Vec::with_capacity(doc.defs.len());
-    for defs in &doc.defs {
-        if defs.is_empty() {
-            values.push(QNIL);
-        } else {
-            values.push(i32_column(defs));
+impl Drop for GcPause<'_> {
+    fn drop(&mut self) {
+        if self.restore {
+            self.ruby.gc_enable();
         }
     }
-    values_column(&values)
 }
 
-unsafe fn attr_columns(
-    string: Value,
+#[magnus::init]
+fn init(ruby: &Ruby) -> Result<(), Error> {
+    let pure = ruby.define_module("Nokogiri")?.define_module("Pure")?;
+    pure.define_module("RustFlat")?.define_module_function("columns", function!(columns, 2))?;
+    pure.define_module("RustHtml5")?.define_module_function("tree", function!(html_tree, 3))?;
+    Ok(())
+}
+
+fn columns(ruby: &Ruby, string: Value, origin: Value) -> Result<Value, Error> {
+    match catch_unwind(AssertUnwindSafe(|| columns_inner(ruby, string, origin))) {
+        Ok(result) => result,
+        Err(_) => Ok(nil(ruby)),
+    }
+}
+
+fn columns_inner(ruby: &Ruby, string: Value, origin: Value) -> Result<Value, Error> {
+    let Some(origin) = fix_to_usize(origin) else {
+        return Ok(nil(ruby));
+    };
+    let string = RString::try_convert(string)?;
+    let bytes = unsafe { string.as_slice() }.to_vec();
+    if origin > bytes.len() {
+        return Ok(nil(ruby));
+    }
+    let Some(doc) = fill::parse(&bytes, origin) else {
+        return Ok(nil(ruby));
+    };
+    let _gc = GcPause::new(ruby);
+    materialize(ruby, string, &bytes, &doc)
+}
+
+fn materialize(ruby: &Ruby, string: RString, source: &[u8], doc: &Doc) -> Result<Value, Error> {
+    let mut names: HashMap<Vec<u8>, Value> = HashMap::new();
+    let (attrs, langs) = attr_columns(ruby, string, source, doc, &mut names);
+    let xml_id = match doc.xml_builtin {
+        Some(id) => int(ruby, id as i64),
+        None => nil(ruby),
+    };
+    let result = [
+        i32_column(ruby, &doc.typ),
+        i32_column(ruby, &doc.parent),
+        i32_column(ruby, &doc.nex),
+        i32_column(ruby, &doc.child),
+        i32_column(ruby, &doc.off),
+        i32_column(ruby, &doc.len),
+        i32_column(ruby, &doc.local),
+        i32_column(ruby, &doc.ns),
+        i32_column(ruby, &doc.line),
+        i32_column(ruby, &doc.text_off),
+        i32_column(ruby, &doc.text_len),
+        i32_column(ruby, &doc.tail),
+        int(ruby, doc.top_head as i64),
+        int(ruby, doc.top_tail as i64),
+        prefix_column(ruby, string, doc),
+        href_column(ruby, string, doc),
+        attrs,
+        def_column(ruby, doc),
+        langs,
+        xml_id,
+    ];
+    Ok(values_column(ruby, &result))
+}
+
+fn i32_column(ruby: &Ruby, col: &[i32]) -> Value {
+    let values: Vec<Value> = col.iter().map(|&number| int(ruby, number as i64)).collect();
+    values_column(ruby, &values)
+}
+
+fn values_column(ruby: &Ruby, values: &[Value]) -> Value {
+    ruby.ary_new_from_values(values).as_value()
+}
+
+fn prefix_column(ruby: &Ruby, string: RString, doc: &Doc) -> Value {
+    let values: Vec<Value> = doc
+        .prefixes
+        .iter()
+        .map(|prefix| match prefix {
+            Prefix::None => nil(ruby),
+            Prefix::Slice { off, len } => subseq(string, *off, *len),
+            Prefix::Xml => utf8(ruby, b"xml"),
+        })
+        .collect();
+    values_column(ruby, &values)
+}
+
+fn href_column(ruby: &Ruby, string: RString, doc: &Doc) -> Value {
+    let values: Vec<Value> = doc.hrefs.iter().map(|href| byte_value(ruby, string, href)).collect();
+    values_column(ruby, &values)
+}
+
+fn def_column(ruby: &Ruby, doc: &Doc) -> Value {
+    let values: Vec<Value> = doc
+        .defs
+        .iter()
+        .map(|defs| if defs.is_empty() { nil(ruby) } else { i32_column(ruby, defs) })
+        .collect();
+    values_column(ruby, &values)
+}
+
+fn attr_columns(
+    ruby: &Ruby,
+    string: RString,
     source: &[u8],
     doc: &Doc,
     names: &mut HashMap<Vec<u8>, Value>,
 ) -> (Value, Value) {
     let mut attrs = Vec::with_capacity(doc.attrs.len());
-    let mut langs = vec![QNIL; doc.langs.len()];
+    let mut langs = vec![nil(ruby); doc.langs.len()];
     for (index, list) in doc.attrs.iter().enumerate() {
         if list.is_empty() {
-            attrs.push(QNIL);
+            attrs.push(nil(ruby));
             continue;
         }
-        let ary = rb_ary_new_capa(list.len() as i64);
+        let mut triples = Vec::with_capacity(list.len());
         for (attr_index, attr) in list.iter().enumerate() {
             let name = intern_slice(names, string, source, attr.name_off, attr.name_len);
-            let value = byte_value(string, source, &attr.value, false, names);
-            let triple = rb_ary_new_capa(3);
-            rb_ary_push(triple, name);
-            rb_ary_push(triple, long2fix(attr.ns as i64));
-            rb_ary_push(triple, value);
-            rb_ary_push(ary, triple);
+            let value = byte_value(ruby, string, &attr.value);
+            triples.push(values_column(ruby, &[name, int(ruby, attr.ns as i64), value]));
             if doc.langs[index] == Some(attr_index) {
                 langs[index] = value;
             }
         }
-        attrs.push(ary);
+        attrs.push(values_column(ruby, &triples));
     }
-    (values_column(&attrs), values_column(&langs))
+    (values_column(ruby, &attrs), values_column(ruby, &langs))
 }
 
-unsafe fn byte_value(
-    string: Value,
-    source: &[u8],
-    bytes: &Bytes,
-    _intern: bool,
-    _names: &mut HashMap<Vec<u8>, Value>,
-) -> Value {
+fn byte_value(ruby: &Ruby, string: RString, bytes: &Bytes) -> Value {
     match bytes {
-        Bytes::Slice { off, len } => {
-            let _ = source;
-            rb_str_subseq(string, *off as i64, *len as i64)
-        }
-        Bytes::Owned(text) => utf8(text),
-        Bytes::Xml => utf8(fill::xml_href()),
+        Bytes::Slice { off, len } => subseq(string, *off, *len),
+        Bytes::Owned(text) => utf8(ruby, text),
+        Bytes::Xml => utf8(ruby, fill::xml_href()),
     }
 }
 
-unsafe fn intern_slice(
+fn intern_slice(
     names: &mut HashMap<Vec<u8>, Value>,
-    string: Value,
+    string: RString,
     source: &[u8],
     off: usize,
     len: usize,
@@ -374,100 +182,74 @@ unsafe fn intern_slice(
     if let Some(&value) = names.get(slice) {
         return value;
     }
-    let value = rb_str_subseq(string, off as i64, len as i64);
+    let value = subseq(string, off, len);
     names.insert(slice.to_vec(), value);
     value
 }
 
-unsafe fn utf8(text: &[u8]) -> Value {
-    if text.is_empty() {
-        return rb_utf8_str_new(c"".as_ptr(), 0);
-    }
-    rb_utf8_str_new(text.as_ptr() as *const i8, text.len() as i64)
+/// Magnus has no wrapper for `rb_str_subseq`. The substring shares the source buffer.
+fn subseq(string: RString, off: usize, len: usize) -> Value {
+    unsafe { Value::from_raw(rb_sys::rb_str_subseq(string.as_raw(), off as _, len as _)) }
 }
 
-fn long2fix(number: i64) -> Value {
-    (((number as u64) << 1) | 1) as Value
+fn utf8(ruby: &Ruby, text: &[u8]) -> Value {
+    ruby.enc_str_new(text, ruby.utf8_encoding()).as_value()
+}
+
+fn int(ruby: &Ruby, number: i64) -> Value {
+    ruby.integer_from_i64(number).as_value()
+}
+
+fn nil(ruby: &Ruby) -> Value {
+    ruby.qnil().as_value()
 }
 
 fn fix_to_usize(value: Value) -> Option<usize> {
-    fix_to_i64(value).and_then(|number| if number < 0 { None } else { Some(number as usize) })
+    fix_to_i64(value).and_then(|number| usize::try_from(number).ok())
 }
 
 fn fix_to_i64(value: Value) -> Option<i64> {
-    if value & 1 != 1 {
-        return None;
-    }
-    Some((value as i64) >> 1)
+    Fixnum::from_value(value).map(Fixnum::to_i64)
 }
 
-const QFALSE: Value = 0;
-
-extern "C" fn html_tree(_module: Value, string: Value, options: Value, parent: Value) -> Value {
-    unsafe {
-        protect_ruby(|frame| {
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                html_tree_inner(string, options, parent, frame)
-            }));
-            match caught {
-                Ok(Ok(value)) => value,
-                Ok(Err(jump)) => {
-                    if jump.clear && parent != QNIL {
-                        clear_children(parent);
-                    }
-                    frame.jump = jump.state;
-                    QNIL
-                }
-                Err(_) => {
-                    if parent != QNIL {
-                        clear_children(parent);
-                    }
-                    QNIL
-                }
-            }
-        })
-    }
-}
-
-unsafe fn html_tree_inner(
-    string: Value,
-    options: Value,
-    parent: Value,
-    frame: &mut RubyFrame,
-) -> Result<Value, Jump> {
-    let Some(packed) = read_html_options(options).map_err(|state| Jump { state, clear: false })?
-    else {
-        return Ok(QNIL);
-    };
-    let Some(bytes) = ruby_bytes(string).map_err(|state| Jump { state, clear: false })? else {
-        return Ok(QNIL);
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let output = crate::html5::parse(text.as_ref(), &packed);
-    pause_gc(frame);
-    let keys = HtmlKeys::new();
-    if parent != QNIL {
-        if output.status == crate::html5::Status::Ok {
-            match attach_output(parent, &output, packed.fragment_context.is_some()) {
-                Ok(true) => return Ok(summary_hash(&keys, &output, true)),
-                Ok(false) => {}
-                Err(jump) => return Err(jump),
-            }
-        } else {
-            return Ok(summary_hash(&keys, &output, false));
+fn html_tree(ruby: &Ruby, string: Value, options: Value, parent: Value) -> Result<Value, Error> {
+    match catch_unwind(AssertUnwindSafe(|| html_tree_inner(ruby, string, options, parent))) {
+        Ok(result) => result,
+        Err(_) => {
+            clear_children(ruby, parent);
+            Ok(nil(ruby))
         }
     }
-    let hash = rb_hash_new();
-    rb_hash_aset(hash, keys.document, node_hash(&keys, &output.document));
-    let root = match &output.root {
-        Some(node) => node_hash(&keys, node),
-        None => QNIL,
+}
+
+fn html_tree_inner(ruby: &Ruby, string: Value, options: Value, parent: Value) -> Result<Value, Error> {
+    let Some(packed) = read_html_options(options)? else {
+        return Ok(nil(ruby));
     };
-    rb_hash_aset(hash, keys.root, root);
-    rb_hash_aset(hash, keys.errors, error_list(&keys, &output.errors));
-    rb_hash_aset(hash, keys.quirks_mode, long2fix(output.quirks_mode as i64));
-    rb_hash_aset(hash, keys.status, utf8(status_name(output.status)));
-    Ok(hash)
+    let string = RString::try_convert(string)?;
+    let bytes = unsafe { string.as_slice() }.to_vec();
+    let text = String::from_utf8_lossy(&bytes);
+    let output = crate::html5::parse(text.as_ref(), &packed);
+    let _gc = GcPause::new(ruby);
+    let keys = HtmlKeys::new(ruby);
+    if let Some(parent) = RObject::from_value(parent) {
+        let attached = output.status == Status::Ok;
+        if attached {
+            attach_output(ruby, parent, &output, packed.fragment_context.is_some())?;
+        }
+        return summary_hash(ruby, &keys, &output, attached);
+    }
+    let hash = ruby.hash_new();
+    hash.aset(keys.document, node_hash(ruby, &keys, &output.document)?)?;
+    let root = match &output.root {
+        Some(node) => node_hash(ruby, &keys, node)?,
+        None => nil(ruby),
+    };
+    hash.aset(keys.root, root)?;
+    hash.aset(keys.errors, error_list(ruby, &keys, &output.errors)?)?;
+    hash.aset(keys.quirks_mode, int(ruby, output.quirks_mode as i64))?;
+    hash.aset(keys.status, utf8(ruby, status_name(output.status)))?;
+    Ok(hash.as_value())
 }
 
 const ELEMENT_NODE: i64 = 1;
@@ -484,102 +266,54 @@ const MATH_HREF: &[u8] = b"http://www.w3.org/1998/Math/MathML";
 const XLINK_HREF: &[u8] = b"http://www.w3.org/1999/xlink";
 const XMLNS_HREF: &[u8] = b"http://www.w3.org/2000/xmlns/";
 
-struct RubyTypes {
-    element: Value,
-    text: Value,
-    cdata: Value,
-    comment: Value,
-    attr: Value,
-    dtd: Value,
-    namespace: Value,
-    state: Value,
-    empty_list: Value,
-    pure: usize,
-    children: usize,
-    attributes: usize,
-    namespace_definitions: usize,
-    type_id: usize,
-    name: usize,
-    document: usize,
-    content: usize,
-    line: usize,
-    parent: usize,
-    namespace_ivar: usize,
-    external_id: usize,
-    system_id: usize,
-    xml_namespace: usize,
-}
-
-struct RubyIds {
-    pure: usize,
-    children: usize,
-    attributes: usize,
-    namespace_definitions: usize,
-    type_id: usize,
-    name: usize,
-    document: usize,
-    content: usize,
-    line: usize,
-    parent: usize,
-    namespace_ivar: usize,
-    external_id: usize,
-    system_id: usize,
-    xml_namespace: usize,
-    empty_list: usize,
-}
-
 // IDs only. Class objects move when Ruby compacts the heap.
-static RUBY_IDS: OnceLock<RubyIds> = OnceLock::new();
+static PURE: LazyId = LazyId::new("@pure");
+static CHILDREN: LazyId = LazyId::new("@children");
+static ATTRIBUTES: LazyId = LazyId::new("@attributes");
+static NAMESPACE_DEFINITIONS: LazyId = LazyId::new("@namespace_definitions");
+static TYPE_ID: LazyId = LazyId::new("@type");
+static NAME: LazyId = LazyId::new("@name");
+static DOCUMENT: LazyId = LazyId::new("@document");
+static CONTENT: LazyId = LazyId::new("@content");
+static LINE: LazyId = LazyId::new("@line");
+static PARENT: LazyId = LazyId::new("@parent");
+static NAMESPACE: LazyId = LazyId::new("@namespace");
+static EXTERNAL_ID: LazyId = LazyId::new("@external_id");
+static SYSTEM_ID: LazyId = LazyId::new("@system_id");
 
-fn ruby_ids() -> RubyIds {
-    unsafe {
-        RubyIds {
-            pure: rb_intern(c"@pure".as_ptr()),
-            children: rb_intern(c"@children".as_ptr()),
-            attributes: rb_intern(c"@attributes".as_ptr()),
-            namespace_definitions: rb_intern(c"@namespace_definitions".as_ptr()),
-            type_id: rb_intern(c"@type".as_ptr()),
-            name: rb_intern(c"@name".as_ptr()),
-            document: rb_intern(c"@document".as_ptr()),
-            content: rb_intern(c"@content".as_ptr()),
-            line: rb_intern(c"@line".as_ptr()),
-            parent: rb_intern(c"@parent".as_ptr()),
-            namespace_ivar: rb_intern(c"@namespace".as_ptr()),
-            external_id: rb_intern(c"@external_id".as_ptr()),
-            system_id: rb_intern(c"@system_id".as_ptr()),
-            xml_namespace: rb_intern(c"xml_namespace".as_ptr()),
-            empty_list: rb_intern(c"EMPTY_LIST".as_ptr()),
-        }
-    }
+struct RubyTypes {
+    element: RClass,
+    text: RClass,
+    cdata: RClass,
+    comment: RClass,
+    attr: RClass,
+    dtd: RClass,
+    namespace: RClass,
+    state: RClass,
+    empty_list: Value,
 }
 
-unsafe fn ruby_classes(ids: &RubyIds) -> Result<RubyTypes, c_int> {
-    let state = path2class(c"Nokogiri::Pure::State".as_ptr())?;
+fn class_at(ruby: &Ruby, path: &str) -> Result<RClass, Error> {
+    ruby.class_object().funcall("const_get", (path,))
+}
+
+fn ruby_classes(ruby: &Ruby) -> Result<RubyTypes, Error> {
+    let state = class_at(ruby, "Nokogiri::Pure::State")?;
     Ok(RubyTypes {
-        element: path2class(c"Nokogiri::XML::Element".as_ptr())?,
-        text: path2class(c"Nokogiri::XML::Text".as_ptr())?,
-        cdata: path2class(c"Nokogiri::XML::CDATA".as_ptr())?,
-        comment: path2class(c"Nokogiri::XML::Comment".as_ptr())?,
-        attr: path2class(c"Nokogiri::XML::Attr".as_ptr())?,
-        dtd: path2class(c"Nokogiri::XML::DTD".as_ptr())?,
-        namespace: path2class(c"Nokogiri::XML::Namespace".as_ptr())?,
+        element: class_at(ruby, "Nokogiri::XML::Element")?,
+        text: class_at(ruby, "Nokogiri::XML::Text")?,
+        cdata: class_at(ruby, "Nokogiri::XML::CDATA")?,
+        comment: class_at(ruby, "Nokogiri::XML::Comment")?,
+        attr: class_at(ruby, "Nokogiri::XML::Attr")?,
+        dtd: class_at(ruby, "Nokogiri::XML::DTD")?,
+        namespace: class_at(ruby, "Nokogiri::XML::Namespace")?,
+        empty_list: state.const_get("EMPTY_LIST")?,
         state,
-        empty_list: const_get(state, ids.empty_list)?,
-        pure: ids.pure,
-        children: ids.children,
-        attributes: ids.attributes,
-        namespace_definitions: ids.namespace_definitions,
-        type_id: ids.type_id,
-        name: ids.name,
-        document: ids.document,
-        content: ids.content,
-        line: ids.line,
-        parent: ids.parent,
-        namespace_ivar: ids.namespace_ivar,
-        external_id: ids.external_id,
-        system_id: ids.system_id,
-        xml_namespace: ids.xml_namespace,
     })
+}
+
+fn alloc(class: RClass) -> Result<RObject, Error> {
+    RObject::try_convert(class.obj_alloc()?)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -597,57 +331,49 @@ enum AttrNs {
 
 #[derive(Clone, Copy)]
 struct Tail {
-    node: Value,
+    node: RObject,
     is_text: bool,
 }
 
-struct Attacher {
+struct Attacher<'a> {
+    ruby: &'a Ruby,
     types: RubyTypes,
-    document: Value,
-    output: Value,
+    document: RObject,
+    output: RObject,
     xml_ns: Option<Value>,
-    decls: HashMap<(Value, DeclKind), Value>,
-    jump: c_int,
+    decls: HashMap<(u64, DeclKind), Value>,
 }
 
-unsafe fn summary_hash(
-    keys: &HtmlKeys,
-    output: &crate::html5::model::Output,
-    attached: bool,
-) -> Value {
-    let hash = rb_hash_new();
-    rb_hash_aset(hash, keys.errors, error_list(keys, &output.errors));
-    rb_hash_aset(hash, keys.quirks_mode, long2fix(output.quirks_mode as i64));
-    rb_hash_aset(hash, keys.status, utf8(status_name(output.status)));
+fn summary_hash(ruby: &Ruby, keys: &HtmlKeys, output: &Output, attached: bool) -> Result<Value, Error> {
+    let hash = ruby.hash_new();
+    hash.aset(keys.errors, error_list(ruby, keys, &output.errors)?)?;
+    hash.aset(keys.quirks_mode, int(ruby, output.quirks_mode as i64))?;
+    hash.aset(keys.status, utf8(ruby, status_name(output.status)))?;
     if attached {
-        rb_hash_aset(hash, keys.attached, QTRUE);
+        hash.aset(keys.attached, true)?;
     }
-    hash
+    Ok(hash.as_value())
 }
 
-unsafe fn clear_children(parent: Value) {
-    let Some(ids) = RUBY_IDS.get() else {
+fn clear_children(ruby: &Ruby, parent: Value) {
+    let Some(parent) = RObject::from_value(parent) else {
         return;
     };
-    let state = rb_ivar_get(parent, ids.pure);
-    if state == QNIL {
+    let Ok(Some(state)) = parent.ivar_get::<_, Option<RObject>>(*PURE) else {
         return;
-    }
-    rb_ivar_set(state, ids.children, rb_ary_new_capa(0));
+    };
+    let _ = state.ivar_set(*CHILDREN, ruby.ary_new());
 }
 
-unsafe fn owner_document(types: &RubyTypes, parent: Value) -> Value {
-    let state = rb_ivar_get(parent, types.pure);
-    match fix_to_i64(rb_ivar_get(state, types.type_id)) {
-        Some(DOCUMENT_NODE) | Some(HTML_DOCUMENT_NODE) => parent,
-        _ => {
-            let document = rb_ivar_get(state, types.document);
-            if document == QNIL { parent } else { document }
-        }
+fn owner_document(parent: RObject) -> Result<RObject, Error> {
+    let state: RObject = parent.ivar_get(*PURE)?;
+    match fix_to_i64(state.ivar_get(*TYPE_ID)?) {
+        Some(DOCUMENT_NODE) | Some(HTML_DOCUMENT_NODE) => Ok(parent),
+        _ => Ok(state.ivar_get::<_, Option<RObject>>(*DOCUMENT)?.unwrap_or(parent)),
     }
 }
 
-fn top_children(output: &crate::html5::model::Output, fragment: bool) -> Vec<NodeRef> {
+fn top_children(output: &Output, fragment: bool) -> Vec<NodeRef> {
     if fragment {
         if let Some(root) = &output.root {
             return root.0.borrow().children.clone();
@@ -660,11 +386,11 @@ fn stored_line(line: i32) -> Option<i64> {
     if line <= 0 || line >= 65535 { None } else { Some(line as i64) }
 }
 
-fn blank_string(value: &str) -> Value {
-    if value.is_empty() { QNIL } else { unsafe { utf8(value.as_bytes()) } }
+fn blank_string(ruby: &Ruby, value: &str) -> Value {
+    if value.is_empty() { nil(ruby) } else { utf8(ruby, value.as_bytes()) }
 }
 
-unsafe fn install_doctype(types: &RubyTypes, document: Value, output: &crate::html5::model::Output) {
+fn install_doctype(ruby: &Ruby, types: &RubyTypes, document: RObject, output: &Output) -> Result<(), Error> {
     let (has, name, public_id, system_id) = {
         let inner = output.document.0.borrow();
         (
@@ -675,51 +401,46 @@ unsafe fn install_doctype(types: &RubyTypes, document: Value, output: &crate::ht
         )
     };
     if !has {
-        return;
+        return Ok(());
     }
-    let dtd = rb_obj_alloc(types.dtd);
-    let state = rb_obj_alloc(types.state);
-    rb_ivar_set(state, types.children, rb_ary_new_capa(0));
-    rb_ivar_set(state, types.attributes, rb_ary_new_capa(0));
-    rb_ivar_set(state, types.namespace_definitions, rb_ary_new_capa(0));
-    rb_ivar_set(state, types.type_id, long2fix(DTD_NODE));
-    rb_ivar_set(state, types.name, utf8(name.as_bytes()));
-    rb_ivar_set(state, types.document, document);
-    rb_ivar_set(state, types.external_id, blank_string(&public_id));
-    rb_ivar_set(state, types.system_id, blank_string(&system_id));
-    rb_ivar_set(dtd, types.pure, state);
-    let parent_state = rb_ivar_get(document, types.pure);
-    rb_ary_push(rb_ivar_get(parent_state, types.children), dtd);
-    rb_ivar_set(state, types.parent, document);
+    let dtd = alloc(types.dtd)?;
+    let state = alloc(types.state)?;
+    state.ivar_set(*CHILDREN, ruby.ary_new())?;
+    state.ivar_set(*ATTRIBUTES, ruby.ary_new())?;
+    state.ivar_set(*NAMESPACE_DEFINITIONS, ruby.ary_new())?;
+    state.ivar_set(*TYPE_ID, DTD_NODE)?;
+    state.ivar_set(*NAME, utf8(ruby, name.as_bytes()))?;
+    state.ivar_set(*DOCUMENT, document)?;
+    state.ivar_set(*EXTERNAL_ID, blank_string(ruby, &public_id))?;
+    state.ivar_set(*SYSTEM_ID, blank_string(ruby, &system_id))?;
+    dtd.ivar_set(*PURE, state)?;
+    let parent_state: RObject = document.ivar_get(*PURE)?;
+    parent_state.ivar_get::<_, RArray>(*CHILDREN)?.push(dtd)?;
+    state.ivar_set(*PARENT, document)?;
+    Ok(())
 }
 
-unsafe fn attach_output(
-    parent: Value,
-    output: &crate::html5::model::Output,
-    fragment: bool,
-) -> Result<bool, Jump> {
-    let Some(ids) = RUBY_IDS.get() else {
-        return Ok(false);
-    };
-    let types = ruby_classes(ids).map_err(|state| Jump { state, clear: false })?;
-    let document = owner_document(&types, parent);
+/// Link the parsed nodes under `parent`. A failure after the first link clears `parent`.
+fn attach_output(ruby: &Ruby, parent: RObject, output: &Output, fragment: bool) -> Result<(), Error> {
+    let types = ruby_classes(ruby)?;
+    let document = owner_document(parent)?;
     if !fragment {
-        install_doctype(&types, document, output);
+        install_doctype(ruby, &types, document, output)?;
     }
     let children = top_children(output, fragment);
     let mut attacher = Attacher {
+        ruby,
         types,
         document,
         output: parent,
         xml_ns: None,
         decls: HashMap::new(),
-        jump: 0,
     };
-    attacher.attach_list(parent, &children, None, None);
-    if attacher.jump != 0 {
-        return Err(Jump { state: attacher.jump, clear: true });
+    let attached = attacher.attach_list(parent, &children, None, None);
+    if attached.is_err() {
+        clear_children(ruby, parent.as_value());
     }
-    Ok(true)
+    attached
 }
 
 fn element_decl(namespace: Ns) -> Option<(DeclKind, &'static [u8], &'static [u8])> {
@@ -739,52 +460,50 @@ fn attr_decl(namespace: Ns) -> Option<AttrNs> {
     }
 }
 
-impl Attacher {
-    unsafe fn attach_list(
+impl Attacher<'_> {
+    fn attach_list(
         &mut self,
-        parent: Value,
+        parent: RObject,
         nodes: &[NodeRef],
-        mut anchor: Option<Value>,
+        mut anchor: Option<RObject>,
         mut tail: Option<Tail>,
-    ) {
+    ) -> Result<(), Error> {
         for node in nodes {
-            if self.jump != 0 {
-                return;
-            }
-            let (next_anchor, next_tail) = self.attach_node(parent, node, anchor, tail);
-            anchor = if parent == self.output { None } else { next_anchor };
+            let (next_anchor, next_tail) = self.attach_node(parent, node, anchor, tail)?;
+            anchor = if parent.as_raw() == self.output.as_raw() { None } else { next_anchor };
             tail = next_tail;
         }
+        Ok(())
     }
 
-    unsafe fn attach_node(
+    fn attach_node(
         &mut self,
-        parent: Value,
+        parent: RObject,
         node: &NodeRef,
-        anchor: Option<Value>,
+        anchor: Option<RObject>,
         tail: Option<Tail>,
-    ) -> (Option<Value>, Option<Tail>) {
+    ) -> Result<(Option<RObject>, Option<Tail>), Error> {
         let kind = node.0.borrow().kind;
-        match kind {
-            NodeKind::Element => self.attach_element(parent, node, anchor),
-            NodeKind::Text => (anchor, self.attach_leaf(parent, node, TEXT_NODE, "text", true, tail)),
+        Ok(match kind {
+            NodeKind::Element => self.attach_element(parent, node, anchor)?,
+            NodeKind::Text => (anchor, self.attach_leaf(parent, node, TEXT_NODE, "text", true, tail)?),
             NodeKind::Cdata => (
                 anchor,
-                self.attach_leaf(parent, node, CDATA_NODE, "#cdata-section", false, tail),
+                self.attach_leaf(parent, node, CDATA_NODE, "#cdata-section", false, tail)?,
             ),
             NodeKind::Comment => {
-                (anchor, self.attach_leaf(parent, node, COMMENT_NODE, "comment", false, tail))
+                (anchor, self.attach_leaf(parent, node, COMMENT_NODE, "comment", false, tail)?)
             }
             NodeKind::Document => (anchor, tail),
-        }
+        })
     }
 
-    unsafe fn attach_element(
+    fn attach_element(
         &mut self,
-        parent: Value,
+        parent: RObject,
         node: &NodeRef,
-        anchor: Option<Value>,
-    ) -> (Option<Value>, Option<Tail>) {
+        anchor: Option<RObject>,
+    ) -> Result<(Option<RObject>, Option<Tail>), Error> {
         let (name, namespace, attrs, line, children) = {
             let inner = node.0.borrow();
             (
@@ -795,29 +514,26 @@ impl Attacher {
                 inner.children.clone(),
             )
         };
-        let element = rb_obj_alloc(self.types.element);
-        let state = self.element_state(&name, line, children.len(), attrs.len());
-        rb_ivar_set(element, self.types.pure, state);
-        self.link_child(parent, element, state);
+        let element = alloc(self.types.element)?;
+        let state = self.element_state(&name, line, children.len(), attrs.len())?;
+        element.ivar_set(*PURE, state)?;
+        self.link_child(parent, element, state)?;
         let anchor = anchor.unwrap_or(element);
-        self.apply_element_ns(state, anchor, namespace);
-        self.add_attrs(element, state, anchor, &attrs);
-        if self.jump != 0 {
-            return (Some(anchor), Some(Tail { node: element, is_text: false }));
-        }
-        self.attach_list(element, &children, Some(anchor), None);
-        (Some(anchor), Some(Tail { node: element, is_text: false }))
+        self.apply_element_ns(state, anchor, namespace)?;
+        self.add_attrs(element, state, anchor, &attrs)?;
+        self.attach_list(element, &children, Some(anchor), None)?;
+        Ok((Some(anchor), Some(Tail { node: element, is_text: false })))
     }
 
-    unsafe fn attach_leaf(
+    fn attach_leaf(
         &mut self,
-        parent: Value,
+        parent: RObject,
         node: &NodeRef,
         type_id: i64,
         name: &str,
         merge: bool,
         tail: Option<Tail>,
-    ) -> Option<Tail> {
+    ) -> Result<Option<Tail>, Error> {
         let (content, line) = {
             let inner = node.0.borrow();
             (inner.content.clone(), inner.line)
@@ -825,8 +541,8 @@ impl Attacher {
         if merge {
             if let Some(tail) = tail {
                 if tail.is_text {
-                    self.append_text(tail.node, &content);
-                    return Some(tail);
+                    self.append_text(tail.node, &content)?;
+                    return Ok(Some(tail));
                 }
             }
         }
@@ -835,147 +551,129 @@ impl Attacher {
             CDATA_NODE => self.types.cdata,
             _ => self.types.comment,
         };
-        let obj = rb_obj_alloc(klass);
-        let state = self.leaf_state(type_id, name, &content, line);
-        rb_ivar_set(obj, self.types.pure, state);
-        self.link_child(parent, obj, state);
-        Some(Tail { node: obj, is_text: merge })
+        let obj = alloc(klass)?;
+        let state = self.leaf_state(type_id, name, &content, line)?;
+        obj.ivar_set(*PURE, state)?;
+        self.link_child(parent, obj, state)?;
+        Ok(Some(Tail { node: obj, is_text: merge }))
     }
 
-    unsafe fn element_state(&self, name: &str, line: i32, child_capa: usize, attr_capa: usize) -> Value {
-        let state = rb_obj_alloc(self.types.state);
-        rb_ivar_set(state, self.types.type_id, long2fix(ELEMENT_NODE));
-        rb_ivar_set(state, self.types.name, utf8(name.as_bytes()));
-        rb_ivar_set(state, self.types.document, self.document);
+    fn element_state(&self, name: &str, line: i32, child_capa: usize, attr_capa: usize) -> Result<RObject, Error> {
+        let ruby = self.ruby;
+        let state = alloc(self.types.state)?;
+        state.ivar_set(*TYPE_ID, ELEMENT_NODE)?;
+        state.ivar_set(*NAME, utf8(ruby, name.as_bytes()))?;
+        state.ivar_set(*DOCUMENT, self.document)?;
         if let Some(line) = stored_line(line) {
-            rb_ivar_set(state, self.types.line, long2fix(line));
+            state.ivar_set(*LINE, line)?;
         }
-        rb_ivar_set(state, self.types.children, rb_ary_new_capa(child_capa as i64));
-        rb_ivar_set(state, self.types.attributes, rb_ary_new_capa(attr_capa as i64));
-        rb_ivar_set(state, self.types.namespace_definitions, rb_ary_new_capa(0));
-        state
+        state.ivar_set(*CHILDREN, ruby.ary_new_capa(child_capa))?;
+        state.ivar_set(*ATTRIBUTES, ruby.ary_new_capa(attr_capa))?;
+        state.ivar_set(*NAMESPACE_DEFINITIONS, ruby.ary_new())?;
+        Ok(state)
     }
 
-    unsafe fn leaf_state(&self, type_id: i64, name: &str, content: &str, line: i32) -> Value {
-        let state = rb_obj_alloc(self.types.state);
+    fn leaf_state(&self, type_id: i64, name: &str, content: &str, line: i32) -> Result<RObject, Error> {
+        let ruby = self.ruby;
+        let state = alloc(self.types.state)?;
         let empty = self.types.empty_list;
-        rb_ivar_set(state, self.types.children, empty);
-        rb_ivar_set(state, self.types.attributes, empty);
-        rb_ivar_set(state, self.types.namespace_definitions, empty);
-        rb_ivar_set(state, self.types.type_id, long2fix(type_id));
-        rb_ivar_set(state, self.types.name, utf8(name.as_bytes()));
-        rb_ivar_set(state, self.types.document, self.document);
-        rb_ivar_set(state, self.types.content, utf8(content.as_bytes()));
+        state.ivar_set(*CHILDREN, empty)?;
+        state.ivar_set(*ATTRIBUTES, empty)?;
+        state.ivar_set(*NAMESPACE_DEFINITIONS, empty)?;
+        state.ivar_set(*TYPE_ID, type_id)?;
+        state.ivar_set(*NAME, utf8(ruby, name.as_bytes()))?;
+        state.ivar_set(*DOCUMENT, self.document)?;
+        state.ivar_set(*CONTENT, utf8(ruby, content.as_bytes()))?;
         if let Some(line) = stored_line(line) {
-            rb_ivar_set(state, self.types.line, long2fix(line));
+            state.ivar_set(*LINE, line)?;
         }
-        state
+        Ok(state)
     }
 
-    unsafe fn apply_element_ns(&mut self, state: Value, anchor: Value, namespace: Ns) {
+    fn apply_element_ns(&mut self, state: RObject, anchor: RObject, namespace: Ns) -> Result<(), Error> {
         let Some((kind, prefix, href)) = element_decl(namespace) else {
-            return;
+            return Ok(());
         };
-        let ns = self.declare(anchor, kind, prefix, href);
-        if self.jump != 0 {
-            return;
-        }
-        rb_ivar_set(state, self.types.namespace_ivar, ns);
+        let ns = self.declare(anchor, kind, prefix, href)?;
+        state.ivar_set(*NAMESPACE, ns)
     }
 
-    unsafe fn add_attrs(
+    fn add_attrs(
         &mut self,
-        element: Value,
-        element_state: Value,
-        anchor: Value,
+        element: RObject,
+        element_state: RObject,
+        anchor: RObject,
         attrs: &[(String, String, Option<Ns>)],
-    ) {
-        let list = rb_ivar_get(element_state, self.types.attributes);
+    ) -> Result<(), Error> {
+        let list: RArray = element_state.ivar_get(*ATTRIBUTES)?;
         for (name, value, namespace) in attrs {
-            if self.jump != 0 {
-                return;
-            }
-            let attr = rb_obj_alloc(self.types.attr);
-            let state = self.attr_state(name, value);
-            rb_ivar_set(attr, self.types.pure, state);
-            rb_ivar_set(state, self.types.parent, element);
+            let attr = alloc(self.types.attr)?;
+            let state = self.attr_state(name, value)?;
+            attr.ivar_set(*PURE, state)?;
+            state.ivar_set(*PARENT, element)?;
             if let Some(namespace) = namespace {
                 let ns = match attr_decl(*namespace) {
-                    Some(AttrNs::Xml) => self.xml_namespace(),
-                    Some(AttrNs::Declare(kind, prefix, href)) => {
-                        self.declare(anchor, kind, prefix, href)
-                    }
-                    None => QNIL,
+                    Some(AttrNs::Xml) => Some(self.xml_namespace()?),
+                    Some(AttrNs::Declare(kind, prefix, href)) => Some(self.declare(anchor, kind, prefix, href)?),
+                    None => None,
                 };
-                if self.jump != 0 {
-                    return;
-                }
-                if ns != QNIL {
-                    rb_ivar_set(state, self.types.namespace_ivar, ns);
+                if let Some(ns) = ns.filter(|ns| !ns.is_nil()) {
+                    state.ivar_set(*NAMESPACE, ns)?;
                 }
             }
-            rb_ary_push(list, attr);
+            list.push(attr)?;
         }
+        Ok(())
     }
 
-    unsafe fn attr_state(&self, name: &str, value: &str) -> Value {
-        let state = rb_obj_alloc(self.types.state);
-        rb_ivar_set(state, self.types.children, rb_ary_new_capa(0));
-        rb_ivar_set(state, self.types.attributes, rb_ary_new_capa(0));
-        rb_ivar_set(state, self.types.namespace_definitions, rb_ary_new_capa(0));
-        rb_ivar_set(state, self.types.type_id, long2fix(ATTRIBUTE_NODE));
-        rb_ivar_set(state, self.types.name, utf8(name.as_bytes()));
-        rb_ivar_set(state, self.types.document, self.document);
-        rb_ivar_set(state, self.types.content, utf8(value.as_bytes()));
-        state
+    fn attr_state(&self, name: &str, value: &str) -> Result<RObject, Error> {
+        let ruby = self.ruby;
+        let state = alloc(self.types.state)?;
+        state.ivar_set(*CHILDREN, ruby.ary_new())?;
+        state.ivar_set(*ATTRIBUTES, ruby.ary_new())?;
+        state.ivar_set(*NAMESPACE_DEFINITIONS, ruby.ary_new())?;
+        state.ivar_set(*TYPE_ID, ATTRIBUTE_NODE)?;
+        state.ivar_set(*NAME, utf8(ruby, name.as_bytes()))?;
+        state.ivar_set(*DOCUMENT, self.document)?;
+        state.ivar_set(*CONTENT, utf8(ruby, value.as_bytes()))?;
+        Ok(state)
     }
 
-    unsafe fn declare(&mut self, anchor: Value, kind: DeclKind, prefix: &[u8], href: &[u8]) -> Value {
-        if let Some(&found) = self.decls.get(&(anchor, kind)) {
-            return found;
+    fn declare(&mut self, anchor: RObject, kind: DeclKind, prefix: &[u8], href: &[u8]) -> Result<Value, Error> {
+        if let Some(&found) = self.decls.get(&(anchor.as_raw(), kind)) {
+            return Ok(found);
         }
-        let argv = [self.document, utf8(prefix), utf8(href)];
-        let created = match class_new(3, argv.as_ptr(), self.types.namespace) {
-            Ok(value) => value,
-            Err(state) => {
-                self.jump = state;
-                return QNIL;
-            }
-        };
-        let anchor_state = rb_ivar_get(anchor, self.types.pure);
-        let defs = rb_ivar_get(anchor_state, self.types.namespace_definitions);
-        rb_ary_push(defs, created);
-        self.decls.insert((anchor, kind), created);
-        created
+        let ruby = self.ruby;
+        let created = self
+            .types
+            .namespace
+            .new_instance((self.document, utf8(ruby, prefix), utf8(ruby, href)))?;
+        let anchor_state: RObject = anchor.ivar_get(*PURE)?;
+        anchor_state.ivar_get::<_, RArray>(*NAMESPACE_DEFINITIONS)?.push(created)?;
+        self.decls.insert((anchor.as_raw(), kind), created);
+        Ok(created)
     }
 
-    unsafe fn xml_namespace(&mut self) -> Value {
+    fn xml_namespace(&mut self) -> Result<Value, Error> {
         if let Some(ns) = self.xml_ns {
-            return ns;
+            return Ok(ns);
         }
-        let ns = match funcall(self.document, self.types.xml_namespace, 0, std::ptr::null()) {
-            Ok(value) => value,
-            Err(state) => {
-                self.jump = state;
-                return QNIL;
-            }
-        };
+        let ns: Value = self.document.funcall("xml_namespace", ())?;
         self.xml_ns = Some(ns);
-        ns
+        Ok(ns)
     }
 
-    unsafe fn append_text(&self, node: Value, extra: &str) {
-        let state = rb_ivar_get(node, self.types.pure);
-        let current = rb_ivar_get(state, self.types.content);
-        let joined = rb_str_plus(current, utf8(extra.as_bytes()));
-        rb_ivar_set(state, self.types.content, joined);
+    fn append_text(&self, node: RObject, extra: &str) -> Result<(), Error> {
+        let state: RObject = node.ivar_get(*PURE)?;
+        let current: Value = state.ivar_get(*CONTENT)?;
+        let joined: Value = current.funcall("+", (utf8(self.ruby, extra.as_bytes()),))?;
+        state.ivar_set(*CONTENT, joined)
     }
 
-    unsafe fn link_child(&self, parent: Value, child: Value, child_state: Value) {
-        let parent_state = rb_ivar_get(parent, self.types.pure);
-        let children = rb_ivar_get(parent_state, self.types.children);
-        rb_ary_push(children, child);
-        rb_ivar_set(child_state, self.types.parent, parent);
+    fn link_child(&self, parent: RObject, child: RObject, child_state: RObject) -> Result<(), Error> {
+        let parent_state: RObject = parent.ivar_get(*PURE)?;
+        parent_state.ivar_get::<_, RArray>(*CHILDREN)?.push(child)?;
+        child_state.ivar_set(*PARENT, parent)
     }
 }
 
@@ -1005,79 +703,80 @@ struct HtmlKeys {
 }
 
 impl HtmlKeys {
-    unsafe fn new() -> Self {
+    fn new(ruby: &Ruby) -> Self {
+        let key = |name: &[u8]| utf8(ruby, name);
         Self {
-            document: utf8(b"document"),
-            root: utf8(b"root"),
-            errors: utf8(b"errors"),
-            quirks_mode: utf8(b"quirks_mode"),
-            status: utf8(b"status"),
-            attached: utf8(b"attached"),
-            type_: utf8(b"type"),
-            children: utf8(b"children"),
-            name: utf8(b"name"),
-            namespace: utf8(b"namespace"),
-            attrs: utf8(b"attrs"),
-            content: utf8(b"content"),
-            data: utf8(b"data"),
-            line: utf8(b"line"),
-            has_doctype: utf8(b"has_doctype"),
-            doctype_name: utf8(b"doctype_name"),
-            public_id: utf8(b"public_id"),
-            system_id: utf8(b"system_id"),
-            code: utf8(b"code"),
-            message: utf8(b"message"),
-            column: utf8(b"column"),
-            byte_offset: utf8(b"byte_offset"),
+            document: key(b"document"),
+            root: key(b"root"),
+            errors: key(b"errors"),
+            quirks_mode: key(b"quirks_mode"),
+            status: key(b"status"),
+            attached: key(b"attached"),
+            type_: key(b"type"),
+            children: key(b"children"),
+            name: key(b"name"),
+            namespace: key(b"namespace"),
+            attrs: key(b"attrs"),
+            content: key(b"content"),
+            data: key(b"data"),
+            line: key(b"line"),
+            has_doctype: key(b"has_doctype"),
+            doctype_name: key(b"doctype_name"),
+            public_id: key(b"public_id"),
+            system_id: key(b"system_id"),
+            code: key(b"code"),
+            message: key(b"message"),
+            column: key(b"column"),
+            byte_offset: key(b"byte_offset"),
         }
     }
 }
 
-fn status_name(status: crate::html5::Status) -> &'static [u8] {
+fn status_name(status: Status) -> &'static [u8] {
     match status {
-        crate::html5::Status::Ok => b"ok",
-        crate::html5::Status::TooManyAttributes => b"too_many_attributes",
-        crate::html5::Status::TreeTooDeep => b"tree_too_deep",
+        Status::Ok => b"ok",
+        Status::TooManyAttributes => b"too_many_attributes",
+        Status::TreeTooDeep => b"tree_too_deep",
     }
 }
 
-unsafe fn node_hash(keys: &HtmlKeys, node: &crate::html5::model::NodeRef) -> Value {
+fn node_hash(ruby: &Ruby, keys: &HtmlKeys, node: &NodeRef) -> Result<Value, Error> {
     let inner = node.0.borrow();
-    let hash = rb_hash_new();
-    rb_hash_aset(hash, keys.type_, utf8(kind_name(inner.kind)));
-    rb_hash_aset(hash, keys.name, utf8(inner.name.as_bytes()));
-    rb_hash_aset(hash, keys.namespace, ns_value(inner.namespace));
-    rb_hash_aset(hash, keys.content, utf8(inner.content.as_bytes()));
-    rb_hash_aset(hash, keys.data, utf8(inner.content.as_bytes()));
-    rb_hash_aset(hash, keys.line, long2fix(inner.line as i64));
-    rb_hash_aset(hash, keys.has_doctype, if inner.has_doctype { QTRUE } else { QFALSE });
-    rb_hash_aset(hash, keys.doctype_name, utf8(inner.doctype_name.as_bytes()));
-    rb_hash_aset(hash, keys.public_id, utf8(inner.public_id.as_bytes()));
-    rb_hash_aset(hash, keys.system_id, utf8(inner.system_id.as_bytes()));
-    rb_hash_aset(hash, keys.quirks_mode, long2fix(inner.quirks_mode as i64));
-    let mut attrs = Vec::with_capacity(inner.attrs.len());
-    for (name, value, namespace) in &inner.attrs {
-        let row = rb_ary_new_capa(3);
-        rb_ary_push(row, utf8(name.as_bytes()));
-        rb_ary_push(row, utf8(value.as_bytes()));
-        rb_ary_push(row, match namespace {
-            Some(ns) => ns_value(*ns),
-            None => QNIL,
-        });
-        attrs.push(row);
-    }
-    rb_hash_aset(hash, keys.attrs, values_column(&attrs));
-    let mut children = Vec::with_capacity(inner.children.len());
-    for child in &inner.children {
-        children.push(node_hash(keys, child));
-    }
+    let hash: RHash = ruby.hash_new();
+    hash.aset(keys.type_, utf8(ruby, kind_name(inner.kind)))?;
+    hash.aset(keys.name, utf8(ruby, inner.name.as_bytes()))?;
+    hash.aset(keys.namespace, ns_value(ruby, inner.namespace))?;
+    hash.aset(keys.content, utf8(ruby, inner.content.as_bytes()))?;
+    hash.aset(keys.data, utf8(ruby, inner.content.as_bytes()))?;
+    hash.aset(keys.line, inner.line as i64)?;
+    hash.aset(keys.has_doctype, inner.has_doctype)?;
+    hash.aset(keys.doctype_name, utf8(ruby, inner.doctype_name.as_bytes()))?;
+    hash.aset(keys.public_id, utf8(ruby, inner.public_id.as_bytes()))?;
+    hash.aset(keys.system_id, utf8(ruby, inner.system_id.as_bytes()))?;
+    hash.aset(keys.quirks_mode, inner.quirks_mode as i64)?;
+    let attrs: Vec<Value> = inner
+        .attrs
+        .iter()
+        .map(|(name, value, namespace)| {
+            let namespace = match namespace {
+                Some(ns) => ns_value(ruby, *ns),
+                None => nil(ruby),
+            };
+            values_column(ruby, &[utf8(ruby, name.as_bytes()), utf8(ruby, value.as_bytes()), namespace])
+        })
+        .collect();
+    hash.aset(keys.attrs, values_column(ruby, &attrs))?;
+    let children = inner
+        .children
+        .iter()
+        .map(|child| node_hash(ruby, keys, child))
+        .collect::<Result<Vec<Value>, Error>>()?;
     drop(inner);
-    rb_hash_aset(hash, keys.children, values_column(&children));
-    hash
+    hash.aset(keys.children, values_column(ruby, &children))?;
+    Ok(hash.as_value())
 }
 
-fn kind_name(kind: crate::html5::model::NodeKind) -> &'static [u8] {
-    use crate::html5::model::NodeKind;
+fn kind_name(kind: NodeKind) -> &'static [u8] {
     match kind {
         NodeKind::Document => b"document",
         NodeKind::Element => b"element",
@@ -1087,70 +786,60 @@ fn kind_name(kind: crate::html5::model::NodeKind) -> &'static [u8] {
     }
 }
 
-fn ns_value(namespace: crate::html5::model::Ns) -> Value {
-    use crate::html5::model::Ns;
+fn ns_value(ruby: &Ruby, namespace: Ns) -> Value {
     let name: &[u8] = match namespace {
-        Ns::Html => return QNIL,
+        Ns::Html => return nil(ruby),
         Ns::Svg => b"svg",
         Ns::MathMl => b"mathml",
         Ns::Xlink => b"xlink",
         Ns::Xml => b"xml",
         Ns::Xmlns => b"xmlns",
     };
-    unsafe { utf8(name) }
+    utf8(ruby, name)
 }
 
-unsafe fn error_list(keys: &HtmlKeys, errors: &[crate::html5::model::ParseError]) -> Value {
+fn error_list(ruby: &Ruby, keys: &HtmlKeys, errors: &[ParseError]) -> Result<Value, Error> {
     let mut values = Vec::with_capacity(errors.len());
     for error in errors {
-        let hash = rb_hash_new();
-        rb_hash_aset(hash, keys.code, utf8(error.code.as_bytes()));
-        rb_hash_aset(hash, keys.message, utf8(error.message.as_bytes()));
-        rb_hash_aset(hash, keys.line, long2fix(error.line as i64));
-        rb_hash_aset(hash, keys.column, long2fix(error.column as i64));
-        rb_hash_aset(hash, keys.byte_offset, long2fix(error.byte_offset as i64));
-        values.push(hash);
+        let hash = ruby.hash_new();
+        hash.aset(keys.code, utf8(ruby, error.code.as_bytes()))?;
+        hash.aset(keys.message, utf8(ruby, error.message.as_bytes()))?;
+        hash.aset(keys.line, error.line as i64)?;
+        hash.aset(keys.column, error.column as i64)?;
+        hash.aset(keys.byte_offset, error.byte_offset as i64)?;
+        values.push(hash.as_value());
     }
-    values_column(&values)
+    Ok(values_column(ruby, &values))
 }
 
-fn is_array(value: Value) -> bool {
-    // Heap objects are aligned. Qfalse is 0. Other immediates set low bits.
-    // RUBY_T_ARRAY is 0x07 and RUBY_T_MASK is 0x1f.
-    if value == 0 || value & 0x07 != 0 {
-        return false;
-    }
-    let flags = unsafe { *(value as *const Value) };
-    flags & 0x1f == 0x07
-}
-
-unsafe fn read_html_options(options: Value) -> Result<Option<crate::html5::Options>, c_int> {
-    use crate::html5::model::Ns;
-    if !is_array(options) {
-        return Ok(None);
-    }
-    let Some(max_attributes) = fix_to_i64(rb_ary_entry(options, 0)) else {
+fn read_html_options(options: Value) -> Result<Option<Options>, Error> {
+    let Some(options) = RArray::from_value(options) else {
         return Ok(None);
     };
-    let Some(max_errors) = fix_to_i64(rb_ary_entry(options, 1)) else {
+    let fixnum = |index| options.entry::<Value>(index).map(fix_to_i64);
+    let text = |index| options.entry::<Value>(index).and_then(ruby_text);
+    let Some(max_attributes) = fixnum(0)? else {
         return Ok(None);
     };
-    let Some(max_tree_depth) = fix_to_i64(rb_ary_entry(options, 2)) else {
+    let Some(max_errors) = fixnum(1)? else {
         return Ok(None);
     };
-    let Some(noscript) = fix_to_i64(rb_ary_entry(options, 3)) else {
+    let Some(max_tree_depth) = fixnum(2)? else {
         return Ok(None);
     };
-    let fragment_context = ruby_text(rb_ary_entry(options, 4))?;
-    let namespace = ruby_text(rb_ary_entry(options, 5))?;
-    let fragment_encoding = ruby_text(rb_ary_entry(options, 6))?;
-    let Some(quirks_mode) = fix_to_i64(rb_ary_entry(options, 7)) else {
+    let Some(noscript) = fixnum(3)? else {
         return Ok(None);
     };
-    let Some(form_ancestor) = fix_to_i64(rb_ary_entry(options, 8)) else {
+    let fragment_context = text(4)?;
+    let namespace = text(5)?;
+    let fragment_encoding = text(6)?;
+    let Some(quirks_mode) = fixnum(7)? else {
         return Ok(None);
     };
-    Ok(Some(crate::html5::Options {
+    let Some(form_ancestor) = fixnum(8)? else {
+        return Ok(None);
+    };
+    Ok(Some(Options {
         max_attributes,
         max_errors,
         max_tree_depth,
@@ -1163,26 +852,10 @@ unsafe fn read_html_options(options: Value) -> Result<Option<crate::html5::Optio
     }))
 }
 
-unsafe fn ruby_text(value: Value) -> Result<Option<String>, c_int> {
-    if value == QNIL {
+fn ruby_text(value: Value) -> Result<Option<String>, Error> {
+    if value.is_nil() {
         return Ok(None);
     }
-    let Some(bytes) = ruby_bytes(value)? else {
-        return Ok(None);
-    };
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-unsafe fn ruby_bytes(string: Value) -> Result<Option<Vec<u8>>, c_int> {
-    let len_val = funcall(string, rb_intern(c"bytesize".as_ptr()), 0, std::ptr::null())?;
-    let len = fix_to_usize(len_val).unwrap_or(0);
-    if len == 0 {
-        return Ok(Some(Vec::new()));
-    }
-    let mut arg = StrArg { slot: string, ptr: std::ptr::null_mut() };
-    str_ptr(&mut arg)?;
-    if arg.ptr.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(std::slice::from_raw_parts(arg.ptr as *const u8, len).to_vec()))
+    let string = RString::try_convert(value)?;
+    Ok(Some(String::from_utf8_lossy(unsafe { string.as_slice() }).into_owned()))
 }

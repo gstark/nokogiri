@@ -1,5 +1,6 @@
 #!/bin/sh
 # Build the optional flat-XML filler for the current machine.
+# rb-sys builds against the Ruby on PATH (or $RUBY). Rebuild after a Ruby upgrade.
 set -eu
 cd "$(dirname "$0")"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/nokogiri-rust-flat-target}"
