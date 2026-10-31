@@ -7,13 +7,15 @@ publish = false
 # The Ruby binding needs Ruby and libclang at build time.
 # The fuzz targets and unit tests build without it.
 [features]
-default = ["ruby"]
+default = ["ruby", "html5gum"]
 ruby = ["dep:magnus", "dep:rb-sys"]
+# Tokenize HTML5 with html5gum. Turn it off to use the crate's own tokenizer.
+html5gum = ["dep:html5gum"]
 
 [dependencies]
 magnus = { version = "0.9", features = ["rb-sys"], optional = true }
 rb-sys = { version = "0.9", default-features = false, optional = true }
-html5gum = { version = "0.9", default-features = false }
+html5gum = { version = "0.9", default-features = false, optional = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

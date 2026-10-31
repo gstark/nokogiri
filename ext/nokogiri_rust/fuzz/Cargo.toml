@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 [dependencies.nokogiri_rust_flat]
 path = ".."
 default-features = false
+features = ["html5gum"]
 
 [[bin]]
 name = "html5"

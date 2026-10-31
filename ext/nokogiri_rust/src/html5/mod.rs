@@ -2,6 +2,14 @@
 
 pub mod model;
 mod quirks;
+// The html5gum feature picks the tokenizer. Without it, the crate uses its
+// own tokenizer. Both give the same token stream to the tree builder.
+#[cfg(not(feature = "html5gum"))]
+mod entities;
+#[cfg(not(feature = "html5gum"))]
+#[path = "lex.rs"]
+mod tokenizer;
+#[cfg(feature = "html5gum")]
 mod tokenizer;
 mod tree;
 

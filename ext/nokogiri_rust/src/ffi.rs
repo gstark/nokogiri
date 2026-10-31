@@ -40,7 +40,11 @@ impl Drop for GcPause<'_> {
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let pure = ruby.define_module("Nokogiri")?.define_module("Pure")?;
     pure.define_module("RustFlat")?.define_module_function("columns", function!(columns, 2))?;
-    pure.define_module("RustHtml5")?.define_module_function("tree", function!(html_tree, 3))?;
+    let html5 = pure.define_module("RustHtml5")?;
+    html5.define_module_function("tree", function!(html_tree, 3))?;
+    // Names the tokenizer this build uses, for comparisons.
+    let tokenizer = if cfg!(feature = "html5gum") { "html5gum" } else { "own" };
+    html5.const_set("TOKENIZER", tokenizer)?;
     Ok(())
 }
 
