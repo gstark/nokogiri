@@ -1297,29 +1297,42 @@ module Nokogiri
     end
 
     class Document < Node
+      # An HTML document takes a system id and an external id, as in
+      # htmlNewDoc. With neither, it gets the HTML 4.0 Transitional DTD.
       def self.new(*args, &block)
-        version = args[0]
-        version = version.respond_to?(:to_str) ? version.to_str : "1.0"
-        document = allocate
-        type = if defined?(Nokogiri::HTML4::Document) && self <= Nokogiri::HTML4::Document && self != Document
-          HTML_DOCUMENT_NODE
-        else
-          DOCUMENT_NODE
+        document = new_without_dtd(*args)
+        if document.html?
+          system_id, external_id = args
+          if system_id.nil? && external_id.nil?
+            system_id = "http://www.w3.org/TR/REC-html40/loose.dtd"
+            external_id = "-//W3C//DTD HTML 4.0 Transitional//EN"
+          end
+          document.create_internal_subset("html", external_id, system_id)
         end
+        document.send(:initialize, *args, &block)
+        document
+      end
+
+      # A parser adds the DTD from its input. The caller must call initialize.
+      def self.new_without_dtd(*args) # :nodoc:
+        html = defined?(Nokogiri::HTML4::Document) && self <= Nokogiri::HTML4::Document && self != Document
+        version = args[0]
+        version = version.respond_to?(:to_str) ? version.to_str : "1.0" unless html
+        document = allocate
         Pure::State.attach(
           document,
-          type: type,
+          type: html ? HTML_DOCUMENT_NODE : DOCUMENT_NODE,
           name: "document",
-          version: version
+          version: html ? nil : version
         )
         document.pure.document = document
-        document.send(:initialize, *args, &block)
         document
       end
 
       def self.read_memory(string, url, encoding, options)
         options = Integer(options)
-        document = new
+        document = new_without_dtd
+        document.send(:initialize)
         if url
           document.pure.url = url.to_s.encode(Encoding::UTF_8)
         end
@@ -1328,11 +1341,11 @@ module Nokogiri
         document.encoding = document.encoding.encode(Encoding::UTF_8) if document.encoding
         Pure::Parser.parse(document, source, options)
         recover = options & ParseOptions::RECOVER != 0
+        # libxml2 returns no HTML document after an error if RECOVER is off.
+        if !recover && document.html? && document.errors.any? { |err| err.level.nil? || err.level >= 2 }
+          raise SyntaxError, "Parser without recover option encountered error or warning"
+        end
         if !recover && document.errors.any? { |err| err.fatal? || err.level.nil? }
-          if document.html?
-            raise SyntaxError, "Parser without recover option encountered error or warning"
-          end
-
           exception = SyntaxError.aggregate(document.errors)
           raise exception if exception
         end
@@ -1392,7 +1405,10 @@ module Nokogiri
         pure.encoding = value.to_str
       end
 
+      # libxml2 sets no version on an HTML document.
       def version
+        return if html?
+
         pure.version || "1.0"
       end
 

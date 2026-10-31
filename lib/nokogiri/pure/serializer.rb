@@ -60,6 +60,8 @@ module Nokogiri
         @encoding_name = encoding&.to_s
         @encoding_name = nil if @encoding_name && @encoding_name.empty?
         @target = resolve_target(encoding)
+        @html_format = options & FORMAT != 0 && options & AS_HTML != 0 &&
+          options & (AS_XHTML | AS_XML) == 0
       end
 
       def resolve_target(encoding)
@@ -85,7 +87,7 @@ module Nokogiri
         if node.document?
           write_document(node)
         else
-          write_node(node, 0)
+          write_node(node, 0, node.next_sibling)
         end
         node.instance_variable_set(:@html_pieces, @pieces) if recording
         @pieces = nil
@@ -156,17 +158,19 @@ module Nokogiri
           emit("?>")
           emit("\n") if format?
         end
+        # The libxml2 HTML dumper ends each top-level node with a newline, also without FORMAT.
+        newline = format? || (@html && @options & (AS_XHTML | AS_XML) == 0)
         document.pure.children.each do |child|
           write_node(child, 0)
-          emit("\n") if format?
+          emit("\n") if newline
         end
       end
 
-      def write_node(node, depth)
+      def write_node(node, depth, following = nil)
         state = node.instance_variable_get(:@pure)
         case state.type
         when XML::Node::ELEMENT_NODE
-          write_element(node, depth, state)
+          write_element(node, depth, state, following)
         when XML::Node::TEXT_NODE
           text = state.content.to_s
           raw = node.instance_variable_get(:@xslt_disable_output_escaping) || raw_text?(state)
@@ -193,18 +197,19 @@ module Nokogiri
         when XML::Node::ATTRIBUTE_NODE
           emit(attribute_text(node))
         when XML::Node::DOCUMENT_FRAG_NODE
-          state.children.each { |child| write_node(child, depth) }
+          write_children(state.children, depth)
         else
-          state.children.each { |child| write_node(child, depth) }
+          write_children(state.children, depth)
         end
       end
 
-      def write_element(node, depth, state)
+      def write_element(node, depth, state, following)
         name = qualified_name(state)
         emit("<#{name}")
         write_namespace_declarations(node)
         write_attributes(node)
         children = state.children
+        block = @html_format && html_block?(state)
         if children.empty?
           if html_void?(state) && @options & AS_XML == 0
             emit((@options & AS_XHTML != 0) ? " />" : ">")
@@ -213,20 +218,56 @@ module Nokogiri
           else
             emit("/>")
           end
-          return
-        end
-
-        emit(">")
-        if format_children?(node)
-          children.each do |child|
-            emit("\n#{@unit * (depth + 1)}")
-            write_node(child, depth + 1)
-          end
-          emit("\n#{@unit * depth}")
         else
-          children.each { |child| write_node(child, depth + 1) }
+          emit(">")
+          if format_children?(node)
+            children.each do |child|
+              emit("\n#{@unit * (depth + 1)}")
+              write_node(child, depth + 1)
+            end
+            emit("\n#{@unit * depth}")
+          else
+            # libxml2 breaks the lines of a block element with more than one
+            # child, unless its name starts with "p" (p, pre, param).
+            wrap = block && children.length > 1 && !name.start_with?("p")
+            emit("\n") if wrap && !inline_text?(children.first)
+            write_children(children, depth + 1)
+            emit("\n") if wrap && !inline_text?(children.last)
+          end
+          emit("</#{name}>")
         end
-        emit("</#{name}>")
+        emit("\n") if block && html_break_after?(state, following)
+      end
+
+      def write_children(children, depth)
+        index = 0
+        length = children.length
+        while index < length
+          write_node(children[index], depth, children[index + 1])
+          index += 1
+        end
+      end
+
+      def html_block?(state)
+        return false unless state.namespace.nil?
+
+        descriptions = HTML4::ElementDescription::DefaultDescriptions
+        desc = descriptions[state.name] || descriptions[state.name.downcase]
+        !desc.nil? && !desc.isinline
+      end
+
+      def inline_text?(node)
+        type = node.node_type
+        type == XML::Node::TEXT_NODE || type == XML::Node::ENTITY_REF_NODE
+      end
+
+      # libxml2 puts a new line after a block element when an element or
+      # comment follows it, inside a parent whose name does not start with "p".
+      def html_break_after?(state, following)
+        return false if following.nil? || inline_text?(following)
+
+        parent = state.parent&.instance_variable_get(:@pure)
+        parent&.type == XML::Node::ELEMENT_NODE && !parent.name.to_s.start_with?("p")
       end
 
       def format_children?(node)

@@ -2,15 +2,20 @@
 
 require "strscan"
 require_relative "html_references"
+require_relative "html4_tree"
 
 module Nokogiri
   module Pure
     # XML parser for the pure Ruby backend.
     class Parser
+      include HTML4Tree
+
       RECOVER = 1
       NAME = /[\p{L}_:][\p{L}\p{N}_:.-]*/
       UNQUOTED = /[^\s>\/]*/
       HTML_ATTRIBUTE_NAME = /[A-Za-z_:.][A-Za-z0-9:_.-]*/
+      # A reference at the end of a string, as libxml2 reads it.
+      HTML_REFERENCE_TAIL = /&(?:#[xX]?[0-9A-Fa-f]*|[A-Za-z_:][A-Za-z0-9_:.-]*)?;?\z/
       QUOTED_DQ = /[^"&]+/
       QUOTED_SQ = /[^'&]+/
       AMP_START = /[#A-Za-z_:]/
@@ -25,8 +30,6 @@ module Nokogiri
       REPEAT_TEXT = %q{((?:[^<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
       REPEAT_DQ = %q{((?:[^"<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
       REPEAT_SQ = %q{((?:[^'<&]|&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9A-Fa-f]+|#X[0-9A-Fa-f]+);)*)}
-      P_END_MESSAGE = 'The element type "p" must be terminated by the matching end-tag "</p>".'
-      P_END_ERROR = [P_END_MESSAGE, 0, 0, nil, false].freeze
 
       def self.parse(document, string, options)
         new(document, string, options).parse_document
@@ -86,7 +89,7 @@ module Nokogiri
           error("Premature end of data in tag #{element.name} line #{element.line}")
         end
         @stack.clear
-        ensure_html_tree
+        error("Document is empty", level: 2) if html_tree? && @scanner.string.match?(/\A[ \t\r\n]*\z/)
         if strict? && @root.document? && @root.pure.children.none?(&:element?) && @scanner.string.strip.empty?
           error("Start tag expected, '<' not found")
         end
@@ -127,6 +130,9 @@ module Nokogiri
           return
         end
         @flat_errors = nil
+        @h_tree = nil
+        @h_stack = nil
+        html_tree_reset if html_tree?
         @scanner.pos = saved_pos
         @line = saved_line
         @column = saved_column
@@ -852,6 +858,9 @@ module Nokogiri
 
         string = @scanner.string
         limit = string.bytesize
+        # The general path has the NUL rules.
+        return nil if string.include?("\0")
+
         @flat_errors = []
         @flat_nl = flat_newline_table(string)
         @flat_nl_i = 0
@@ -859,6 +868,9 @@ module Nokogiri
         tree = FlatTree.new(@document, string)
         tree.mark_html
         stack = []
+        html_tree_reset
+        @h_tree = tree
+        @h_stack = stack
         pos = @scanner.pos
         while pos < limit
           unless html_markup_at?(string, pos, limit)
@@ -868,10 +880,7 @@ module Nokogiri
               found = string.byteindex("<", nxt + 1)
               nxt = found || limit
             end
-            if nxt > pos
-              parent = stack.empty? ? -1 : stack[-1]
-              return nil unless add_html_text(tree, string, pos, nxt, parent)
-            end
+            add_html_text(tree, string, pos, nxt, stack) if nxt > pos
             pos = nxt
             next
           end
@@ -918,19 +927,49 @@ module Nokogiri
         end
       end
 
-      def add_html_text(tree, string, from, to, parent)
-        if parent < 0
-          return add_html_root_text(string, from, to)
+      # libxml2 reads a stray "<" as one character with no paragraph
+      # check. Each run of text after it is one character data run.
+      def add_html_text(tree, string, from, to, stack)
+        while from < to
+          if string.getbyte(from) == 60
+            tree.add_text_range(stack[-1], from, 1, flat_line(from)) unless stack.empty? || tree.merge_text_range(stack[-1], from, 1)
+            from += 1
+          end
+          stop = string.byteindex("<", from)
+          stop = to if stop.nil? || stop > to
+          add_html_text_run(tree, string, from, stop, stack) if stop > from
+          from = stop
         end
+      end
 
+      def add_html_text_run(tree, string, from, to, stack)
         amp = flat_next_amp(string, from)
+        if amp < to || !blank_bytes?(string, from, to)
+          @h_pos = from
+          html_tree_paragraph
+        end
+        # libxml2 drops text that has no open element.
+        return if stack.empty?
+
+        parent = stack[-1]
         if amp >= to
+          return if tree.merge_text_range(parent, from, to - from)
+
           tree.add_text_range(parent, from, to - from, flat_line(to))
-          return true
+          return
         end
 
         text = flat_html_references(string, from, to, false)
-        tree.add_text(parent, text, flat_line(to)) unless text.empty?
+        tree.add_text(parent, text, flat_line(to)) unless text.empty? || tree.merge_text(parent, text)
+      end
+
+      def blank_bytes?(string, from, to)
+        while from < to
+          byte = string.getbyte(from)
+          return false unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+          from += 1
+        end
         true
       end
 
@@ -943,21 +982,6 @@ module Nokogiri
           @flat_errors << [message, line, column, 2, true]
         end
         text
-      end
-
-      def add_html_root_text(string, from, to)
-        index = from
-        while index < to
-          byte = string.getbyte(index)
-          return nil if byte >= 128
-          unless byte == 32 || byte == 9 || byte == 10 || byte == 13
-            line, column = flat_location(string, to)
-            @flat_errors << ["Start tag expected, '<' not found", line, column, 3, true]
-            return true
-          end
-          index += 1
-        end
-        true
       end
 
       def read_html_comment(tree, string, pos, limit, stack)
@@ -1059,50 +1083,13 @@ module Nokogiri
 
           index += 1
         end
-        name_len = index - name_off
+        name = string.byteslice(name_off, index - name_off)
+        name.downcase!
         index = skip_tag_space(string, index, limit)
         return nil if index.nil? || index >= limit || string.getbyte(index) != 62
 
-        if html_stack_has?(tree, stack, string, name_off, name_len)
-          finish_html_end(tree, string, name_off, name_len, index + 1, stack)
-        elsif html_p_or_br?(string, name_off, name_len)
-          parent = stack.empty? ? -1 : stack[-1]
-          tree.add_element(parent, name_off, name_len, 0, -1, nil, EMPTY_SCOPE)
-          index + 1
-        else
-          note_html_mismatch(tree, string, name_off, name_len, index + 1, stack)
-          index + 1
-        end
-      end
-
-      def finish_html_end(tree, string, name_off, name_len, next_pos, stack)
-        unless stack.empty? || tree.html_name_eq?(stack[-1], string, name_off, name_len)
-          if stack.empty?
-            note_html_mismatch(tree, string, name_off, name_len, next_pos, stack)
-          elsif tree.p_open?(stack[-1])
-            @flat_errors << P_END_ERROR
-          else
-            name = tree.folded_name(stack[-1])
-            @flat_errors << [%(The element type "#{name}" must be terminated by the matching end-tag "</#{name}>."), 0, 0, nil, false]
-          end
-          stack.pop while stack.any? && !tree.html_name_eq?(stack[-1], string, name_off, name_len)
-        end
-        stack.pop if stack.any? && tree.html_name_eq?(stack[-1], string, name_off, name_len)
-        next_pos
-      end
-
-      def note_html_mismatch(tree, string, name_off, name_len, next_pos, stack)
-        if stack.empty?
-          name = string.byteslice(name_off, name_len)
-          name = name.downcase if name.match?(/[A-Z]/)
-          line, column = flat_location(string, next_pos)
-          @flat_errors << ["Opening and ending tag mismatch: #{name}", line, column, 3, true]
-        elsif tree.p_open?(stack[-1])
-          @flat_errors << P_END_ERROR
-        else
-          name = tree.folded_name(stack[-1])
-          @flat_errors << [%(The element type "#{name}" must be terminated by the matching end-tag "</#{name}>."), 0, 0, nil, false]
-        end
+        html_tree_end(name, index + 1)
+        index + 1
       end
 
       def read_html_start(tree, string, pos, limit, stack)
@@ -1118,8 +1105,14 @@ module Nokogiri
         return nil if index == name_off
 
         name_len = index - name_off
-        parent = stack.empty? ? -1 : stack[-1]
-        element = tree.add_element(parent, name_off, name_len, 0, -1, flat_line(pos), EMPTY_SCOPE)
+        name = string.byteslice(name_off, name_len)
+        name.downcase!
+        @h_pos = pos
+        # A misplaced tag adds no element. Its attributes are read and dropped.
+        unless html_tree_start(name, index)
+          parent = stack.empty? ? -1 : stack[-1]
+          element = tree.add_element(parent, name_off, name_len, 0, -1, flat_line(pos), EMPTY_SCOPE)
+        end
         closed = false
         self_closing = false
         spans = nil
@@ -1197,10 +1190,20 @@ module Nokogiri
             next
           end
           (spans ||= []) << attr_off << attr_len
-          tree.add_html_attr(element, attr_off, attr_len, value_off, value_end - value_off, decoded)
+          tree.add_html_attr(element, attr_off, attr_len, value_off, value_end - value_off, decoded) if element
         end
         return nil unless closed
-        return index if self_closing || void_at?(string, name_off, name_len)
+
+        unless element
+          # libxml2 then ends the current element at "/>".
+          html_close_top if self_closing && html_tree_open?
+          return index
+        end
+        html_tree_push(name)
+        if self_closing || void_at?(string, name_off, name_len)
+          html_tree_pop
+          return index
+        end
 
         stack << element
         raw_name = RAW_TEXT_NAMES.find { |name| name.bytesize == name_len && same_ascii_name?(string, name_off, name) }
@@ -1286,30 +1289,6 @@ module Nokogiri
           return (third >= 65 && third <= 90) || (third >= 97 && third <= 122)
         end
         (nxt >= 65 && nxt <= 90) || (nxt >= 97 && nxt <= 122)
-      end
-
-      def html_stack_has?(tree, stack, string, off, len)
-        index = stack.length
-        while index > 0
-          index -= 1
-          return true if tree.html_name_eq?(stack[index], string, off, len)
-        end
-        false
-      end
-
-      def html_p_or_br?(string, off, len)
-        if len == 1
-          byte = string.getbyte(off)
-          byte == 112 || byte == 80
-        elsif len == 2
-          first = string.getbyte(off)
-          second = string.getbyte(off + 1)
-          first += 32 if first >= 65 && first <= 90
-          second += 32 if second >= 65 && second <= 90
-          first == 98 && second == 114
-        else
-          false
-        end
       end
 
       def void_at?(string, off, len)
@@ -1796,8 +1775,15 @@ module Nokogiri
       def parse_loop_general
         scanner = @scanner
         until scanner.eos?
+          byte = scanner.string.getbyte(scanner.pos)
+          # libxml2 ends the document at a NUL where new content starts.
+          if byte == 0 && html_tree?
+            scanner.terminate
+            break
+          end
+
           # "<" is one ASCII byte, including inside a UTF-8 document.
-          if scanner.string.getbyte(scanner.pos) == 60
+          if byte == 60
             if html_document? && !html_markup?
               append_text(take_char.to_s)
             else
@@ -2073,6 +2059,8 @@ module Nokogiri
           error("StartTag: invalid element name")
           return
         end
+        return read_misplaced_tag if html_tree? && html_tree_start(qname, nil)
+
         attributes = html_document? ? read_html_attributes : read_attributes
         skip_space
         self_closing = false
@@ -2081,8 +2069,10 @@ module Nokogiri
         if string.getbyte(mark) == 47 && string.getbyte(mark + 1) == 62
           advance("/>")
           self_closing = true
-        elsif html_document? && @scanner.eos?
+        elsif html_document? && (@scanner.eos? || string.getbyte(mark) == 0)
+          # libxml2 adds the element and then closes it.
           error("Couldn't find end of Start Tag #{qname}", level: 2)
+          self_closing = true
         else
           expect(">")
         end
@@ -2090,10 +2080,35 @@ module Nokogiri
         element = make_node(XML::Element, XML::Node::ELEMENT_NODE, qname, nil, line)
         apply_namespaces(element, qname, attributes)
         append_node(element)
-        return if self_closing || void_html?(element.name)
+        tree = html_tree?
+        html_tree_push(qname) if tree
+        if self_closing || void_html?(element.name)
+          html_tree_pop if tree
+          return
+        end
 
         push_open_element(element)
         read_raw_text(element.name) if html_document? && RAW_TEXT_NAMES.include?(element.name)
+      end
+
+      # libxml2 drops a misplaced tag and its attributes. The tag end then
+      # acts on the current element.
+      def read_misplaced_tag
+        read_html_attributes
+        skip_space
+        string = @scanner.string
+        mark = @scanner.pos
+        if string.getbyte(mark) == 47 && string.getbyte(mark + 1) == 62
+          advance("/>")
+          html_close_top if html_tree_open?
+        elsif @scanner.eos?
+          return unless html_tree_open?
+
+          error("Couldn't find end of Start Tag #{html_tree_top}", level: 2)
+          html_close_top
+        else
+          expect(">")
+        end
       end
 
       def read_raw_text(name)
@@ -2132,7 +2147,14 @@ module Nokogiri
         advance("</")
         qname = read_name
         skip_space
+        if html_tree?
+          read_html_end_tag_close
+          html_tree_end(qname.downcase, nil)
+          return
+        end
+
         expect(">")
+
         name = local_name(qname)
         name.downcase! if html_document? && !name.empty?
         if html_document? && @stack.none? { |node| node.name == name }
@@ -2593,6 +2615,44 @@ module Nokogiri
         @html
       end
 
+      # The libxml2 tree rules apply to an HTML document. A fragment parsed
+      # in a context node keeps the open elements of the context.
+      def html_tree?
+        @html && @root.document?
+      end
+
+      # HTML4Tree hooks. @h_tree is set while the flat path runs. @h_pos is
+      # the source offset of the construct that implies an element.
+      def html_open_implied(name)
+        if (tree = @h_tree)
+          stack = @h_stack
+          stack << tree.add_implied_element(stack.empty? ? -1 : stack[-1], name, flat_line(@h_pos))
+        else
+          element = make_node(XML::Element, XML::Node::ELEMENT_NODE, name, nil, @line)
+          append_node(element)
+          push_open_element(element)
+        end
+        html_tree_push(name)
+      end
+
+      def html_close_top
+        if @h_tree
+          @h_stack.pop
+        else
+          pop_open_element
+        end
+        html_tree_pop
+      end
+
+      def html_tree_error(message, offset)
+        if @h_tree
+          line, column = flat_location(@scanner.string, offset)
+          @flat_errors << [message, line, column, 2, true]
+        else
+          error(message, level: 2)
+        end
+      end
+
       def self.void_html_names
         @void_html_names ||= begin
           names = {}
@@ -2617,26 +2677,6 @@ module Nokogiri
           end
           groups
         end
-      end
-
-      def ensure_html_tree
-        return unless html_document? && @root.document?
-
-        elements = @document.pure.children.select(&:element?)
-        return if elements.any? { |node| node.name.casecmp?("html") }
-
-        html = XML::Element.new("html", @document)
-        body = XML::Element.new("body", @document)
-        movable = @document.pure.children.reject { |node| node.node_type == XML::Node::DTD_NODE }
-        movable.each do |node|
-          node.unlink
-          node.pure.parent = body
-          body.pure.children << node
-        end
-        body.pure.parent = html
-        html.pure.children << body
-        html.pure.parent = @document
-        @document.pure.children << html
       end
 
       def apply_namespaces(element, qname, attributes)
@@ -2809,15 +2849,69 @@ module Nokogiri
       def root_text?(text)
         return false unless @root.document? && @stack.empty?
 
-        error("Start tag expected, '<' not found") unless text.match?(/\A\s*\z/)
+        error("Start tag expected, '<' not found") unless @html || text.match?(/\A\s*\z/)
         true
+      end
+
+      # libxml2 skips to the next ">" if the end tag has more after the name.
+      def read_html_end_tag_close
+        string = @scanner.string
+        from = @scanner.pos
+        if string.getbyte(from) == 62
+          advance(">")
+          return
+        end
+
+        error("End tag : expected '>'", level: 2)
+        to = from
+        to += 1 while (byte = string.getbyte(to)) && byte != 62 && byte != 0
+        to += 1 if byte == 62
+        account_text(string.byteslice(from, to - from))
+        @scanner.pos = to
       end
 
       def read_html_text
         string = @scanner.string
         from = @scanner.pos
         to = string.byteindex("<", from) || string.bytesize
+        if html_tree? && (nul = string.byteindex("\0", from)) && nul < to
+          return read_html_text_with_nul(string, from, to, nul)
+        end
+
+        if html_tree?
+          amp = string.byteindex("&", from)
+          html_tree_paragraph if (amp && amp < to) || !blank_bytes?(string, from, to)
+        end
         text = html_references(string, from, to, false)
+        return if text.empty? || root_text?(text)
+
+        append_node(make_node(XML::Text, XML::Node::TEXT_NODE, "text", text, @line))
+      end
+
+      # libxml2 reads a NUL in a text run as a space, with an error. A NUL
+      # where new content starts, such as after a reference, ends the text.
+      # parse_loop_general then ends the document at that NUL.
+      def read_html_text_with_nul(string, from, to, nul)
+        nuls = []
+        while nul && nul < to
+          if nul == from || string.byteslice(from, nul - from).match?(HTML_REFERENCE_TAIL)
+            to = nul
+            break
+          end
+          nuls << nul
+          nul = string.byteindex("\0", nul + 1)
+        end
+        html_tree_paragraph if string.byteslice(from, to - from).match?(/[^ \t\r\n\0]/)
+
+        text = +""
+        nuls.each do |index|
+          text << html_references(string, from, index, false)
+          error("Char 0x0 out of allowed range", level: 2)
+          account_text("\0")
+          text << " "
+          from = index + 1
+        end
+        text << html_references(string, from, to, false)
         return if text.empty? || root_text?(text)
 
         append_node(make_node(XML::Text, XML::Node::TEXT_NODE, "text", text, @line))
@@ -2918,6 +3012,7 @@ module Nokogiri
           skip_html_blanks
           byte = string.getbyte(@scanner.pos)
           break if byte.nil? || byte == 62 || (byte == 47 && string.getbyte(@scanner.pos + 1) == 62)
+          break if byte == 0 && html_tree?
 
           name = @scanner.scan(HTML_ATTRIBUTE_NAME)
           unless name
@@ -2953,7 +3048,13 @@ module Nokogiri
           mark = quote.chr
           advance(mark)
           close = string.byteindex(mark, from + 1)
-          value = html_references(string, from + 1, close || string.bytesize, true)
+          # A NUL ends the value.
+          if html_tree? && (nul = string.byteindex("\0", from + 1)) && (close.nil? || nul < close)
+            close = nil
+            value = html_references(string, from + 1, nul, true)
+          else
+            value = html_references(string, from + 1, close || string.bytesize, true)
+          end
           if close
             advance(mark)
           else
@@ -2963,7 +3064,7 @@ module Nokogiri
         end
 
         to = from
-        to += 1 while (byte = string.getbyte(to)) && byte != 32 && byte != 9 && byte != 10 && byte != 13 && byte != 62
+        to += 1 while (byte = string.getbyte(to)) && byte != 32 && byte != 9 && byte != 10 && byte != 13 && byte != 62 && byte != 0
         html_references(string, from, to, true)
       end
 

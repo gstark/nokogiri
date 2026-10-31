@@ -29,7 +29,8 @@ module Nokogiri
         module_function
 
         def parse(string, url, klass, **options)
-          document = klass.new
+          document = klass.new_without_dtd
+          document.send(:initialize)
           result = build(string, options, document)
           unless slot(result, :attached)
             source = slot(result, :document)

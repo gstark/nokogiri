@@ -17,6 +17,7 @@ module Nokogiri
       CDATA = 4
       COMMENT = 8
       DTD = 14
+      EMPTY = [].freeze
 
       attr_reader :document
 
@@ -143,32 +144,31 @@ module Nokogiri
         index
       end
 
-      def html_name_eq?(index, string, off, len)
-        return false unless @len[index] == len
+      # An implied HTML element has no name in the source.
+      def add_implied_element(parent, name, line)
+        index = add_element(parent, -1, name.bytesize, 0, -1, line, EMPTY)
+        (@folded_name ||= [])[index] = name
+        (@qnames ||= [])[index] = name
+        index
+      end
 
-        start = @off[index]
-        cursor = 0
-        while cursor < len
-          left = @source.getbyte(start + cursor)
-          right = string.getbyte(off + cursor)
-          left += 32 if left >= 65 && left <= 90
-          right += 32 if right >= 65 && right <= 90
-          return false if left != right
+      # Adds string to the last child of parent if that child is text.
+      # Returns false if there is no such child.
+      def merge_text(parent, string)
+        last = (parent < 0) ? @top_tail : @tail[parent]
+        return false if last < 0 || @type[last] != TEXT
 
-          cursor += 1
-        end
+        @text_str[last] = text_content(last) + string
         true
       end
 
-      def p_open?(index)
-        return false unless @len[index] == 1
+      # merge_text for a range of the source.
+      def merge_text_range(parent, off, len)
+        last = (parent < 0) ? @top_tail : @tail[parent]
+        return false if last < 0 || @type[last] != TEXT
 
-        byte = @source.getbyte(@off[index])
-        byte == 112 || byte == 80
-      end
-
-      def folded_name(index)
-        local_name(index)
+        @text_str[last] = text_content(last) + @source.byteslice(off, len)
+        true
       end
 
       def line_of(index)
@@ -605,6 +605,8 @@ module Nokogiri
       end
 
       def local_eq?(index, text, want)
+        return @folded_name[index] == text if @off[index] < 0
+
         delta = @local[index]
         return false unless @len[index] - delta == want
 

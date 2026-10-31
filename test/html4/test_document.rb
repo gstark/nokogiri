@@ -79,6 +79,27 @@ module Nokogiri
           assert_nil(doc.root)
         end
 
+        def test_new_document_has_the_default_dtd
+          dtd = Nokogiri::HTML4::Document.new.internal_subset
+          assert_equal(
+            ["html", "-//W3C//DTD HTML 4.0 Transitional//EN", "http://www.w3.org/TR/REC-html40/loose.dtd"],
+            [dtd.name, dtd.external_id, dtd.system_id]
+          )
+          assert_equal("-//W3C//DTD HTML 4.0 Transitional//EN", Nokogiri::HTML4("").internal_subset.external_id)
+          assert_nil(Nokogiri::HTML4::Document.new("http://x/a.dtd").version)
+        end
+
+        def test_new_document_takes_the_system_id_and_the_external_id
+          [
+            [["http://x/a.dtd"], [nil, "http://x/a.dtd"]],
+            [["http://x/a.dtd", "-//X//Y"], ["-//X//Y", "http://x/a.dtd"]],
+            [[nil, "-//X//Y"], ["-//X//Y", nil]]
+          ].each do |args, ids|
+            dtd = Nokogiri::HTML4::Document.new(*args).internal_subset
+            assert_equal(["html", *ids], [dtd.name, dtd.external_id, dtd.system_id], args.inspect)
+          end
+        end
+
         def test_to_xhtml_with_indent
           doc = Nokogiri::HTML4("<html><body><a>foo</a></body></html>")
           doc = Nokogiri::HTML4(doc.to_xhtml(indent: 2))
@@ -346,7 +367,7 @@ module Nokogiri
           temp_html_file.open
           assert_equal(
             Nokogiri::HTML4.parse(File.read(HTML_FILE)).xpath("//div/a").length,
-            Nokogiri::HTML4.parse(temp_html_file).xpath("//div/a").length,
+            Nokogiri::HTML4.parse(temp_html_file).xpath("//div/a").length
           )
         end
 
@@ -361,8 +382,8 @@ module Nokogiri
           html = "<html><body><br><table><colgroup><col>"
           doc = Nokogiri::HTML4::Document.parse(html)
           xhtml = doc.to_xhtml
-          assert_match(%r(<br ?/>), xhtml)
-          assert_match(%r(<col ?/>), xhtml)
+          assert_match(%r{<br ?/>}, xhtml)
+          assert_match(%r{<col ?/>}, xhtml)
         end
 
         def test_no_xml_header
@@ -448,7 +469,7 @@ module Nokogiri
           assert_equal("http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd", html.internal_subset.system_id)
           assert_equal(
             "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">",
-            html.to_s[0, 97],
+            html.to_s[0, 97]
           )
         end
 
@@ -744,7 +765,7 @@ module Nokogiri
         end
 
         it "handles ill-formed processing instructions" do
-          html = %{<html><body><!--><?a/}
+          html = %(<html><body><!--><?a/)
           doc = Nokogiri::HTML4::Document.parse(html)
           expected = if Nokogiri.jruby?
             [Nokogiri::XML::Node::COMMENT_NODE, Nokogiri::XML::Node::PI_NODE]
@@ -764,11 +785,11 @@ module Nokogiri
 
           assert_equal(
             expected,
-            doc.write_to(StringIO.new, save_with: Nokogiri::XML::Node::SaveOptions::DEFAULT_HTML).tap(&:rewind).read,
+            doc.write_to(StringIO.new, save_with: Nokogiri::XML::Node::SaveOptions::DEFAULT_HTML).tap(&:rewind).read
           )
           assert_equal(
             expected,
-            doc.write_to(StringIO.new).tap(&:rewind).read,
+            doc.write_to(StringIO.new).tap(&:rewind).read
           )
 
           # but not when the AS_XML or AS_XHTML flag is set
@@ -791,7 +812,7 @@ module Nokogiri
           end
 
           describe "ill-formed < character" do
-            let(:input) { %{<html><body><div>this < that</div><div>second element</div></body></html>} }
+            let(:input) { %(<html><body><div>this < that</div><div>second element</div></body></html>) }
 
             it "skips to the next start tag" do
               # see https://github.com/sparklemotion/nokogiri/issues/2461 for why we're testing this edge case
@@ -914,7 +935,7 @@ module Nokogiri
               doc = klass.new("http://www.w3.org/TR/REC-html40/loose.dtd", "-//W3C//DTD HTML 4.0 Transitional//EN")
               assert_equal(
                 ["http://www.w3.org/TR/REC-html40/loose.dtd", "-//W3C//DTD HTML 4.0 Transitional//EN"],
-                doc.initialized_with,
+                doc.initialized_with
               )
             end
           end
