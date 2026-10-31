@@ -47,6 +47,8 @@ module Nokogiri
         state = new
         attrs.each { |key, value| state.public_send(:"#{key}=", value) }
         owner.instance_variable_set(:@pure, state)
+        # The C extension decorates a node when it first wraps it, before #initialize.
+        state.document&.decorate(owner)
         state
       end
 
