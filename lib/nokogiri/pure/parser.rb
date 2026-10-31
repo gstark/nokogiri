@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "strscan"
+require_relative "html_references"
 
 module Nokogiri
   module Pure
@@ -9,6 +10,7 @@ module Nokogiri
       RECOVER = 1
       NAME = /[\p{L}_:][\p{L}\p{N}_:.-]*/
       UNQUOTED = /[^\s>\/]*/
+      HTML_ATTRIBUTE_NAME = /[A-Za-z_:.][A-Za-z0-9:_.-]*/
       QUOTED_DQ = /[^"&]+/
       QUOTED_SQ = /[^'&]+/
       AMP_START = /[#A-Za-z_:]/
@@ -78,7 +80,8 @@ module Nokogiri
           read_xml_declaration
         end
         parse_loop
-        if @stack.any? && @document.errors.count(&:fatal?) == fatals_before
+        # libxml2 does not report an open element at the end of HTML.
+        if !html_document? && @stack.any? && @document.errors.count(&:fatal?) == fatals_before
           element = @stack.last
           error("Premature end of data in tag #{element.name} line #{element.line}")
         end
@@ -400,7 +403,6 @@ module Nokogiri
 
           count += 1
           pos = md.byteend(0)
-          nil
           if sep_len.positive? && repeat_eq?(string, pos, sep)
             after = pos + sep_len
             nxt = re.match(string, after)
@@ -853,6 +855,7 @@ module Nokogiri
         @flat_errors = []
         @flat_nl = flat_newline_table(string)
         @flat_nl_i = 0
+        @flat_amp = -1
         tree = FlatTree.new(@document, string)
         tree.mark_html
         stack = []
@@ -894,29 +897,7 @@ module Nokogiri
             return nil if pos.nil?
           end
         end
-        finish_html_flat(tree, string, limit, stack)
         tree
-      end
-
-      def finish_html_flat(tree, string, limit, stack)
-        return if stack.empty? || flat_fatal?
-
-        index = stack[-1]
-        line, column = flat_location(string, limit)
-        name = tree.folded_name(index)
-        @flat_errors << ["Premature end of data in tag #{name} line #{tree.line_of(index)}", line, column, 3, true]
-      end
-
-      def flat_fatal?
-        list = @flat_errors
-        index = 0
-        length = list.length
-        while index < length
-          return true if list[index][3] == 3
-
-          index += 1
-        end
-        false
       end
 
       def flush_flat_errors
@@ -942,43 +923,26 @@ module Nokogiri
           return add_html_root_text(string, from, to)
         end
 
-        line = flat_line(to)
-        span = from
-        pos = from
-        split = false
-        names = nil
-        while (amp = string.byteindex("&", pos)) && amp < to
-          kind = entity_kind(string, amp, to)
-          if kind.nil?
-            pos = amp + 1
-            next
-          end
-          if kind[0] == :keep
-            pos = kind[1] + 1
-            next
-          end
-
-          name = string.byteslice(kind[1], kind[2])
-          return nil if noent? || lookup_entity(name)
-
-          split = true
-          tree.add_text_range(parent, span, amp - span, line) if amp > span
-          tree.add_entity_ref(parent, kind[1], kind[2])
-          span = kind[3] + 1
-          pos = span
-          names ||= []
-          names << name
+        amp = flat_next_amp(string, from)
+        if amp >= to
+          tree.add_text_range(parent, from, to - from, flat_line(to))
+          return true
         end
-        if split
-          tree.add_text_range(parent, span, to - span, line) if span < to
-          column = flat_column(string, to)
-          names.each do |name|
-            @flat_errors << ["Entity '#{name}' not defined", line, column, 3, true]
-          end
-        elsif to > from
-          tree.add_text_range(parent, from, to - from, line)
-        end
+
+        text = flat_html_references(string, from, to, false)
+        tree.add_text(parent, text, flat_line(to)) unless text.empty?
         true
+      end
+
+      # Errors come first. flat_location only moves forward in the source.
+      def flat_html_references(string, from, to, attribute)
+        errors = []
+        text = HTMLReferences.decode(string, from, to, attribute, errors)
+        errors.each do |message, offset|
+          line, column = flat_location(string, offset)
+          @flat_errors << [message, line, column, 2, true]
+        end
+        text
       end
 
       def add_html_root_text(string, from, to)
@@ -1065,7 +1029,7 @@ module Nokogiri
 
         close = string.byteindex((quote == 34) ? "\"" : "'", index + 1)
         return [nil, nil] unless close && close < limit
-        return [nil, nil] if string.byteindex("&", index + 1)&.between?(index + 1, close - 1)
+        return [nil, nil] if flat_next_amp(string, index + 1) < close
 
         [string.byteslice(index + 1, close - index - 1), close + 1]
       end
@@ -1158,6 +1122,7 @@ module Nokogiri
         element = tree.add_element(parent, name_off, name_len, 0, -1, flat_line(pos), EMPTY_SCOPE)
         closed = false
         self_closing = false
+        spans = nil
         while index < limit
           index = skip_tag_space(string, index, limit)
           return nil if index.nil?
@@ -1169,15 +1134,19 @@ module Nokogiri
             index += 1
             break
           end
-          if byte == 47
-            return nil unless index + 1 < limit && string.getbyte(index + 1) == 62
-
+          if byte == 47 && index + 1 < limit && string.getbyte(index + 1) == 62
             self_closing = true
             closed = true
             index += 2
             break
           end
-          return nil if byte >= 128 || !name_start_byte?(byte)
+          return nil if byte >= 128
+          unless name_start_byte?(byte) || byte == 46
+            line, column = flat_location(string, index)
+            @flat_errors << ["error parsing attribute name", line, column, 2, true]
+            index = bogus_attribute_end(string, index, limit)
+            next
+          end
 
           attr_off = index
           index += 1
@@ -1202,26 +1171,33 @@ module Nokogiri
               return nil unless close && close < limit
 
               value_off = index + 1
-              value_len = close - value_off
-              tree.add_html_attr(element, attr_off, attr_len, value_off, value_len, 1)
-              if value_len.positive?
-                amp = string.byteindex("&", value_off)
-                return nil unless amp.nil? || amp >= value_off + value_len || note_quoted_entities(string, value_off, value_off + value_len)
-              end
+              value_end = close
               index = close + 1
             else
               value_off = index
               while index < limit
                 byte = string.getbyte(index)
-                break if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 62 || byte == 47
+                break if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 62
 
                 index += 1
               end
-              tree.add_html_attr(element, attr_off, attr_len, value_off, index - value_off, 0)
+              value_end = index
             end
+            amp = flat_next_amp(string, value_off)
+            decoded = (amp < value_end) ? flat_html_references(string, value_off, value_end, true) : nil
           else
-            tree.add_html_attr(element, attr_off, attr_len, -1, 0, 0)
+            value_off = -1
+            value_end = -1
+            decoded = nil
           end
+          # libxml2 keeps the first of two attributes with the same name.
+          if spans && redefined_attribute?(string, spans, attr_off, attr_len)
+            line, column = flat_location(string, index)
+            @flat_errors << ["Attribute #{string.byteslice(attr_off, attr_len).downcase} redefined", line, column, 2, true]
+            next
+          end
+          (spans ||= []) << attr_off << attr_len
+          tree.add_html_attr(element, attr_off, attr_len, value_off, value_end - value_off, decoded)
         end
         return nil unless closed
         return index if self_closing || void_at?(string, name_off, name_len)
@@ -1251,6 +1227,33 @@ module Nokogiri
           pos = close + 2
         end
         limit
+      end
+
+      # spans holds the offset and length of each earlier attribute name.
+      def redefined_attribute?(string, spans, off, len)
+        i = 0
+        while i < spans.length
+          if spans[i + 1] == len
+            other = spans[i]
+            j = 0
+            j += 1 while j < len && (string.getbyte(off + j) | 32) == (string.getbyte(other + j) | 32)
+            return true if j == len
+          end
+          i += 2
+        end
+        false
+      end
+
+      # libxml2 skips a bad attribute up to a blank, ">", or "/>".
+      def bogus_attribute_end(string, index, limit)
+        while index < limit
+          byte = string.getbyte(index)
+          break if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 62
+          break if byte == 47 && string.getbyte(index + 1) == 62
+
+          index += 1
+        end
+        index
       end
 
       def skip_tag_space(string, index, limit)
@@ -1335,125 +1338,6 @@ module Nokogiri
         true
       end
 
-      def note_quoted_entities(string, from, to)
-        pos = from
-        while (amp = string.byteindex("&", pos)) && amp < to
-          kind = entity_kind(string, amp, to)
-          if kind.nil?
-            pos = amp + 1
-            next
-          end
-          if kind[0] == :keep
-            pos = kind[1] + 1
-            next
-          end
-
-          name = string.byteslice(kind[1], kind[2])
-          return nil if noent? || lookup_entity(name)
-
-          line, column = flat_location(string, kind[3] + 1)
-          @flat_errors << ["Entity '#{name}' not defined", line, column, 3, true]
-          pos = kind[3] + 1
-        end
-        true
-      end
-
-      # :keep means a predefined or numeric reference that stays in the text.
-      # :bad is an unknown name. nil is a bare "&".
-      def entity_kind(string, amp, limit)
-        nxt = amp + 1
-        return nil if nxt >= limit
-
-        byte = string.getbyte(nxt)
-        if byte == 35
-          semi = numeric_semi(string, nxt, limit)
-          return nil unless semi
-
-          return [:keep, semi]
-        end
-        return nil unless byte && ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))
-
-        index = nxt + 1
-        while index < limit
-          byte = string.getbyte(index)
-          break unless entity_name_byte?(byte)
-
-          index += 1
-        end
-        return nil if index >= limit || string.getbyte(index) != 59
-
-        if predefined_at?(string, nxt, index - nxt)
-          [:keep, index]
-        else
-          [:bad, nxt, index - nxt, index]
-        end
-      end
-
-      def numeric_semi(string, hash_pos, limit)
-        index = hash_pos + 1
-        return nil if index >= limit
-
-        byte = string.getbyte(index)
-        if byte == 120 || byte == 88
-          index += 1
-          start = index
-          while index < limit && hex_byte?(string.getbyte(index))
-            index += 1
-          end
-          return nil if index == start
-        else
-          start = index
-          while index < limit
-            byte = string.getbyte(index)
-            break unless byte >= 48 && byte <= 57
-
-            index += 1
-          end
-          return nil if index == start
-        end
-        return nil if index >= limit || string.getbyte(index) != 59
-
-        index
-      end
-
-      def entity_name_byte?(byte)
-        return false unless byte
-        return true if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
-        return true if byte >= 48 && byte <= 57
-
-        byte == 45 || byte == 46
-      end
-
-      def hex_byte?(byte)
-        return false unless byte
-        return true if byte >= 48 && byte <= 57
-        return true if byte >= 65 && byte <= 70
-
-        byte >= 97 && byte <= 102
-      end
-
-      def predefined_at?(string, off, len)
-        case len
-        when 2
-          first = string.getbyte(off)
-          second = string.getbyte(off + 1)
-          (first == 108 && second == 116) || (first == 103 && second == 116)
-        when 3
-          string.getbyte(off) == 97 && string.getbyte(off + 1) == 109 && string.getbyte(off + 2) == 112
-        when 4
-          first = string.getbyte(off)
-          if first == 113
-            string.getbyte(off + 1) == 117 && string.getbyte(off + 2) == 111 && string.getbyte(off + 3) == 116
-          elsif first == 97
-            string.getbyte(off + 1) == 112 && string.getbyte(off + 2) == 111 && string.getbyte(off + 3) == 115
-          else
-            false
-          end
-        else
-          false
-        end
-      end
-
       def flat_location(string, pos)
         [flat_line(pos), flat_column(string, pos)]
       end
@@ -1473,6 +1357,14 @@ module Nokogiri
           pos = found + 1
         end
         table
+      end
+
+      # The offset of the first "&" at or after +from+, or the string size.
+      # One search serves all later calls until the parser passes that "&".
+      # Without the cache, input with no "&" makes each search scan to the end.
+      def flat_next_amp(string, from)
+        @flat_amp = string.byteindex("&", from) || string.bytesize if @flat_amp < from
+        @flat_amp
       end
 
       def flat_line(byte_pos)
@@ -1911,6 +1803,8 @@ module Nokogiri
             else
               parse_markup
             end
+          elsif html_document?
+            read_html_text
           else
             append_text(read_until_markup)
           end
@@ -2179,7 +2073,7 @@ module Nokogiri
           error("StartTag: invalid element name")
           return
         end
-        attributes = read_attributes
+        attributes = html_document? ? read_html_attributes : read_attributes
         skip_space
         self_closing = false
         string = @scanner.string
@@ -2187,6 +2081,8 @@ module Nokogiri
         if string.getbyte(mark) == 47 && string.getbyte(mark + 1) == 62
           advance("/>")
           self_closing = true
+        elsif html_document? && @scanner.eos?
+          error("Couldn't find end of Start Tag #{qname}", level: 2)
         else
           expect(">")
         end
@@ -2896,11 +2792,7 @@ module Nokogiri
       end
 
       def append_text(text)
-        return if text.empty?
-        if @root.document? && @stack.empty?
-          error("Start tag expected, '<' not found") unless text.match?(/\A\s*\z/)
-          return
-        end
+        return if text.empty? || root_text?(text)
 
         unless text.include?("&")
           append_node(make_node(XML::Text, XML::Node::TEXT_NODE, "text", text, @line))
@@ -2911,6 +2803,40 @@ module Nokogiri
           node = piece.is_a?(XML::Node) ? piece : make_node(XML::Text, XML::Node::TEXT_NODE, "text", piece, @line)
           append_node(node)
         end
+      end
+
+      # A document drops text at the root.
+      def root_text?(text)
+        return false unless @root.document? && @stack.empty?
+
+        error("Start tag expected, '<' not found") unless text.match?(/\A\s*\z/)
+        true
+      end
+
+      def read_html_text
+        string = @scanner.string
+        from = @scanner.pos
+        to = string.byteindex("<", from) || string.bytesize
+        text = html_references(string, from, to, false)
+        return if text.empty? || root_text?(text)
+
+        append_node(make_node(XML::Text, XML::Node::TEXT_NODE, "text", text, @line))
+      end
+
+      # Decodes the references from +from+ to +to+ and moves the scanner to
+      # +to+. Each error gets the line and column of its place in the source.
+      def html_references(string, from, to, attribute)
+        errors = []
+        text = HTMLReferences.decode(string, from, to, attribute, errors)
+        pos = from
+        errors.each do |message, offset|
+          account_text(string.byteslice(pos, offset - pos))
+          pos = offset
+          error(message, level: 2)
+        end
+        account_text(string.byteslice(pos, to - pos))
+        @scanner.pos = to
+        text
       end
 
       def split_text_and_entities(text)
@@ -2981,6 +2907,84 @@ module Nokogiri
           attributes[name] = read_attribute_value
         end
         attributes
+      end
+
+      # The rules of htmlParseStartTag in libxml2 before 2.14. A bad name is
+      # skipped. The first of two attributes with the same name stays.
+      def read_html_attributes
+        attributes = {}
+        string = @scanner.string
+        loop do
+          skip_html_blanks
+          byte = string.getbyte(@scanner.pos)
+          break if byte.nil? || byte == 62 || (byte == 47 && string.getbyte(@scanner.pos + 1) == 62)
+
+          name = @scanner.scan(HTML_ATTRIBUTE_NAME)
+          unless name
+            error("error parsing attribute name", level: 2)
+            skip_html_bad_attribute
+            next
+          end
+          account_text(name)
+          name.downcase!
+          skip_html_blanks
+          value = ""
+          if string.getbyte(@scanner.pos) == 61
+            advance("=")
+            skip_html_blanks
+            value = read_html_attribute_value
+          end
+          if attributes.key?(name)
+            error("Attribute #{name} redefined", level: 2)
+          else
+            attributes[name] = value
+          end
+        end
+        attributes
+      end
+
+      # A quoted value with no closing quote runs to the end of the input.
+      # An unquoted value ends at a blank or ">".
+      def read_html_attribute_value
+        string = @scanner.string
+        from = @scanner.pos
+        quote = string.getbyte(from)
+        if quote == 34 || quote == 39
+          mark = quote.chr
+          advance(mark)
+          close = string.byteindex(mark, from + 1)
+          value = html_references(string, from + 1, close || string.bytesize, true)
+          if close
+            advance(mark)
+          else
+            error("AttValue: #{mark} expected", level: 2)
+          end
+          return value
+        end
+
+        to = from
+        to += 1 while (byte = string.getbyte(to)) && byte != 32 && byte != 9 && byte != 10 && byte != 13 && byte != 62
+        html_references(string, from, to, true)
+      end
+
+      def skip_html_bad_attribute
+        string = @scanner.string
+        from = @scanner.pos
+        to = bogus_attribute_end(string, from, string.bytesize)
+        account_text(string.byteslice(from, to - from))
+        @scanner.pos = to
+      end
+
+      # libxml2 HTML blanks are space, tab, LF, and CR.
+      def skip_html_blanks
+        string = @scanner.string
+        from = @scanner.pos
+        to = from
+        to += 1 while (byte = string.getbyte(to)) && (byte == 32 || byte == 9 || byte == 10 || byte == 13)
+        return if to == from
+
+        account_text(string.byteslice(from, to - from))
+        @scanner.pos = to
       end
 
       def read_attribute_value

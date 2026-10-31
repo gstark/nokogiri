@@ -15,7 +15,6 @@ module Nokogiri
       ELEMENT = 1
       TEXT = 3
       CDATA = 4
-      ENTITY_REF = 5
       COMMENT = 8
       DTD = 14
 
@@ -119,10 +118,11 @@ module Nokogiri
       end
 
       # HTML attributes stay as source offsets until a reader asks for them.
-      # value_off < 0 is a boolean attribute. decode is 1 for a quoted value.
-      def add_html_attr(index, name_off, name_len, value_off, value_len, decode)
+      # value_off < 0 is a boolean attribute. decoded is the value after the
+      # parser read its references, or nil if the source bytes are the value.
+      def add_html_attr(index, name_off, name_len, value_off, value_len, decoded)
         list = (@attrs[index] ||= [])
-        list << [:h, name_off, name_len, value_off, value_len, decode]
+        list << [:h, name_off, name_len, value_off, value_len, decoded]
       end
 
       def mark_html
@@ -135,10 +135,6 @@ module Nokogiri
 
       def add_cdata(parent, off, len)
         add_span(CDATA, parent, nil, off, len, nil)
-      end
-
-      def add_entity_ref(parent, off, len)
-        add_span(ENTITY_REF, parent, nil, off, len, nil)
       end
 
       def add_dtd(parent, name, external_id, system_id)
@@ -241,17 +237,6 @@ module Nokogiri
         state = State.leaf_new
         state.fast_fill(CDATA, "#cdata-section", @document, content, nil)
         state.parent = wrapper(@parent[index])
-        node.instance_variable_set(:@pure, state)
-        node
-      end
-
-      def entity_node(index)
-        name = @source.byteslice(@text_off[index], @text_len[index])
-        node = XML::EntityReference.allocate
-        state = State.new
-        state.fast_fill(ENTITY_REF, name, @document, nil, nil)
-        parent = @parent[index]
-        state.parent = (parent < 0) ? @document : wrapper(parent)
         node.instance_variable_set(:@pure, state)
         node
       end
@@ -488,11 +473,12 @@ module Nokogiri
                   cursor += 1
                 end
               end
-              if row[3] < 0
-                value = +""
+              value = if row[5]
+                row[5]
+              elsif row[3] < 0
+                +""
               else
-                value = @source.byteslice(row[3], row[4])
-                value = Entities.decode_predefined(value) if row[5] == 1 && value.byteindex("&")
+                @source.byteslice(row[3], row[4])
               end
               ns_id = -1
             else
@@ -528,10 +514,6 @@ module Nokogiri
           return node
         when CDATA
           node = cdata_node(index)
-          @cache[index] = node
-          return node
-        when ENTITY_REF
-          node = entity_node(index)
           @cache[index] = node
           return node
         when DTD

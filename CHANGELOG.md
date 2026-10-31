@@ -36,6 +36,13 @@ Nokogiri follows [Semantic Versioning](https://semver.org/), please see the [REA
 * [JRuby] Fixed multiple issues with `Node#namespace_definitions` so that it now behaves identically to CRuby. (#2543, #3460) @flavorjones
 * [Pure] Nodes and document fragments created with `.new` or `Document#create_*` now get the document's decorators, as on CRuby and JRuby. Before, Loofah could not call `scrub!` on a fragment.
 * [Pure] The HTML4 parser now reads `script` and `style` content as one CDATA node with no entity decoding, as libxml2 does before v2.14. `#to_html` writes that content as is. Before, the parser read tags inside a `script` element as markup, so sanitizers such as Loofah could miss nested scripts.
+* [Pure] The HTML4 parser now reads attributes and references as libxml2 does before v2.14. It decodes all 253 HTML 4 named entities and numeric references with no `;`, such as `&#58`. A named reference with no `;` stays as text. It skips a bad attribute name such as `/XSS` with an error, keeps the first of two attributes with the same name, and keeps a `/` in an unquoted value. A quoted value with no closing quote runs to the end of the input. It no longer reports "Premature end of data" for an open HTML element. Before, sanitizers such as Loofah could see different attributes than CRuby gives.
+* [Pure] Parsing HTML4 with no `&` in the input is no longer quadratic.
+* [Pure] Four recent CRuby fixes now also apply to the pure Ruby implementation:
+  * `XML::XPathContext.new` and `#node=` raise `TypeError` when the argument is not a `Node`.
+  * `XML::Reader.from_io` reads from the IO at once and raises a non-standard exception from `read`. It swallows a `StandardError` from `read`, as libxml2 does.
+  * `XML::SAX::Parser#parse_io` calls `read` with a length.
+  * `Nokogiri.XSLT` raises `RuntimeError` for a `select` or `test` expression with an XPath syntax error.
 * [JRuby] `Document#create_element` and `Node.new` no longer set the namespace to the document's default namespace. The namespace must be set explicitly with `namespace=` or by parenting the node. (#3457, #3463) @flavorjones
 * `XML::XPathContext.new` and `XML::XPathContext#node=` raise `TypeError` when the argument is not a `Node`. Previously, on CRuby, most such arguments crashed the process. (#3720) @flavorjones
 * CSS `an+b` selectors with a zero or negative step now follow the Selectors spec: `:nth-child(0n+3)` matches only the third element (previously nothing), `0n-1` matches nothing instead of raising `ZeroDivisionError`, and `-n+0` / `-2n` match nothing instead of every (or every other) element. @afurm

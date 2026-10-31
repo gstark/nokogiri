@@ -1,11 +1,13 @@
 # frozen_string_literal: true
 
 module Nokogiri
-  module XML
-    class Node
-      # xml/node.rb loads after pure/dom.rb and would replace an earlier
-      # definition. Element content= escapes, then native_content= decodes.
-      # Those two scans are an identity, so store the input text directly.
+  module Pure
+    # Faster versions of two XML::Node methods. xml/node.rb loads after
+    # pure/dom.rb, so a plain definition would lose to it. A prepended
+    # module wins in any load order, and Ruby does not warn about it.
+    module ElementContent
+      # Element content= escapes, then native_content= decodes. Those two
+      # scans are an identity, so store the input text directly.
       def content=(string)
         text = string.to_s
         if element?
@@ -16,8 +18,8 @@ module Nokogiri
         string
       end
 
-      # xml/node.rb loads after pure/dom.rb. Build the hash from the attribute
-      # list. The NodeSet wrapper is only needed for #attribute_nodes.
+      # Build the hash from the attribute list. The NodeSet wrapper is only
+      # needed for #attribute_nodes.
       def attributes
         list = pure.attributes
         hash = {}
@@ -36,3 +38,5 @@ module Nokogiri
     end
   end
 end
+
+Nokogiri::XML::Node.prepend(Nokogiri::Pure::ElementContent)

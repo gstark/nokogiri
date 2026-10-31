@@ -2515,6 +2515,7 @@ module Nokogiri
   module XML
     class XPathContext
       def self.new(node)
+        check_node(node)
         context = allocate
         context.instance_variable_set(:@node, node)
         context.instance_variable_set(:@namespaces, {"xml" => Pure::XML_NS_HREF})
@@ -2540,7 +2541,16 @@ module Nokogiri
         end
       end
 
-      attr_writer :node
+      def node=(node)
+        self.class.check_node(node)
+        @node = node
+      end
+
+      def self.check_node(node)
+        return if node.is_a?(Node)
+
+        raise TypeError, "expected a Nokogiri::XML::Node, received #{node.class}"
+      end
 
       def evaluate(path, handler = nil)
         Pure::XPath.evaluate(@node, path, @namespaces, @variables, handler)

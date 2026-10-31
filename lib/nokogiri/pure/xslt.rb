@@ -20,6 +20,13 @@ module Nokogiri
 
       Context = Struct.new(:node, :variables, :result)
 
+      # A compile check knows no variable values, so it accepts every name.
+      module AnyVariable
+        def self.key?(_name) = true
+
+        def self.[](_name) = ""
+      end
+
       # Dispatches namespaced extension calls. XPath asks only for the local name.
       class Extensions
         def initialize(engine)
@@ -179,23 +186,35 @@ module Nokogiri
       def compile_xsl(node)
         case node.name
         when "value-of"
-          [:value_of, node["select"].to_s]
+          [:value_of, compiled_select(node)]
         when "for-each"
-          [:for_each, node["select"].to_s, compile_sequence(node)]
+          [:for_each, compiled_select(node), compile_sequence(node)]
         when "text"
           [:text, node.content.to_s, node["disable-output-escaping"] == "yes"]
         when "apply-templates"
           mode = node["mode"]
-          [:apply_templates, node["select"].to_s, (mode.nil? || mode.empty?) ? nil : mode]
+          [:apply_templates, compiled_select(node), (mode.nil? || mode.empty?) ? nil : mode]
         when "apply-imports"
           [:apply_imports]
         when "copy"
           [:copy, compile_sequence(node)]
         when "copy-of"
-          [:copy_of, node["select"].to_s]
+          [:copy_of, compiled_select(node)]
         when "choose"
           [:choose, node.pure.children.filter_map { |child| compile_branch(child) }]
         end
+      end
+
+      # libxml2 compiles each expression when it loads the stylesheet, and
+      # a syntax error stops the load.
+      def compiled_select(node, attribute = "select")
+        expression = node[attribute].to_s
+        return expression if expression.empty?
+
+        Pure::XPath::Engine.new(expression, @namespaces, AnyVariable, evaluating: false).evaluate(node.document)
+        expression
+      rescue XML::XPath::SyntaxError
+        raise "compilation error: element #{node.name}\nxsl:#{node.name} : could not compile #{attribute} expression '#{expression}'"
       end
 
       def compile_branch(node)
@@ -203,7 +222,7 @@ module Nokogiri
 
         case node.name
         when "when"
-          [:when, node["test"].to_s, compile_sequence(node)]
+          [:when, compiled_select(node, "test"), compile_sequence(node)]
         when "otherwise"
           [:otherwise, compile_sequence(node)]
         end

@@ -888,9 +888,7 @@ module Nokogiri
           def native_io(input, encoding)
             raise TypeError, "argument expected to respond to :read" unless input.respond_to?(:read)
 
-            data = input.read
-            data = "" if data.nil?
-            build_context(data, encoding)
+            build_context(XML::Document.read_source(input), encoding)
           end
 
           def native_file(path, encoding = nil)

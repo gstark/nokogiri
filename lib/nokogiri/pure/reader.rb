@@ -56,6 +56,8 @@ module Nokogiri
         @base_stack = [@url]
         @seen_element = false
         @seen_doctype = false
+        # libxml2 reads the first chunk when it makes the reader.
+        fill_chunk if io
       end
 
       def read
@@ -1150,7 +1152,13 @@ module Nokogiri
       def fill_chunk
         return if @io.nil? || @eof
 
-        chunk = @io.read(CHUNK)
+        # As in libxml2, a StandardError from the IO is a failed read. Any
+        # other exception, such as Interrupt, goes to the caller.
+        chunk = begin
+          @io.read(CHUNK)
+        rescue
+          nil
+        end
         unless chunk.is_a?(String)
           @eof = true
           return
