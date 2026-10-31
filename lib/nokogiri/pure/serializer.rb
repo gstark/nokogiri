@@ -172,7 +172,12 @@ module Nokogiri
           raw = node.instance_variable_get(:@xslt_disable_output_escaping) || raw_text?(state)
           emit(raw ? text : Entities.escape_text(text))
         when XML::Node::CDATA_SECTION_NODE
-          emit("<![CDATA[#{state.content}]]>")
+          # The libxml2 HTML dumper writes CDATA content as is.
+          if @html && @options & AS_XML == 0 && @options & AS_XHTML == 0
+            emit(state.content.to_s)
+          else
+            emit("<![CDATA[#{state.content}]]>")
+          end
         when XML::Node::COMMENT_NODE
           emit("<!--#{state.content}-->")
         when XML::Node::PI_NODE

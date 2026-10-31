@@ -13,6 +13,7 @@ module Nokogiri
       QUOTED_SQ = /[^'&]+/
       AMP_START = /[#A-Za-z_:]/
       EMPTY_SCOPE = [].freeze
+      RAW_TEXT_NAMES = ["script", "style"].freeze
       # Quote-aware tag. The match stops at the tag's ">", including one
       # that sits inside a quoted attribute value.
       FLAT_TAG = /<(?:[^>"']|"[^"]*"|'[^']*')*>/
@@ -1223,9 +1224,33 @@ module Nokogiri
           end
         end
         return nil unless closed
+        return index if self_closing || void_at?(string, name_off, name_len)
 
-        stack << element unless self_closing || void_at?(string, name_off, name_len)
-        index
+        stack << element
+        raw_name = RAW_TEXT_NAMES.find { |name| name.bytesize == name_len && same_ascii_name?(string, name_off, name) }
+        return index unless raw_name
+
+        stop = raw_text_end(string, index, raw_name)
+        tree.add_cdata(element, index, stop - index) if stop > index
+        stop
+      end
+
+      # libxml2 before 2.14 reads script and style content as one CDATA node.
+      # With RECOVER, the content ends at "</" and the element name in any
+      # case. Without RECOVER, it ends at "</" and any ASCII letter.
+      def raw_text_end(string, from, name)
+        limit = string.bytesize
+        pos = from
+        while (close = string.byteindex("</", pos))
+          if strict?
+            byte = string.getbyte(close + 2)
+            return close if byte && ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))
+          elsif close + 2 + name.bytesize <= limit && same_ascii_name?(string, close + 2, name)
+            return close
+          end
+          pos = close + 2
+        end
+        limit
       end
 
       def skip_tag_space(string, index, limit)
@@ -2169,7 +2194,21 @@ module Nokogiri
         element = make_node(XML::Element, XML::Node::ELEMENT_NODE, qname, nil, line)
         apply_namespaces(element, qname, attributes)
         append_node(element)
-        push_open_element(element) unless self_closing || void_html?(element.name)
+        return if self_closing || void_html?(element.name)
+
+        push_open_element(element)
+        read_raw_text(element.name) if html_document? && RAW_TEXT_NAMES.include?(element.name)
+      end
+
+      def read_raw_text(name)
+        from = @scanner.pos
+        stop = raw_text_end(@scanner.string, from, name)
+        return if stop == from
+
+        body = @scanner.string.byteslice(from, stop - from)
+        account_text(body)
+        @scanner.pos = stop
+        append_node(make_node(XML::CDATA, XML::Node::CDATA_SECTION_NODE, "#cdata-section", body))
       end
 
       def push_open_element(element)

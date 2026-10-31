@@ -35,6 +35,7 @@ Nokogiri follows [Semantic Versioning](https://semver.org/), please see the [REA
 * [CRuby MacOS] Fixed an issue handling SIGINT during HTML5 parsing. (#3528, #3535) @stevecheckoway
 * [JRuby] Fixed multiple issues with `Node#namespace_definitions` so that it now behaves identically to CRuby. (#2543, #3460) @flavorjones
 * [Pure] Nodes and document fragments created with `.new` or `Document#create_*` now get the document's decorators, as on CRuby and JRuby. Before, Loofah could not call `scrub!` on a fragment.
+* [Pure] The HTML4 parser now reads `script` and `style` content as one CDATA node with no entity decoding, as libxml2 does before v2.14. `#to_html` writes that content as is. Before, the parser read tags inside a `script` element as markup, so sanitizers such as Loofah could miss nested scripts.
 * [JRuby] `Document#create_element` and `Node.new` no longer set the namespace to the document's default namespace. The namespace must be set explicitly with `namespace=` or by parenting the node. (#3457, #3463) @flavorjones
 * `XML::XPathContext.new` and `XML::XPathContext#node=` raise `TypeError` when the argument is not a `Node`. Previously, on CRuby, most such arguments crashed the process. (#3720) @flavorjones
 * CSS `an+b` selectors with a zero or negative step now follow the Selectors spec: `:nth-child(0n+3)` matches only the third element (previously nothing), `0n-1` matches nothing instead of raising `ZeroDivisionError`, and `-n+0` / `-2n` match nothing instead of every (or every other) element. @afurm

@@ -14,6 +14,7 @@ module Nokogiri
       # after this file is loaded.
       ELEMENT = 1
       TEXT = 3
+      CDATA = 4
       ENTITY_REF = 5
       COMMENT = 8
       DTD = 14
@@ -132,6 +133,10 @@ module Nokogiri
         add_span(COMMENT, parent, line, off, len, nil)
       end
 
+      def add_cdata(parent, off, len)
+        add_span(CDATA, parent, nil, off, len, nil)
+      end
+
       def add_entity_ref(parent, off, len)
         add_span(ENTITY_REF, parent, nil, off, len, nil)
       end
@@ -226,6 +231,16 @@ module Nokogiri
         state.fast_fill(COMMENT, "comment", @document, content, nil)
         parent = @parent[index]
         state.parent = (parent < 0) ? @document : wrapper(parent)
+        node.instance_variable_set(:@pure, state)
+        node
+      end
+
+      def cdata_node(index)
+        content = @source.byteslice(@text_off[index], @text_len[index])
+        node = XML::CDATA.allocate
+        state = State.leaf_new
+        state.fast_fill(CDATA, "#cdata-section", @document, content, nil)
+        state.parent = wrapper(@parent[index])
         node.instance_variable_set(:@pure, state)
         node
       end
@@ -509,6 +524,10 @@ module Nokogiri
           return node
         when COMMENT
           node = comment_node(index)
+          @cache[index] = node
+          return node
+        when CDATA
+          node = cdata_node(index)
           @cache[index] = node
           return node
         when ENTITY_REF
