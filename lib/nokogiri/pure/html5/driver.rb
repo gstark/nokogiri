@@ -94,7 +94,7 @@ module Nokogiri
         end
 
         # One native call builds the tree and links the nodes. Nil keeps the Ruby builder.
-        def rust_html5(string, options, parent = nil)
+        def rust_html5(string, options, parent)
           return nil if ENV["NOKOGIRI_RUST_HTML5"] == "0"
           return nil unless defined?(Nokogiri::Pure::RustHtml5) && Nokogiri::Pure::RustHtml5.respond_to?(:tree)
 

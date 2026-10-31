@@ -10,7 +10,7 @@ use crate::html5::{Options, Status};
 use magnus::prelude::*;
 use magnus::rb_sys::{AsRawValue, FromRawValue};
 use magnus::value::LazyId;
-use magnus::{function, Error, Fixnum, RArray, RClass, RHash, RObject, RString, Ruby, Value};
+use magnus::{function, Error, Fixnum, RArray, RClass, RObject, RString, Ruby, Value};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -227,29 +227,16 @@ fn html_tree_inner(ruby: &Ruby, string: Value, options: Value, parent: Value) ->
         return Ok(nil(ruby));
     };
     let string = RString::try_convert(string)?;
+    let parent = RObject::try_convert(parent)?;
     let bytes = unsafe { string.as_slice() }.to_vec();
     let text = String::from_utf8_lossy(&bytes);
     let output = crate::html5::parse(text.as_ref(), &packed);
     let _gc = GcPause::new(ruby);
-    let keys = HtmlKeys::new(ruby);
-    if let Some(parent) = RObject::from_value(parent) {
-        let attached = output.status == Status::Ok;
-        if attached {
-            attach_output(ruby, parent, &output, packed.fragment_context.is_some())?;
-        }
-        return summary_hash(ruby, &keys, &output, attached);
+    let attached = output.status == Status::Ok;
+    if attached {
+        attach_output(ruby, parent, &output, packed.fragment_context.is_some())?;
     }
-    let hash = ruby.hash_new();
-    hash.aset(keys.document, node_hash(ruby, &keys, &output.document)?)?;
-    let root = match &output.root {
-        Some(node) => node_hash(ruby, &keys, node)?,
-        None => nil(ruby),
-    };
-    hash.aset(keys.root, root)?;
-    hash.aset(keys.errors, error_list(ruby, &keys, &output.errors)?)?;
-    hash.aset(keys.quirks_mode, int(ruby, output.quirks_mode as i64))?;
-    hash.aset(keys.status, utf8(ruby, status_name(output.status)))?;
-    Ok(hash.as_value())
+    summary_hash(ruby, &HtmlKeys::new(ruby), &output, attached)
 }
 
 const ELEMENT_NODE: i64 = 1;
@@ -678,26 +665,13 @@ impl Attacher<'_> {
 }
 
 struct HtmlKeys {
-    document: Value,
-    root: Value,
     errors: Value,
     quirks_mode: Value,
     status: Value,
     attached: Value,
-    type_: Value,
-    children: Value,
-    name: Value,
-    namespace: Value,
-    attrs: Value,
-    content: Value,
-    data: Value,
-    line: Value,
-    has_doctype: Value,
-    doctype_name: Value,
-    public_id: Value,
-    system_id: Value,
     code: Value,
     message: Value,
+    line: Value,
     column: Value,
     byte_offset: Value,
 }
@@ -706,26 +680,13 @@ impl HtmlKeys {
     fn new(ruby: &Ruby) -> Self {
         let key = |name: &[u8]| utf8(ruby, name);
         Self {
-            document: key(b"document"),
-            root: key(b"root"),
             errors: key(b"errors"),
             quirks_mode: key(b"quirks_mode"),
             status: key(b"status"),
             attached: key(b"attached"),
-            type_: key(b"type"),
-            children: key(b"children"),
-            name: key(b"name"),
-            namespace: key(b"namespace"),
-            attrs: key(b"attrs"),
-            content: key(b"content"),
-            data: key(b"data"),
-            line: key(b"line"),
-            has_doctype: key(b"has_doctype"),
-            doctype_name: key(b"doctype_name"),
-            public_id: key(b"public_id"),
-            system_id: key(b"system_id"),
             code: key(b"code"),
             message: key(b"message"),
+            line: key(b"line"),
             column: key(b"column"),
             byte_offset: key(b"byte_offset"),
         }
@@ -738,64 +699,6 @@ fn status_name(status: Status) -> &'static [u8] {
         Status::TooManyAttributes => b"too_many_attributes",
         Status::TreeTooDeep => b"tree_too_deep",
     }
-}
-
-fn node_hash(ruby: &Ruby, keys: &HtmlKeys, node: &NodeRef) -> Result<Value, Error> {
-    let inner = node.0.borrow();
-    let hash: RHash = ruby.hash_new();
-    hash.aset(keys.type_, utf8(ruby, kind_name(inner.kind)))?;
-    hash.aset(keys.name, utf8(ruby, inner.name.as_bytes()))?;
-    hash.aset(keys.namespace, ns_value(ruby, inner.namespace))?;
-    hash.aset(keys.content, utf8(ruby, inner.content.as_bytes()))?;
-    hash.aset(keys.data, utf8(ruby, inner.content.as_bytes()))?;
-    hash.aset(keys.line, inner.line as i64)?;
-    hash.aset(keys.has_doctype, inner.has_doctype)?;
-    hash.aset(keys.doctype_name, utf8(ruby, inner.doctype_name.as_bytes()))?;
-    hash.aset(keys.public_id, utf8(ruby, inner.public_id.as_bytes()))?;
-    hash.aset(keys.system_id, utf8(ruby, inner.system_id.as_bytes()))?;
-    hash.aset(keys.quirks_mode, inner.quirks_mode as i64)?;
-    let attrs: Vec<Value> = inner
-        .attrs
-        .iter()
-        .map(|(name, value, namespace)| {
-            let namespace = match namespace {
-                Some(ns) => ns_value(ruby, *ns),
-                None => nil(ruby),
-            };
-            values_column(ruby, &[utf8(ruby, name.as_bytes()), utf8(ruby, value.as_bytes()), namespace])
-        })
-        .collect();
-    hash.aset(keys.attrs, values_column(ruby, &attrs))?;
-    let children = inner
-        .children
-        .iter()
-        .map(|child| node_hash(ruby, keys, child))
-        .collect::<Result<Vec<Value>, Error>>()?;
-    drop(inner);
-    hash.aset(keys.children, values_column(ruby, &children))?;
-    Ok(hash.as_value())
-}
-
-fn kind_name(kind: NodeKind) -> &'static [u8] {
-    match kind {
-        NodeKind::Document => b"document",
-        NodeKind::Element => b"element",
-        NodeKind::Text => b"text",
-        NodeKind::Cdata => b"cdata",
-        NodeKind::Comment => b"comment",
-    }
-}
-
-fn ns_value(ruby: &Ruby, namespace: Ns) -> Value {
-    let name: &[u8] = match namespace {
-        Ns::Html => return nil(ruby),
-        Ns::Svg => b"svg",
-        Ns::MathMl => b"mathml",
-        Ns::Xlink => b"xlink",
-        Ns::Xml => b"xml",
-        Ns::Xmlns => b"xmlns",
-    };
-    utf8(ruby, name)
 }
 
 fn error_list(ruby: &Ruby, keys: &HtmlKeys, errors: &[ParseError]) -> Result<Value, Error> {
