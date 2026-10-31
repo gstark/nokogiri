@@ -651,7 +651,7 @@ pub fn parse(input: &str, options: &crate::html5::model::Options) -> crate::html
 }
 
 struct Builder {
-    tokenizer: crate::html5::lex::Tokenizer,
+    tokenizer: crate::html5::tokenizer::Tokenizer,
     errors: Rc<RefCell<ErrorLog>>,
     document: NodeRef,
     root: Option<NodeRef>,
@@ -687,7 +687,7 @@ impl Builder {
     fn new(input: &str, options: &Options) -> Self {
         let errors = Rc::new(RefCell::new(ErrorLog::new(options.max_errors)));
         let tokenizer =
-            crate::html5::lex::Tokenizer::new(input, errors.clone(), options.max_attributes);
+            crate::html5::tokenizer::Tokenizer::new(input, errors.clone(), options.max_attributes);
         Self {
             tokenizer,
             errors,
